@@ -16,6 +16,24 @@ Default flow:
 - Translation mode that keeps original `start/end` timings and only replaces subtitle text
 - OpenAI-compatible translation config via environment variables
 - `--skip-existing`, `--dry-run`, `--workers`
+- **Interactive TUI** (`tui.py`) — 5-tab terminal UI backed by SQLite
+
+## TUI
+
+```bash
+./tui.py
+# or
+python tui.py
+```
+
+Tabs:
+- **1 Browse** — DirectoryTree path browser, manual path entry, recent paths
+- **2 Setup** — auto-detect deps, build whisper.cpp, download ggml models, pip install
+- **3 Transcribe** — all job settings (backend, model, format, translation)
+- **4 History** — SQLite-backed job history with status and timing
+- **5 Settings** — persistent config (replaces `.env`), export to `.env`
+
+Keyboard shortcuts: `Ctrl+R` run · `Ctrl+D` dry-run · `Ctrl+K` kill · `Ctrl+S` save · `1-5` tabs · `Ctrl+Q` quit
 
 ## Requirements
 
@@ -35,8 +53,9 @@ pip install -r requirements.txt
 Optional backends:
 
 ```bash
-pip install -r requirements-whisper.txt
-pip install -r requirements-whisperx.txt
+pip install -r requirements-faster-whisper.txt  # faster-whisper (recommended Python backend)
+pip install -r requirements-whisper.txt          # openai-whisper
+pip install -r requirements-whisperx.txt         # whisperX + diarization
 ```
 
 ## whisper.cpp setup

@@ -1,0 +1,5 @@
+# requirements-faster-whisper.txt
+# Python backend using faster-whisper (CTranslate2-based, fastest CPU option)
+# Install with: pip install -r requirements-faster-whisper.txt
+
+faster-whisper>=1.0.0

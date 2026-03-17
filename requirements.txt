@@ -6,9 +6,10 @@
 # TUI dependencies:
 #   pip install -r requirements.txt
 #
-# Optional Python transcription backend:
-#   pip install -r requirements-whisper.txt   (faster-whisper)
-#   pip install -r requirements-whisperx.txt  (whisperX)
+# Optional Python transcription backends:
+#   pip install -r requirements-faster-whisper.txt  (faster-whisper, recommended)
+#   pip install -r requirements-whisper.txt         (openai-whisper)
+#   pip install -r requirements-whisperx.txt        (whisperX + diarization)
 
 textual>=0.80.0
 python-dotenv>=1.0.0
