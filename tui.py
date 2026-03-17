@@ -35,7 +35,7 @@ import time
 import urllib.error
 import urllib.request
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
 
 from dotenv import load_dotenv
 from textual import work
@@ -98,6 +98,30 @@ KNOWN_MODELS: list[str] = [
 BACKENDS = ["whisper-cpp", "faster-whisper", "whisper", "whisperx"]
 DEVICES = ["cpu", "auto", "cuda", "mps"]
 FORMATS = ["srt", "vtt", "txt", "tsv", "json"]
+SEARCH_RESULT_LIMIT = 60
+
+VIDEO_INPUT_EXTENSIONS: frozenset[str] = frozenset(
+    {
+        ".mp4",
+        ".mkv",
+        ".mov",
+        ".avi",
+        ".wmv",
+        ".flv",
+        ".webm",
+        ".m4v",
+        ".ts",
+        ".mts",
+        ".m2ts",
+        ".mpeg",
+        ".mpg",
+        ".3gp",
+        ".ogv",
+        ".rmvb",
+        ".vob",
+        ".divx",
+    }
+)
 
 ENV_WCPP_BIN = "VID_TO_SUB_WHISPER_CPP_BIN"
 ENV_WCPP_MODEL = "VID_TO_SUB_WHISPER_CPP_MODEL"
@@ -139,6 +163,7 @@ DetectResult = dict[str, tuple[bool, str]]  # name -> (found, detail)
 def detect_all() -> DetectResult:
     """Scan system for required / optional dependencies."""
     results: DetectResult = {}
+    ggml_models = discover_ggml_models()
 
     # ffmpeg
     p = shutil.which("ffmpeg")
@@ -159,14 +184,7 @@ def detect_all() -> DetectResult:
     if wmodel and Path(wmodel).exists():
         results["ggml-model"] = (True, wmodel)
     else:
-        found_model: str | None = None
-        for d in MODEL_SEARCH_DIRS:
-            dp = Path(d)
-            if dp.is_dir():
-                bins = sorted(dp.glob("ggml-*.bin"))
-                if bins:
-                    found_model = str(bins[0])
-                    break
+        found_model = preferred_ggml_model_path(ggml_models)
         results["ggml-model"] = (
             bool(found_model),
             found_model or "no ggml-*.bin found",
@@ -225,6 +243,118 @@ def _mask(cmd: list[str]) -> list[str]:
         else:
             out.append(tok)
     return out
+
+
+def _candidate_model_dirs() -> list[Path]:
+    dirs: list[Path] = []
+    seen: set[str] = set()
+    configured = _db.get("tui.model_dir")
+    raw_dirs = [configured] if configured else []
+    raw_dirs.extend(MODEL_SEARCH_DIRS)
+    for raw in raw_dirs:
+        path = Path(raw).expanduser()
+        if not path.is_absolute():
+            path = SCRIPT_DIR / path
+        key = str(path.resolve()) if path.exists() else str(path)
+        if key in seen:
+            continue
+        seen.add(key)
+        dirs.append(path)
+    return dirs
+
+
+def discover_ggml_models(
+    search_dirs: Sequence[str | Path] | None = None,
+) -> dict[str, str]:
+    """Return whisper.cpp model names mapped to absolute ggml file paths."""
+    found: dict[str, str] = {}
+    dirs = [Path(p) for p in search_dirs] if search_dirs is not None else _candidate_model_dirs()
+    for raw_dir in dirs:
+        path = raw_dir.expanduser()
+        if not path.is_absolute():
+            path = SCRIPT_DIR / path
+        if not path.is_dir():
+            continue
+        for candidate in sorted(path.glob("ggml-*.bin")):
+            model_name = candidate.name.removeprefix("ggml-").removesuffix(".bin")
+            if model_name and model_name not in found:
+                found[model_name] = str(candidate.resolve())
+    return found
+
+
+def summarize_ggml_models(models: dict[str, str], limit: int = 4) -> str:
+    if not models:
+        return "no ggml-*.bin found"
+    names = sorted(models)
+    preview = ", ".join(names[:limit])
+    remainder = len(names) - limit
+    suffix = f" (+{remainder} more)" if remainder > 0 else ""
+    return f"{len(names)} detected: {preview}{suffix}"
+
+
+def preferred_ggml_model_path(models: dict[str, str]) -> str:
+    if DEFAULT_MODEL in models:
+        return models[DEFAULT_MODEL]
+    if models:
+        first_name = sorted(models)[0]
+        return models[first_name]
+    return ""
+
+
+def _search_terms(query: str) -> list[str]:
+    return [term for term in re.split(r"\s+", query.strip().lower()) if term]
+
+
+def _matches_search(path: Path, root: Path, terms: Sequence[str]) -> bool:
+    try:
+        rel = str(path.relative_to(root)).lower()
+    except ValueError:
+        rel = str(path).lower()
+    name = path.name.lower()
+    return all(term in name or term in rel for term in terms)
+
+
+def discover_input_matches(root: Path, query: str, limit: int = SEARCH_RESULT_LIMIT) -> list[str]:
+    """Search *root* recursively for directories and video files matching *query*."""
+    if limit < 1:
+        return []
+
+    root = root.expanduser()
+    terms = _search_terms(query)
+    if not terms or not root.is_dir():
+        return []
+
+    matches: list[str] = []
+    seen: set[str] = set()
+
+    for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
+        dirnames.sort()
+        filenames.sort()
+        current_dir = Path(dirpath)
+
+        if current_dir != root and _matches_search(current_dir, root, terms):
+            resolved = str(current_dir.resolve())
+            if resolved not in seen:
+                matches.append(resolved)
+                seen.add(resolved)
+                if len(matches) >= limit:
+                    return matches
+
+        for filename in filenames:
+            candidate = current_dir / filename
+            if candidate.suffix.lower() not in VIDEO_INPUT_EXTENSIONS:
+                continue
+            if not _matches_search(candidate, root, terms):
+                continue
+            resolved = str(candidate.resolve())
+            if resolved in seen:
+                continue
+            matches.append(resolved)
+            seen.add(resolved)
+            if len(matches) >= limit:
+                return matches
+
+    return matches
 
 
 # ---------------------------------------------------------------------------
@@ -310,6 +440,22 @@ DirectoryTree { height: 1fr; }
 #manual-add-row { height: 3; align: left middle; margin-top: 0; }
 #manual-add-row Input { width: 1fr; }
 #manual-add-row Button { width: 5; margin-left: 1; }
+#search-row { height: 3; align: left middle; margin-top: 1; }
+#search-row Input { width: 1fr; }
+#search-row Button { width: 8; margin-left: 1; }
+#search-status { height: auto; padding: 0 1; margin-bottom: 1; color: $text-muted; }
+#search-results-box {
+    height: auto;
+    max-height: 12;
+    overflow-y: auto;
+    border: solid $panel;
+    padding: 0 1;
+    min-height: 4;
+}
+.search-row { height: 2; align: left middle; }
+.search-label { width: 1fr; overflow: hidden; }
+.search-go { width: 5; margin-right: 1; }
+.search-add { width: 5; }
 #outdir-row { height: auto; margin-top: 1; layout: horizontal; align: left middle; }
 #outdir-label { width: 14; color: $text-muted; }
 #inp-output-dir { width: 1fr; }
@@ -414,8 +560,10 @@ class VidToSubApp(App):
         super().__init__()
         _db.seed_defaults()
         self._selected_paths: list[str] = []
+        self._search_results: list[str] = []
         self._tree_selection: Path | None = None
         self._detect_results: DetectResult = {}
+        self._detected_ggml_models: dict[str, str] = {}
         self._active_worker: Worker | None = None
         self._proc: subprocess.Popen | None = None
         self._hist_key: str | None = None
@@ -471,6 +619,26 @@ class VidToSubApp(App):
                                 )
                                 yield Button(
                                     "＋", id="btn-manual-add", variant="default"
+                                )
+
+                            yield Static("Quick Search", classes="stitle")
+                            with Horizontal(id="search-row"):
+                                yield Input(
+                                    placeholder="Find directories or video files under root…",
+                                    id="inp-path-search",
+                                )
+                                yield Button("Find", id="btn-search-paths")
+                                yield Button("Clear", id="btn-clear-search")
+                            yield Static(
+                                "[dim]Type at least 2 characters. Results stay inside the current root path.[/]",
+                                id="search-status",
+                                markup=True,
+                            )
+                            with Vertical(id="search-results-box"):
+                                yield Static(
+                                    "[dim]Type a keyword to search the current root.[/]",
+                                    id="search-empty",
+                                    markup=True,
                                 )
 
                             with Horizontal(id="outdir-row"):
@@ -696,6 +864,11 @@ class VidToSubApp(App):
                                 id="inp-wcpp-model",
                                 classes="fwidget",
                             )
+                        yield Static(
+                            "[dim]Auto-detect scans known model directories and matches ggml-<model>.bin.[/]",
+                            id="wcpp-model-status",
+                            markup=True,
+                        )
                         with Horizontal(classes="crow"):
                             yield Label("Diarize (whisperX only)")
                             yield Switch(id="sw-diarize", value=False)
@@ -850,11 +1023,26 @@ class VidToSubApp(App):
             self.query_one("#tree-root", Input).value = root
         except (NoMatches, Exception):
             pass
+        self._update_wcpp_model_status()
 
     # ── Event handlers ────────────────────────────────────────────────────
 
-    def on_input_changed(self, _: Input.Changed) -> None:
+    def on_input_changed(self, event: Input.Changed) -> None:
         self._update_cmd_preview()
+        if event.input.id == "inp-path-search":
+            query = event.value.strip()
+            if not query:
+                self._clear_path_search(
+                    "[dim]Type a keyword to search the current root.[/]"
+                )
+            elif len(query) < 2:
+                self._clear_path_search(
+                    "[dim]Type at least 2 characters to start searching.[/]"
+                )
+            else:
+                self._start_path_search()
+        elif event.input.id in {"inp-wcpp-model", "tree-root"}:
+            self._update_wcpp_model_status()
 
     def on_input_submitted(self, event: Input.Submitted) -> None:
         if event.input.id == "tree-root":
@@ -864,8 +1052,11 @@ class VidToSubApp(App):
             if path:
                 self._add_path(path)
                 event.input.value = ""
+        elif event.input.id == "inp-path-search":
+            self._start_path_search()
 
     def on_select_changed(self, _: Select.Changed) -> None:
+        self._update_wcpp_model_status()
         self._update_cmd_preview()
 
     def on_checkbox_changed(self, event: Checkbox.Changed) -> None:
@@ -967,6 +1158,14 @@ class VidToSubApp(App):
             self._selected_paths.clear()
             self._refresh_sel_paths()
             self._update_cmd_preview()
+        elif bid == "btn-search-paths":
+            self._start_path_search()
+        elif bid == "btn-clear-search":
+            try:
+                self.query_one("#inp-path-search", Input).value = ""
+            except NoMatches:
+                pass
+            self._clear_path_search("[dim]Type a keyword to search the current root.[/]")
         elif bid.startswith("selrm-"):
             try:
                 idx = int(bid.removeprefix("selrm-"))
@@ -983,6 +1182,23 @@ class VidToSubApp(App):
                 if idx < len(recent):
                     self._add_path(recent[idx]["path"])
             except (ValueError, IndexError):
+                pass
+        elif bid.startswith("sgo-"):
+            try:
+                idx = int(bid.removeprefix("sgo-"))
+                if 0 <= idx < len(self._search_results):
+                    target = Path(self._search_results[idx])
+                    self._tree_selection = target
+                    self._goto_tree(str(target if target.is_dir() else target.parent))
+            except ValueError:
+                pass
+        elif bid.startswith("sadd-"):
+            try:
+                idx = int(bid.removeprefix("sadd-"))
+                if 0 <= idx < len(self._search_results):
+                    self._tree_selection = Path(self._search_results[idx])
+                    self._add_path(self._search_results[idx])
+            except ValueError:
                 pass
 
         # ── Setup ──────────────────────────────────────────────
@@ -1068,6 +1284,8 @@ class VidToSubApp(App):
                 self.query_one("#tree-root", Input).value = str(target)
             except NoMatches:
                 pass
+            if len(self._val("inp-path-search")) >= 2:
+                self._start_path_search()
 
     def _add_path(self, path: str) -> None:
         if path and path not in self._selected_paths:
@@ -1115,6 +1333,74 @@ class VidToSubApp(App):
             row.mount(
                 Button("＋", id=f"radd-{i}", classes="recent-add", variant="default")
             )
+
+    def _clear_path_search(self, status: str) -> None:
+        self._search_results = []
+        try:
+            self.query_one("#search-status", Static).update(status)
+        except NoMatches:
+            pass
+        self._refresh_search_results()
+
+    def _refresh_search_results(self) -> None:
+        try:
+            box = self.query_one("#search-results-box")
+        except NoMatches:
+            return
+        box.remove_children()
+        if not self._search_results:
+            box.mount(Static("[dim]No search results yet.[/]", markup=True))
+            return
+        for i, path in enumerate(self._search_results):
+            target = Path(path)
+            label = path + ("/" if target.is_dir() else "")
+            row = Horizontal(classes="search-row")
+            box.mount(row)
+            row.mount(Button("Go", id=f"sgo-{i}", classes="search-go"))
+            row.mount(Static(label, classes="search-label", markup=False))
+            row.mount(
+                Button("＋", id=f"sadd-{i}", classes="search-add", variant="default")
+            )
+
+    def _start_path_search(self) -> None:
+        query = self._val("inp-path-search")
+        if len(query) < 2:
+            self._clear_path_search("[dim]Type at least 2 characters to start searching.[/]")
+            return
+        root = Path(self._val("tree-root") or str(Path.home())).expanduser()
+        if not root.is_dir():
+            self._clear_path_search(f"[red]Search root not found:[/] {root}")
+            return
+        try:
+            self.query_one("#search-status", Static).update(
+                f"[cyan]Searching under[/] {root}"
+            )
+        except NoMatches:
+            pass
+        self._search_input_paths(str(root), query)
+
+    @work(thread=True, exclusive=True, exit_on_error=False, name="path-search")
+    def _search_input_paths(self, root: str, query: str) -> None:
+        root_path = Path(root)
+        results = discover_input_matches(root_path, query, limit=SEARCH_RESULT_LIMIT)
+        if results:
+            count_label = f"{len(results)} result(s)"
+            if len(results) >= SEARCH_RESULT_LIMIT:
+                count_label += f" (showing first {SEARCH_RESULT_LIMIT})"
+            status = (
+                f"[green]{count_label}[/] for [bold]{query}[/] under {root_path}"
+            )
+        else:
+            status = f"[yellow]No matches[/] for [bold]{query}[/] under {root_path}"
+        self.call_from_thread(self._apply_path_search_results, results, status)
+
+    def _apply_path_search_results(self, results: list[str], status: str) -> None:
+        self._search_results = results
+        try:
+            self.query_one("#search-status", Static).update(status)
+        except NoMatches:
+            pass
+        self._refresh_search_results()
 
     # ── Setup tab ─────────────────────────────────────────────────────────
 
@@ -1177,6 +1463,7 @@ class VidToSubApp(App):
 
     @work(thread=True, exclusive=False, exit_on_error=False)
     def _run_detection(self) -> None:
+        self._detected_ggml_models = discover_ggml_models()
         results = detect_all()
         self._detect_results = results
         self.call_from_thread(self._update_detect_ui, results)
@@ -1184,6 +1471,8 @@ class VidToSubApp(App):
     def _update_detect_ui(self, results: DetectResult) -> None:
         for name, (found, detail) in results.items():
             icon = "[green]✅[/]" if found else "[red]❌[/]"
+            if name == "ggml-model" and self._detected_ggml_models:
+                detail = summarize_ggml_models(self._detected_ggml_models)
             dshort = detail[:55] + "…" if len(detail) > 56 else detail
             try:
                 self.query_one(f"#det-{name}", Static).update(
@@ -1207,11 +1496,50 @@ class VidToSubApp(App):
         if results.get("ggml-model", (False,))[0] and not _db.get(ENV_WCPP_MODEL):
             _db.set(ENV_WCPP_MODEL, wmod)
             os.environ[ENV_WCPP_MODEL] = wmod
-            for wid in ("stg-wcpp-model", "inp-wcpp-model"):
+            for wid in ("stg-wcpp-model",):
                 try:
                     self.query_one(f"#{wid}", Input).value = wmod
                 except NoMatches:
                     pass
+        self._update_wcpp_model_status()
+
+    def _resolved_wcpp_model_path(self) -> str:
+        if manual := self._val("inp-wcpp-model"):
+            return manual
+        selected_model = self._sel("sel-model", DEFAULT_MODEL)
+        return self._detected_ggml_models.get(selected_model, "")
+
+    def _update_wcpp_model_status(self) -> None:
+        backend = self._sel("sel-backend", DEFAULT_BACKEND)
+        manual = self._val("inp-wcpp-model")
+        selected_model = self._sel("sel-model", DEFAULT_MODEL)
+        auto_path = self._detected_ggml_models.get(selected_model, "")
+
+        if backend != "whisper-cpp":
+            status = "[dim]GGML auto-detect is used only with the whisper-cpp backend.[/]"
+        elif manual:
+            status = f"[yellow]Manual override[/] {manual}"
+        elif auto_path:
+            filename = Path(auto_path).name
+            status = f"[green]Auto[/] {filename} -> {auto_path}"
+        elif self._detected_ggml_models:
+            available = ", ".join(sorted(self._detected_ggml_models)[:4])
+            extra = len(self._detected_ggml_models) - 4
+            more = f" (+{extra} more)" if extra > 0 else ""
+            status = (
+                f"[yellow]No ggml-{selected_model}.bin detected.[/] "
+                f"Available: {available}{more}"
+            )
+        else:
+            status = (
+                f"[yellow]No GGML model detected for {selected_model}.[/] "
+                "Use Setup -> Download Model or set a manual override."
+            )
+
+        try:
+            self.query_one("#wcpp-model-status", Static).update(status)
+        except NoMatches:
+            pass
 
     @work(thread=True, exclusive=False, exit_on_error=False, name="build-whisper")
     def _build_whisper_cpp(self) -> None:
@@ -1425,8 +1753,10 @@ class VidToSubApp(App):
             for f in fmts:
                 cmd += ["--format", f]
 
-        cmd += ["--backend", self._sel("sel-backend", DEFAULT_BACKEND)]
-        cmd += ["--model", self._sel("sel-model", DEFAULT_MODEL)]
+        backend = self._sel("sel-backend", DEFAULT_BACKEND)
+        model = self._sel("sel-model", DEFAULT_MODEL)
+        cmd += ["--backend", backend]
+        cmd += ["--model", model]
         cmd += ["--device", self._sel("sel-device", DEFAULT_DEVICE)]
 
         if v := self._val("inp-language"):
@@ -1442,7 +1772,7 @@ class VidToSubApp(App):
         if workers != "1":
             cmd += ["--workers", workers]
 
-        if v := self._val("inp-wcpp-model"):
+        if backend == "whisper-cpp" and (v := self._resolved_wcpp_model_path()):
             cmd += ["--whisper-cpp-model-path", v]
 
         if self._sw("sw-translate"):
@@ -1486,6 +1816,14 @@ class VidToSubApp(App):
         # whisper-cli binary override from Transcribe tab
         if v := self._val("inp-wcpp-bin"):
             env[ENV_WCPP_BIN] = v
+        backend = self._sel("sel-backend", DEFAULT_BACKEND)
+        if backend == "whisper-cpp":
+            resolved_model = self._resolved_wcpp_model_path()
+            stored_model = _db.get(ENV_WCPP_MODEL)
+            if resolved_model:
+                env[ENV_WCPP_MODEL] = resolved_model
+            elif stored_model and stored_model in self._detected_ggml_models.values():
+                env.pop(ENV_WCPP_MODEL, None)
         # Translation overrides
         for wid, evar in [
             ("inp-trans-url", ENV_TRANS_URL),
@@ -1706,7 +2044,6 @@ class VidToSubApp(App):
             ("inp-trans-key", ENV_TRANS_KEY),
             ("inp-trans-model", ENV_TRANS_MOD),
             ("inp-wcpp-bin", ENV_WCPP_BIN),
-            ("inp-wcpp-model", ENV_WCPP_MODEL),
         ]:
             try:
                 val = _db.get(key) or os.environ.get(key, "")
@@ -1735,6 +2072,8 @@ class VidToSubApp(App):
                 pass
         _db.set_many(data)
         self._apply_db_to_env()
+        self._run_detection()
+        self._update_wcpp_model_status()
         try:
             self.query_one("#stg-status", Static).update("[green]✓ Saved to SQLite[/]")
         except NoMatches:
