@@ -3,7 +3,12 @@
 # Default transcription backend is whisper.cpp, which is an external binary,
 # not a Python package. Install ffmpeg + whisper-cli separately.
 #
-# Optional Python backend:
+# TUI dependencies:
 #   pip install -r requirements.txt
+#
+# Optional Python transcription backend:
+#   pip install -r requirements-whisper.txt   (faster-whisper)
+#   pip install -r requirements-whisperx.txt  (whisperX)
 
-faster-whisper>=1.0.0
+textual>=0.80.0
+python-dotenv>=1.0.0

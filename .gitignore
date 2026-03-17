@@ -29,6 +29,11 @@ dist/
 .env.*
 !.env.example
 
+# SQLite database (user data, not version-controlled)
+*.db
+*.db-shm
+*.db-wal
+
 # Editor and OS metadata
 .idea/
 .vscode/
