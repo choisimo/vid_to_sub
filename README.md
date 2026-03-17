@@ -1,4 +1,5 @@
 # vid_to_sub
+<img width="942" height="1122" alt="스크린샷_20260318_033855" src="https://github.com/user-attachments/assets/33bb1db1-2656-4112-8e60-0342816332ff" />
 
 Recursively transcribe video files to subtitle files.
 
