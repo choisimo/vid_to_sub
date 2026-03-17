@@ -28,9 +28,9 @@ python tui.py
 ```
 
 Tabs:
-- **1 Browse** — DirectoryTree path browser, manual path entry, recent paths
-- **2 Setup** — auto-detect deps, build whisper.cpp, download ggml models, pip install
-- **3 Transcribe** — all job settings (backend, model, format, translation)
+- **1 Browse** — DirectoryTree path browser, quick recursive path search, manual path entry, recent paths
+- **2 Setup** — auto-detect deps and installed ggml models, build whisper.cpp, download ggml models, pip install
+- **3 Transcribe** — all job settings (backend, model, format, translation) with automatic ggml model matching for `whisper.cpp`
 - **4 History** — SQLite-backed job history with status and timing
 - **5 Settings** — persistent config (replaces `.env`), export to `.env`
 
