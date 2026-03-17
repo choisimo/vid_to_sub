@@ -1,0 +1,12 @@
+# requirements-whisperx.txt
+# Full install for whisperx backend (includes diarization support)
+# Install with: pip install -r requirements-whisperx.txt
+#
+# NOTES:
+#   - Diarization requires accepting gated pyannote models on Hugging Face:
+#       https://huggingface.co/pyannote/speaker-diarization-3.1
+#   - Pass your HF token via --hf-token or env var HUGGING_FACE_HUB_TOKEN
+
+whisperx>=3.1.0
+torch>=2.0.0          # install GPU build separately if needed: https://pytorch.org/get-started/locally/
+torchaudio>=2.0.0

@@ -1,0 +1,7 @@
+# requirements-whisper.txt
+# Full install for openai-whisper backend
+# Install with: pip install -r requirements-whisper.txt
+
+openai-whisper>=20230314
+torch>=2.0.0          # install GPU build separately if needed: https://pytorch.org/get-started/locally/
+torchaudio>=2.0.0
