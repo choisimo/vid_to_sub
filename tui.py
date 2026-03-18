@@ -2,7 +2,7 @@
 """
 tui.py — vid_to_sub TUI v2
 ===========================
-5-tab terminal UI backed by SQLite.
+6-tab terminal UI backed by SQLite.
 
 Tabs
 ----
@@ -11,6 +11,7 @@ Tabs
   3  Transcribe — All job settings (backend / model / formats / translation)
   4  History    — SQLite-backed job history
   5  Settings   — Persistent configuration (SQLite)
+  6  Agent      — OpenAI-compatible bounded setup assistant
 
 Keyboard shortcuts
 ------------------
@@ -19,7 +20,7 @@ Keyboard shortcuts
   Ctrl+K   Kill
   Ctrl+S   Save settings
   Ctrl+Q   Quit
-  1–5      Switch tabs
+  1–6      Switch tabs
 """
 
 from __future__ import annotations
@@ -58,6 +59,7 @@ from textual.widgets import (
     Switch,
     TabbedContent,
     TabPane,
+    TextArea,
 )
 from textual.worker import Worker, WorkerState
 
@@ -128,6 +130,9 @@ ENV_WCPP_MODEL = "VID_TO_SUB_WHISPER_CPP_MODEL"
 ENV_TRANS_URL = "VID_TO_SUB_TRANSLATION_BASE_URL"
 ENV_TRANS_KEY = "VID_TO_SUB_TRANSLATION_API_KEY"
 ENV_TRANS_MOD = "VID_TO_SUB_TRANSLATION_MODEL"
+ENV_AGENT_URL = "VID_TO_SUB_AGENT_BASE_URL"
+ENV_AGENT_KEY = "VID_TO_SUB_AGENT_API_KEY"
+ENV_AGENT_MOD = "VID_TO_SUB_AGENT_MODEL"
 
 # Common locations to search for whisper-cli
 WHISPER_CLI_CANDIDATES: list[str] = [
@@ -149,6 +154,49 @@ MODEL_SEARCH_DIRS: list[str] = [
 ]
 
 HF_MODEL_BASE = "https://huggingface.co/ggerganov/whisper.cpp/resolve/main"
+
+PIP_REQUIREMENT_FILES: dict[str, tuple[str, str]] = {
+    "base": ("requirements.txt", "base TUI/runtime requirements"),
+    "faster-whisper": (
+        "requirements-faster-whisper.txt",
+        "faster-whisper backend requirements",
+    ),
+    "whisper": ("requirements-whisper.txt", "openai-whisper backend requirements"),
+    "whisperx": ("requirements-whisperx.txt", "whisperX backend requirements"),
+}
+
+SYSTEM_PACKAGE_MAP: dict[str, dict[str, tuple[str, ...]]] = {
+    "apt-get": {
+        "ffmpeg": ("ffmpeg",),
+        "git": ("git",),
+        "cmake": ("cmake",),
+        "whisper-build": ("build-essential", "pkg-config"),
+    },
+    "dnf": {
+        "ffmpeg": ("ffmpeg",),
+        "git": ("git",),
+        "cmake": ("cmake",),
+        "whisper-build": ("gcc-c++", "make", "pkgconf-pkg-config"),
+    },
+    "yum": {
+        "ffmpeg": ("ffmpeg",),
+        "git": ("git",),
+        "cmake": ("cmake",),
+        "whisper-build": ("gcc-c++", "make", "pkgconfig"),
+    },
+    "pacman": {
+        "ffmpeg": ("ffmpeg",),
+        "git": ("git",),
+        "cmake": ("cmake",),
+        "whisper-build": ("base-devel", "pkgconf"),
+    },
+    "brew": {
+        "ffmpeg": ("ffmpeg",),
+        "git": ("git",),
+        "cmake": ("cmake",),
+        "whisper-build": ("pkg-config",),
+    },
+}
 
 # Module-level database singleton
 _db = Database()
@@ -198,6 +246,7 @@ def detect_all() -> DetectResult:
     # Python packages
     for pkg, modname in [
         ("faster-whisper", "faster_whisper"),
+        ("whisper", "whisper"),
         ("whisperx", "whisperx"),
     ]:
         spec = importlib.util.find_spec(modname)
@@ -357,6 +406,75 @@ def discover_input_matches(root: Path, query: str, limit: int = SEARCH_RESULT_LI
     return matches
 
 
+def detect_package_manager() -> str | None:
+    for manager in SYSTEM_PACKAGE_MAP:
+        if shutil.which(manager):
+            return manager
+    return None
+
+
+def packages_for_manager(manager: str, tools: Sequence[str]) -> list[str]:
+    mapping = SYSTEM_PACKAGE_MAP.get(manager, {})
+    packages: list[str] = []
+    seen: set[str] = set()
+    for tool in tools:
+        for package in mapping.get(tool, ()):
+            if package not in seen:
+                packages.append(package)
+                seen.add(package)
+    return packages
+
+
+def build_system_install_commands(
+    manager: str,
+    tools: Sequence[str],
+    *,
+    use_sudo: bool,
+) -> list[list[str]]:
+    packages = packages_for_manager(manager, tools)
+    if not packages:
+        return []
+
+    prefix = ["sudo", "-n"] if use_sudo and manager != "brew" else []
+    if manager == "apt-get":
+        return [
+            prefix + ["apt-get", "update"],
+            prefix + ["apt-get", "install", "-y", *packages],
+        ]
+    if manager in {"dnf", "yum"}:
+        return [prefix + [manager, "install", "-y", *packages]]
+    if manager == "pacman":
+        return [prefix + ["pacman", "-Sy", "--noconfirm", *packages]]
+    if manager == "brew":
+        return [["brew", "install", *packages]]
+    return []
+
+
+def normalize_chat_endpoint(base_url: str) -> str:
+    endpoint = base_url.rstrip("/")
+    if not endpoint.endswith("/chat/completions"):
+        endpoint = endpoint + "/chat/completions"
+    return endpoint
+
+
+def extract_json_payload(text: str) -> dict[str, Any]:
+    cleaned = text.strip()
+    if cleaned.startswith("```"):
+        cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned)
+        cleaned = re.sub(r"\s*```$", "", cleaned)
+    try:
+        payload = json.loads(cleaned)
+    except json.JSONDecodeError:
+        start = cleaned.find("{")
+        end = cleaned.rfind("}")
+        if start < 0 or end <= start:
+            raise
+        payload = json.loads(cleaned[start : end + 1])
+    if not isinstance(payload, dict):
+        raise ValueError("Agent response must be a JSON object")
+    return payload
+
+
 # ---------------------------------------------------------------------------
 # CSS
 # ---------------------------------------------------------------------------
@@ -486,6 +604,12 @@ DirectoryTree { height: 1fr; }
 .inst-row { height: 3; align: left middle; layout: horizontal; padding: 0 1; }
 .inst-label { width: 18; color: $text-muted; }
 .inst-field { width: 1fr; }
+#auto-setup-status {
+    height: auto;
+    padding: 0 1;
+    margin-bottom: 1;
+    color: $text-muted;
+}
 #setup-log {
     height: 12;
     border: solid $panel;
@@ -513,6 +637,27 @@ DirectoryTree { height: 1fr; }
 #stg-actions { height: 3; align: left middle; margin-top: 1; }
 #stg-actions Button { margin-right: 1; }
 #stg-status { height: 1; color: $success; padding: 0 1; }
+
+/* ── Agent tab ───────────────────────────────────── */
+#agent-help, #agent-config, #agent-status {
+    height: auto;
+    padding: 0 1;
+    color: $text-muted;
+}
+#agent-prompt {
+    height: 10;
+    border: solid $panel;
+    margin: 0 1 1 1;
+}
+#agent-actions { height: 3; align: left middle; padding: 0 1; }
+#agent-actions Button { margin-right: 1; }
+#agent-log {
+    height: 1fr;
+    min-height: 12;
+    border: solid $panel;
+    background: $surface-darken-1;
+    margin: 0 1;
+}
 
 /* ── Bottom panel ────────────────────────────────── */
 #bottom { height: auto; border-top: solid $primary; padding: 0 1; }
@@ -554,6 +699,7 @@ class VidToSubApp(App):
         Binding("3", "tab('tab-transcribe')", show=False),
         Binding("4", "tab('tab-history')", show=False),
         Binding("5", "tab('tab-settings')", show=False),
+        Binding("6", "tab('tab-agent')", show=False),
     ]
 
     def __init__(self) -> None:
@@ -564,6 +710,7 @@ class VidToSubApp(App):
         self._tree_selection: Path | None = None
         self._detect_results: DetectResult = {}
         self._detected_ggml_models: dict[str, str] = {}
+        self._agent_plan: dict[str, Any] | None = None
         self._active_worker: Worker | None = None
         self._proc: subprocess.Popen | None = None
         self._hist_key: str | None = None
@@ -672,6 +819,7 @@ class VidToSubApp(App):
                             "cmake",
                             "git",
                             "faster-whisper",
+                            "whisper",
                             "whisperx",
                         ):
                             yield Static(
@@ -684,6 +832,24 @@ class VidToSubApp(App):
                             yield Button(
                                 "🔍 Re-detect", id="btn-redetect", variant="default"
                             )
+
+                        yield Static("Automatic Setup", classes="stitle")
+                        with Horizontal(classes="crow"):
+                            yield Button(
+                                "🚀 Auto Setup",
+                                id="btn-auto-setup",
+                                variant="primary",
+                            )
+                            yield Button(
+                                "🧩 Full Install",
+                                id="btn-full-setup",
+                                variant="warning",
+                            )
+                        yield Static(
+                            "[dim]Best effort: install missing system tools, Python deps, build whisper.cpp, and download the selected model.[/]",
+                            id="auto-setup-status",
+                            markup=True,
+                        )
 
                         yield Static("Build whisper.cpp", classes="stitle")
                         with Horizontal(classes="inst-row"):
@@ -723,6 +889,11 @@ class VidToSubApp(App):
                             yield Button(
                                 "pip install faster-whisper",
                                 id="btn-pip-fw",
+                                variant="default",
+                            )
+                            yield Button(
+                                "pip install whisper",
+                                id="btn-pip-whisper",
                                 variant="default",
                             )
                             yield Button(
@@ -955,6 +1126,30 @@ class VidToSubApp(App):
                                 placeholder="gpt-4.1-mini",
                             )
 
+                        yield Static("AI Agent", classes="stitle")
+                        with Horizontal(classes="frow"):
+                            yield Label(ENV_AGENT_URL, classes="flabel")
+                            yield Input(
+                                id="stg-agent-url",
+                                classes="fwidget",
+                                placeholder="(blank = use translation URL)",
+                            )
+                        with Horizontal(classes="frow"):
+                            yield Label(ENV_AGENT_KEY, classes="flabel")
+                            yield Input(
+                                id="stg-agent-key",
+                                classes="fwidget",
+                                placeholder="(blank = use translation API key)",
+                                password=True,
+                            )
+                        with Horizontal(classes="frow"):
+                            yield Label(ENV_AGENT_MOD, classes="flabel")
+                            yield Input(
+                                id="stg-agent-model",
+                                classes="fwidget",
+                                placeholder="(blank = use translation model)",
+                            )
+
                         yield Static("Build & Installation", classes="stitle")
                         with Horizontal(classes="frow"):
                             yield Label("Build dir", classes="flabel")
@@ -980,6 +1175,51 @@ class VidToSubApp(App):
                             yield Button(
                                 "📤 Export .env", id="btn-export-env", variant="default"
                             )
+
+                # ── Tab 6: Agent ──────────────────────────────────────
+                with TabPane("6 Agent", id="tab-agent"):
+                    with ScrollableContainer(classes="tab-body"):
+                        yield Static("Prompt", classes="stitle")
+                        yield Static(
+                            "[dim]Uses OpenAI-compatible chat completions. Agent settings fall back to Translation API settings when blank.[/]",
+                            id="agent-help",
+                            markup=True,
+                        )
+                        yield Static("", id="agent-config", markup=True)
+                        yield TextArea(
+                            id="agent-prompt",
+                            soft_wrap=True,
+                            placeholder=(
+                                "Ask for setup help or actions, for example:\n"
+                                "- Install everything needed for whisper.cpp\n"
+                                "- Detect what is missing and fix it\n"
+                                "- Download large-v3 and prepare the default CPU pipeline"
+                            ),
+                        )
+                        with Horizontal(id="agent-actions"):
+                            yield Button(
+                                "Ask Agent", id="btn-agent-plan", variant="primary"
+                            )
+                            yield Button(
+                                "Apply Plan",
+                                id="btn-agent-apply",
+                                variant="success",
+                                disabled=True,
+                            )
+                            yield Button("Clear", id="btn-agent-clear")
+                        yield Static(
+                            "[dim]No agent plan yet.[/]",
+                            id="agent-status",
+                            markup=True,
+                        )
+                        yield RichLog(
+                            id="agent-log",
+                            highlight=True,
+                            markup=True,
+                            auto_scroll=True,
+                            wrap=True,
+                            max_lines=4000,
+                        )
 
         # ── Bottom panel (always visible) ─────────────────────────────────
         with Vertical(id="bottom"):
@@ -1024,6 +1264,7 @@ class VidToSubApp(App):
         except (NoMatches, Exception):
             pass
         self._update_wcpp_model_status()
+        self._update_agent_config_status()
 
     # ── Event handlers ────────────────────────────────────────────────────
 
@@ -1204,6 +1445,16 @@ class VidToSubApp(App):
         # ── Setup ──────────────────────────────────────────────
         elif bid == "btn-redetect":
             self._run_detection()
+        elif bid == "btn-auto-setup":
+            self._save_setup_build_fields()
+            self._save_setup_model_fields()
+            model = self._sel("sel-dl-model", DEFAULT_MODEL)
+            self._auto_setup(False, model)
+        elif bid == "btn-full-setup":
+            self._save_setup_build_fields()
+            self._save_setup_model_fields()
+            model = self._sel("sel-dl-model", DEFAULT_MODEL)
+            self._auto_setup(True, model)
         elif bid == "btn-build-whisper":
             self._save_setup_build_fields()
             self._build_whisper_cpp()
@@ -1213,6 +1464,8 @@ class VidToSubApp(App):
             self._download_model(model)
         elif bid == "btn-pip-fw":
             self._pip_install("faster-whisper")
+        elif bid == "btn-pip-whisper":
+            self._pip_install("whisper")
         elif bid == "btn-pip-wx":
             self._pip_install("whisperx")
 
@@ -1242,8 +1495,15 @@ class VidToSubApp(App):
             self._save_settings()
         elif bid == "btn-stg-reload":
             self._load_settings_form()
+            self._update_agent_config_status()
         elif bid == "btn-export-env":
             self._export_env()
+        elif bid == "btn-agent-plan":
+            self._request_agent_plan()
+        elif bid == "btn-agent-apply":
+            self._apply_agent_plan()
+        elif bid == "btn-agent-clear":
+            self._clear_agent_ui()
 
     # ── Actions ───────────────────────────────────────────────────────────
 
@@ -1461,12 +1721,20 @@ class VidToSubApp(App):
             self.call_from_thread(self._setup_log, f"[red]✗ Not found: {e}[/]")
             return False
 
-    @work(thread=True, exclusive=False, exit_on_error=False)
-    def _run_detection(self) -> None:
+    def _capture_detection_state(self) -> DetectResult:
         self._detected_ggml_models = discover_ggml_models()
         results = detect_all()
         self._detect_results = results
+        return results
+
+    def _refresh_detection_from_worker(self) -> DetectResult:
+        results = self._capture_detection_state()
         self.call_from_thread(self._update_detect_ui, results)
+        return results
+
+    @work(thread=True, exclusive=False, exit_on_error=False)
+    def _run_detection(self) -> None:
+        self._refresh_detection_from_worker()
 
     def _update_detect_ui(self, results: DetectResult) -> None:
         for name, (found, detail) in results.items():
@@ -1541,8 +1809,85 @@ class VidToSubApp(App):
         except NoMatches:
             pass
 
-    @work(thread=True, exclusive=False, exit_on_error=False, name="build-whisper")
-    def _build_whisper_cpp(self) -> None:
+    def _set_setup_status(self, message: str) -> None:
+        try:
+            self.query_one("#auto-setup-status", Static).update(message)
+        except NoMatches:
+            pass
+
+    def _system_install_tools(self, tools: Sequence[str], reason: str) -> bool:
+        log = lambda m: self.call_from_thread(self._setup_log, m)
+        manager = detect_package_manager()
+        wanted = list(dict.fromkeys(tools))
+
+        if not manager:
+            log("[yellow]⚠ No supported package manager detected for auto-install.[/]")
+            self.call_from_thread(
+                self._set_setup_status,
+                "[yellow]Auto-install skipped: no supported package manager detected.[/]",
+            )
+            return False
+
+        use_sudo = manager != "brew" and hasattr(os, "geteuid") and os.geteuid() != 0
+        if use_sudo and not shutil.which("sudo"):
+            log("[red]✗ sudo is not available, so system package auto-install cannot run.[/]")
+            self.call_from_thread(
+                self._set_setup_status,
+                "[red]Auto-install failed: sudo is required for system packages.[/]",
+            )
+            return False
+
+        commands = build_system_install_commands(manager, wanted, use_sudo=use_sudo)
+        if not commands:
+            log(
+                f"[yellow]⚠ No package mapping for {', '.join(wanted)} on {manager}. Skipping auto-install.[/]"
+            )
+            return False
+
+        log(
+            f"[cyan]Auto-installing system packages via {manager} for {reason}: {', '.join(wanted)}[/]"
+        )
+        if use_sudo:
+            log("[dim]Using sudo -n; password prompts are not supported in this TUI worker.[/]")
+        self.call_from_thread(
+            self._set_setup_status,
+            f"[cyan]Auto-installing system packages via {manager}…[/]",
+        )
+
+        for cmd in commands:
+            if not self._run_cmd(cmd):
+                log("[red]✗ System package auto-install failed.[/]")
+                self.call_from_thread(
+                    self._set_setup_status,
+                    "[red]System package auto-install failed. Check setup log.[/]",
+                )
+                self._refresh_detection_from_worker()
+                return False
+
+        log("[green]✅ System package auto-install completed.[/]")
+        self._refresh_detection_from_worker()
+        return True
+
+    def _install_requirement_target(self, target: str) -> bool:
+        log = lambda m: self.call_from_thread(self._setup_log, m)
+        spec = PIP_REQUIREMENT_FILES.get(target)
+        if not spec:
+            log(f"[red]✗ Unknown pip install target: {target}[/]")
+            return False
+        filename, label = spec
+        req_path = SCRIPT_DIR / filename
+        if not req_path.exists():
+            log(f"[red]✗ Requirement file not found: {req_path}[/]")
+            return False
+        self.call_from_thread(self._set_setup_status, f"[cyan]Installing {label}…[/]")
+        log(f"[cyan]Installing {label}…[/]")
+        ok = self._run_cmd([sys.executable, "-m", "pip", "install", "-r", str(req_path)])
+        if ok:
+            log(f"[green]✅ Installed {label}[/]")
+        self._refresh_detection_from_worker()
+        return ok
+
+    def _build_whisper_cpp_sync(self) -> bool:
         log = lambda m: self.call_from_thread(self._setup_log, m)
 
         build_dir = _db.get("tui.build_dir") or str(
@@ -1553,12 +1898,26 @@ class VidToSubApp(App):
         install_d = Path(install_dir).expanduser().resolve()
         repo_dir = build_root / "whisper.cpp"
 
+        missing_tools: list[str] = []
+        if not shutil.which("git"):
+            missing_tools.append("git")
+        if not shutil.which("cmake"):
+            missing_tools.append("cmake")
+        if missing_tools:
+            log(
+                f"[yellow]⚠ Missing build tools: {', '.join(missing_tools)} — attempting auto-install…[/]"
+            )
+            self._system_install_tools(
+                [*missing_tools, "whisper-build"],
+                "whisper.cpp build prerequisites",
+            )
+
         if not shutil.which("git"):
             log("[red]✗ git not found in PATH — needed for cloning[/]")
-            return
+            return False
         if not shutil.which("cmake"):
             log("[red]✗ cmake not found in PATH — needed for building[/]")
-            return
+            return False
 
         build_root.mkdir(parents=True, exist_ok=True)
 
@@ -1575,7 +1934,7 @@ class VidToSubApp(App):
             )
             if not ok:
                 log("[red]✗ Clone failed[/]")
-                return
+                return False
         else:
             log("[cyan]Pulling latest whisper.cpp…[/]")
             self._run_cmd(["git", "-C", str(repo_dir), "pull", "--ff-only"])
@@ -1593,7 +1952,7 @@ class VidToSubApp(App):
         )
         if not ok:
             log("[red]✗ cmake configure failed[/]")
-            return
+            return False
 
         nproc = str(os.cpu_count() or 4)
         log(f"[cyan]Building with {nproc} threads…[/]")
@@ -1613,7 +1972,7 @@ class VidToSubApp(App):
             ok = self._run_cmd(["cmake", "--build", str(cmake_build), "-j", nproc])
         if not ok:
             log("[red]✗ Build failed[/]")
-            return
+            return False
 
         # Locate binary
         candidates = [
@@ -1625,7 +1984,7 @@ class VidToSubApp(App):
         binary = next((c for c in candidates if c.exists()), None)
         if not binary:
             log("[red]✗ Built binary not found — check cmake output above[/]")
-            return
+            return False
 
         install_d.mkdir(parents=True, exist_ok=True)
         dest = install_d / "whisper-cli"
@@ -1635,7 +1994,7 @@ class VidToSubApp(App):
         except PermissionError:
             log(f"[red]✗ Permission denied writing to {dest}[/]")
             log(f"[yellow]  Tip: set Install dir to ~/.local/bin[/]")
-            return
+            return False
 
         _db.set(ENV_WCPP_BIN, str(dest))
         os.environ[ENV_WCPP_BIN] = str(dest)
@@ -1650,10 +2009,18 @@ class VidToSubApp(App):
         self.call_from_thread(_update_bin_inputs)
 
         log(f"[green]✅ whisper-cli installed → {dest}[/]")
-        self.call_from_thread(self._run_detection)
+        self.call_from_thread(
+            self._set_setup_status,
+            f"[green]whisper-cli installed → {dest}[/]",
+        )
+        self._refresh_detection_from_worker()
+        return True
 
-    @work(thread=True, exclusive=False, exit_on_error=False, name="download-model")
-    def _download_model(self, model_name: str) -> None:
+    @work(thread=True, exclusive=False, exit_on_error=False, name="build-whisper")
+    def _build_whisper_cpp(self) -> None:
+        self._build_whisper_cpp_sync()
+
+    def _download_model_sync(self, model_name: str) -> bool:
         log = lambda m: self.call_from_thread(self._setup_log, m)
 
         model_dir_s = _db.get("tui.model_dir") or str(SCRIPT_DIR / "models")
@@ -1670,12 +2037,20 @@ class VidToSubApp(App):
             log(f"[yellow]⚠ {filename} already at {dest} ({size:.0f} MB) — skipping[/]")
             _db.set(ENV_WCPP_MODEL, str(dest))
             os.environ[ENV_WCPP_MODEL] = str(dest)
-            self.call_from_thread(self._run_detection)
-            return
+            self.call_from_thread(
+                self._set_setup_status,
+                f"[green]{filename} already available.[/]",
+            )
+            self._refresh_detection_from_worker()
+            return True
 
         url = f"{HF_MODEL_BASE}/{filename}"
         log(f"[cyan]Downloading {filename}…[/]")
         log(f"[dim]  {url}[/]")
+        self.call_from_thread(
+            self._set_setup_status,
+            f"[cyan]Downloading {filename}…[/]",
+        )
 
         try:
             req = urllib.request.Request(url, headers={"User-Agent": "vid_to_sub/2"})
@@ -1702,26 +2077,394 @@ class VidToSubApp(App):
             log(f"[red]✗ Download failed: {e}[/]")
             if dest.exists():
                 dest.unlink()
-            return
+            self.call_from_thread(
+                self._set_setup_status,
+                f"[red]Download failed for {filename}. Check setup log.[/]",
+            )
+            return False
         except OSError as e:
             log(f"[red]✗ Write error: {e}[/]")
             if dest.exists():
                 dest.unlink()
-            return
+            self.call_from_thread(
+                self._set_setup_status,
+                f"[red]Could not write {filename}. Check setup log.[/]",
+            )
+            return False
 
         size = dest.stat().st_size / 1024 / 1024
         _db.set(ENV_WCPP_MODEL, str(dest))
         os.environ[ENV_WCPP_MODEL] = str(dest)
         log(f"[green]✅ {filename} saved → {dest} ({size:.0f} MB)[/]")
-        self.call_from_thread(self._run_detection)
+        self.call_from_thread(
+            self._set_setup_status,
+            f"[green]{filename} saved → {dest}[/]",
+        )
+        self._refresh_detection_from_worker()
+        return True
+
+    @work(thread=True, exclusive=False, exit_on_error=False, name="download-model")
+    def _download_model(self, model_name: str) -> None:
+        self._download_model_sync(model_name)
 
     @work(thread=True, exclusive=False, exit_on_error=False, name="pip-install")
     def _pip_install(self, package: str) -> None:
+        if package in PIP_REQUIREMENT_FILES:
+            self._install_requirement_target(package)
+            return
         self.call_from_thread(self._setup_log, f"[cyan]Installing {package}…[/]")
         ok = self._run_cmd([sys.executable, "-m", "pip", "install", package])
         if ok:
             self.call_from_thread(self._setup_log, f"[green]✅ {package} installed[/]")
-        self.call_from_thread(self._run_detection)
+        self._refresh_detection_from_worker()
+
+    def _auto_setup_sync(self, full: bool, model_name: str) -> None:
+        log = lambda m: self.call_from_thread(self._setup_log, m)
+        mode_label = "full install" if full else "auto setup"
+        self.call_from_thread(
+            self._set_setup_status,
+            f"[cyan]Running {mode_label}…[/]",
+        )
+        log(f"[bold cyan]Starting {mode_label}[/]")
+        self._refresh_detection_from_worker()
+
+        essential_tools = ["ffmpeg", "git", "cmake", "whisper-build"]
+        self._system_install_tools(essential_tools, "default whisper.cpp pipeline")
+        self._install_requirement_target("base")
+
+        if full:
+            for target in ("faster-whisper", "whisper", "whisperx"):
+                self._install_requirement_target(target)
+
+        self._build_whisper_cpp_sync()
+        self._download_model_sync(model_name)
+        results = self._refresh_detection_from_worker()
+
+        missing = [
+            name
+            for name in ("ffmpeg", "whisper-cli", "ggml-model")
+            if not results.get(name, (False, ""))[0]
+        ]
+        if missing:
+            summary = f"[yellow]{mode_label.title()} incomplete: missing {', '.join(missing)}[/]"
+            log(summary)
+            self.call_from_thread(self._set_setup_status, summary)
+        else:
+            summary = f"[green]✅ {mode_label.title()} complete[/]"
+            log(summary)
+            self.call_from_thread(self._set_setup_status, summary)
+
+    @work(thread=True, exclusive=False, exit_on_error=False, name="auto-setup")
+    def _auto_setup(self, full: bool, model_name: str) -> None:
+        self._auto_setup_sync(full, model_name)
+
+    def _effective_agent_config(self) -> tuple[str, str, str]:
+        model = (
+            _db.get(ENV_AGENT_MOD)
+            or _db.get(ENV_TRANS_MOD)
+            or os.environ.get(ENV_AGENT_MOD, "")
+            or os.environ.get(ENV_TRANS_MOD, "")
+        )
+        base_url = (
+            _db.get(ENV_AGENT_URL)
+            or _db.get(ENV_TRANS_URL)
+            or os.environ.get(ENV_AGENT_URL, "")
+            or os.environ.get(ENV_TRANS_URL, "")
+        )
+        api_key = (
+            _db.get(ENV_AGENT_KEY)
+            or _db.get(ENV_TRANS_KEY)
+            or os.environ.get(ENV_AGENT_KEY, "")
+            or os.environ.get(ENV_TRANS_KEY, "")
+        )
+        return model, base_url, api_key
+
+    def _update_agent_config_status(self) -> None:
+        model, base_url, api_key = self._effective_agent_config()
+        status = (
+            f"[dim]Effective agent model:[/] {model or '(missing)'}   "
+            f"[dim]base URL:[/] {base_url or '(missing)'}   "
+            f"[dim]API key:[/] {'set' if api_key else 'missing'}"
+        )
+        try:
+            self.query_one("#agent-config", Static).update(status)
+        except NoMatches:
+            pass
+
+    def _set_agent_status(self, message: str) -> None:
+        try:
+            self.query_one("#agent-status", Static).update(message)
+        except NoMatches:
+            pass
+
+    def _agent_log_write(self, message: str) -> None:
+        try:
+            self.query_one("#agent-log", RichLog).write(message)
+        except NoMatches:
+            pass
+
+    def _update_agent_apply_state(self) -> None:
+        try:
+            button = self.query_one("#btn-agent-apply", Button)
+            button.disabled = not bool(self._agent_plan and self._agent_plan.get("actions"))
+        except NoMatches:
+            pass
+
+    def _clear_agent_ui(self) -> None:
+        self._agent_plan = None
+        try:
+            self.query_one("#agent-prompt", TextArea).text = ""
+            self.query_one("#agent-log", RichLog).clear()
+        except NoMatches:
+            pass
+        self._set_agent_status("[dim]No agent plan yet.[/]")
+        self._update_agent_apply_state()
+        self._update_agent_config_status()
+
+    def _normalize_agent_plan(self, payload: dict[str, Any]) -> dict[str, Any]:
+        summary = str(payload.get("summary") or "No summary provided.").strip()
+        analysis = str(payload.get("analysis") or "").strip()
+        normalized_actions: list[dict[str, Any]] = []
+        raw_actions = payload.get("actions")
+
+        if isinstance(raw_actions, list):
+            for raw_action in raw_actions:
+                if not isinstance(raw_action, dict):
+                    continue
+                action_type = str(raw_action.get("type") or "").strip()
+                if action_type == "run_detection":
+                    normalized_actions.append({"type": "run_detection"})
+                elif action_type == "auto_setup":
+                    mode = str(raw_action.get("mode") or "essential").strip().lower()
+                    model = str(raw_action.get("model") or DEFAULT_MODEL).strip()
+                    normalized_actions.append(
+                        {
+                            "type": "auto_setup",
+                            "mode": "full" if mode == "full" else "essential",
+                            "model": model if model in KNOWN_MODELS else DEFAULT_MODEL,
+                        }
+                    )
+                elif action_type == "build_whisper_cpp":
+                    normalized_actions.append({"type": "build_whisper_cpp"})
+                elif action_type == "download_model":
+                    model = str(raw_action.get("model") or DEFAULT_MODEL).strip()
+                    normalized_actions.append(
+                        {
+                            "type": "download_model",
+                            "model": model if model in KNOWN_MODELS else DEFAULT_MODEL,
+                        }
+                    )
+                elif action_type == "pip_install":
+                    target = str(raw_action.get("target") or "").strip()
+                    if target in PIP_REQUIREMENT_FILES:
+                        normalized_actions.append(
+                            {"type": "pip_install", "target": target}
+                        )
+
+        return {
+            "summary": summary,
+            "analysis": analysis,
+            "actions": normalized_actions,
+        }
+
+    def _render_agent_plan(self, plan: dict[str, Any]) -> None:
+        try:
+            log = self.query_one("#agent-log", RichLog)
+            log.clear()
+        except NoMatches:
+            log = None
+
+        if log is not None:
+            log.write(f"[bold]Summary[/] {plan['summary']}")
+            if plan.get("analysis"):
+                log.write(f"\n[bold]Analysis[/] {plan['analysis']}")
+            actions = plan.get("actions") or []
+            if actions:
+                log.write("\n[bold]Actions[/]")
+                for idx, action in enumerate(actions, start=1):
+                    line = f"{idx}. {action['type']}"
+                    if action["type"] == "auto_setup":
+                        line += f" mode={action['mode']} model={action['model']}"
+                    elif action["type"] == "download_model":
+                        line += f" model={action['model']}"
+                    elif action["type"] == "pip_install":
+                        line += f" target={action['target']}"
+                    log.write(line)
+            else:
+                log.write("\n[yellow]No executable actions returned.[/]")
+
+        if plan.get("actions"):
+            self._set_agent_status("[green]Agent plan ready. Review and apply when ready.[/]")
+        else:
+            self._set_agent_status("[yellow]Agent returned guidance only.[/]")
+        self._update_agent_apply_state()
+
+    def _agent_context(self) -> dict[str, Any]:
+        detections = {
+            name: {"found": found, "detail": detail}
+            for name, (found, detail) in self._detect_results.items()
+        }
+        return {
+            "detections": detections,
+            "selected_download_model": self._sel("sel-dl-model", DEFAULT_MODEL),
+            "selected_backend": self._sel("sel-backend", DEFAULT_BACKEND),
+            "selected_model": self._sel("sel-model", DEFAULT_MODEL),
+            "known_models": KNOWN_MODELS,
+            "allowed_actions": [
+                {"type": "run_detection"},
+                {"type": "auto_setup", "mode": "essential|full", "model": "KNOWN_MODELS"},
+                {"type": "build_whisper_cpp"},
+                {"type": "download_model", "model": "KNOWN_MODELS"},
+                {
+                    "type": "pip_install",
+                    "target": list(PIP_REQUIREMENT_FILES),
+                },
+            ],
+        }
+
+    def _request_agent_plan(self) -> None:
+        try:
+            prompt = self.query_one("#agent-prompt", TextArea).text.strip()
+            self.query_one("#agent-log", RichLog).clear()
+        except NoMatches:
+            return
+        if not prompt:
+            self._set_agent_status("[red]Enter a request for the agent first.[/]")
+            return
+        self._agent_plan = None
+        self._update_agent_apply_state()
+        self._set_agent_status("[cyan]Requesting agent plan…[/]")
+        self._update_agent_config_status()
+        self._fetch_agent_plan(prompt)
+
+    @work(thread=True, exclusive=True, exit_on_error=False, name="agent-plan")
+    def _fetch_agent_plan(self, prompt: str) -> None:
+        log = lambda m: self.call_from_thread(self._agent_log_write, m)
+        model, base_url, api_key = self._effective_agent_config()
+        if not model or not base_url or not api_key:
+            self.call_from_thread(
+                self._set_agent_status,
+                "[red]Agent settings are incomplete. Configure agent or translation API settings first.[/]",
+            )
+            return
+
+        endpoint = normalize_chat_endpoint(base_url)
+        context = self._agent_context()
+        payload = {
+            "model": model,
+            "temperature": 0.2,
+            "messages": [
+                {
+                    "role": "system",
+                    "content": (
+                        "You are a bounded setup agent for the vid_to_sub TUI. "
+                        "Return JSON only with keys summary, analysis, actions. "
+                        "Actions must be an array using only these types: "
+                        "run_detection, auto_setup, build_whisper_cpp, download_model, pip_install. "
+                        "Never invent shell commands or unsupported action types. "
+                        "Prefer empty actions when the request is informational."
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": json.dumps(
+                        {"request": prompt, "context": context},
+                        ensure_ascii=False,
+                    ),
+                },
+            ],
+        }
+
+        request = urllib.request.Request(
+            endpoint,
+            data=json.dumps(payload).encode("utf-8"),
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {api_key}",
+                "User-Agent": "vid_to_sub/agent",
+            },
+        )
+
+        log(f"[dim]POST {endpoint}[/]")
+        try:
+            with urllib.request.urlopen(request, timeout=120) as response:
+                response_payload = json.loads(response.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            body = exc.read().decode("utf-8", errors="replace")
+            self.call_from_thread(
+                self._set_agent_status,
+                f"[red]Agent API HTTP {exc.code}. Check agent log.[/]",
+            )
+            log(f"[red]HTTP {exc.code}[/] {body}")
+            return
+        except urllib.error.URLError as exc:
+            self.call_from_thread(
+                self._set_agent_status,
+                f"[red]Agent API request failed: {exc.reason}[/]",
+            )
+            return
+        except json.JSONDecodeError as exc:
+            self.call_from_thread(
+                self._set_agent_status,
+                "[red]Agent API returned invalid JSON.[/]",
+            )
+            log(f"[red]JSON decode failed[/] {exc}")
+            return
+
+        try:
+            message = response_payload["choices"][0]["message"]["content"]
+            if isinstance(message, list):
+                message = "".join(
+                    part.get("text", "") if isinstance(part, dict) else str(part)
+                    for part in message
+                )
+            plan = self._normalize_agent_plan(extract_json_payload(str(message)))
+        except (KeyError, IndexError, TypeError, ValueError, json.JSONDecodeError) as exc:
+            self.call_from_thread(
+                self._set_agent_status,
+                "[red]Could not parse the agent response as a valid plan. Check agent log.[/]",
+            )
+            log(f"[red]Raw response[/] {response_payload}")
+            log(f"[red]Parse error[/] {exc}")
+            return
+
+        self._agent_plan = plan
+        self.call_from_thread(self._render_agent_plan, plan)
+
+    def _apply_agent_plan(self) -> None:
+        if not self._agent_plan or not self._agent_plan.get("actions"):
+            self._set_agent_status("[yellow]There is no executable agent plan to apply.[/]")
+            return
+        self._set_agent_status("[cyan]Applying agent plan…[/]")
+        self._execute_agent_plan(list(self._agent_plan["actions"]))
+
+    @work(thread=True, exclusive=True, exit_on_error=False, name="agent-apply")
+    def _execute_agent_plan(self, actions: list[dict[str, Any]]) -> None:
+        log = lambda m: self.call_from_thread(self._agent_log_write, m)
+        for idx, action in enumerate(actions, start=1):
+            action_type = action["type"]
+            log(f"[bold cyan]Step {idx}/{len(actions)}[/] {action_type}")
+            if action_type == "run_detection":
+                self._refresh_detection_from_worker()
+            elif action_type == "auto_setup":
+                self._auto_setup_sync(
+                    action.get("mode") == "full",
+                    str(action.get("model") or DEFAULT_MODEL),
+                )
+            elif action_type == "build_whisper_cpp":
+                self._build_whisper_cpp_sync()
+            elif action_type == "download_model":
+                self._download_model_sync(str(action.get("model") or DEFAULT_MODEL))
+            elif action_type == "pip_install":
+                target = str(action.get("target") or "")
+                if target in PIP_REQUIREMENT_FILES:
+                    self._install_requirement_target(target)
+
+        self._refresh_detection_from_worker()
+        self.call_from_thread(
+            self._set_agent_status,
+            "[green]Agent plan applied. Review setup and logs.[/]",
+        )
 
     # ── Command builder ───────────────────────────────────────────────────
 
@@ -2026,6 +2769,9 @@ class VidToSubApp(App):
             ("stg-trans-url", ENV_TRANS_URL),
             ("stg-trans-key", ENV_TRANS_KEY),
             ("stg-trans-model", ENV_TRANS_MOD),
+            ("stg-agent-url", ENV_AGENT_URL),
+            ("stg-agent-key", ENV_AGENT_KEY),
+            ("stg-agent-model", ENV_AGENT_MOD),
             ("stg-build-dir", "tui.build_dir"),
             ("stg-install-dir", "tui.install_dir"),
             ("stg-model-dir", "tui.model_dir"),
@@ -2059,6 +2805,9 @@ class VidToSubApp(App):
             ("stg-trans-url", ENV_TRANS_URL),
             ("stg-trans-key", ENV_TRANS_KEY),
             ("stg-trans-model", ENV_TRANS_MOD),
+            ("stg-agent-url", ENV_AGENT_URL),
+            ("stg-agent-key", ENV_AGENT_KEY),
+            ("stg-agent-model", ENV_AGENT_MOD),
             ("stg-build-dir", "tui.build_dir"),
             ("stg-install-dir", "tui.install_dir"),
             ("stg-model-dir", "tui.model_dir"),
@@ -2074,6 +2823,7 @@ class VidToSubApp(App):
         self._apply_db_to_env()
         self._run_detection()
         self._update_wcpp_model_status()
+        self._update_agent_config_status()
         try:
             self.query_one("#stg-status", Static).update("[green]✓ Saved to SQLite[/]")
         except NoMatches:
@@ -2087,6 +2837,9 @@ class VidToSubApp(App):
             ENV_TRANS_URL: "stg-trans-url",
             ENV_TRANS_KEY: "stg-trans-key",
             ENV_TRANS_MOD: "stg-trans-model",
+            ENV_AGENT_URL: "stg-agent-url",
+            ENV_AGENT_KEY: "stg-agent-key",
+            ENV_AGENT_MOD: "stg-agent-model",
         }
         lines: list[str] = []
         for env_key, wid in env_map.items():
@@ -2130,6 +2883,9 @@ class VidToSubApp(App):
             ENV_TRANS_URL,
             ENV_TRANS_KEY,
             ENV_TRANS_MOD,
+            ENV_AGENT_URL,
+            ENV_AGENT_KEY,
+            ENV_AGENT_MOD,
         ]
         updates: dict[str, str] = {}
         for key in env_keys:

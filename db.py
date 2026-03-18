@@ -63,6 +63,9 @@ ENV_KEYS = (
     "VID_TO_SUB_TRANSLATION_BASE_URL",
     "VID_TO_SUB_TRANSLATION_API_KEY",
     "VID_TO_SUB_TRANSLATION_MODEL",
+    "VID_TO_SUB_AGENT_BASE_URL",
+    "VID_TO_SUB_AGENT_API_KEY",
+    "VID_TO_SUB_AGENT_MODEL",
 )
 
 _DEFAULT_SETTINGS: dict[str, str] = {
@@ -72,6 +75,9 @@ _DEFAULT_SETTINGS: dict[str, str] = {
     "VID_TO_SUB_TRANSLATION_BASE_URL": "",
     "VID_TO_SUB_TRANSLATION_API_KEY": "",
     "VID_TO_SUB_TRANSLATION_MODEL": "",
+    "VID_TO_SUB_AGENT_BASE_URL": "",
+    "VID_TO_SUB_AGENT_API_KEY": "",
+    "VID_TO_SUB_AGENT_MODEL": "",
     # TUI-specific settings
     "tui.build_dir": str(Path.home() / ".cache" / "vid_to_sub_build"),
     "tui.install_dir": str(Path.home() / ".local" / "bin"),
