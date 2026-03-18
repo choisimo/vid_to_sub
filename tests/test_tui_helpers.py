@@ -1042,6 +1042,105 @@ class TuiHelperTests(unittest.TestCase):
             plan["actions"],
         )
 
+    def test_stream_reaps_process_when_ui_callback_raises(self) -> None:
+        app = VidToSubApp()
+
+        class FakeProc:
+            def __init__(self) -> None:
+                self.stdout = io.StringIO("plain output\n")
+                self.stdin = None
+                self.wait_calls = 0
+                self.terminate_calls = 0
+
+            def poll(self) -> int | None:
+                return 0
+
+            def wait(self, timeout: float | None = None) -> int:
+                self.wait_calls += 1
+                return 0
+
+            def terminate(self) -> None:
+                self.terminate_calls += 1
+
+        proc = FakeProc()
+        plan = SimpleNamespace(
+            label="local",
+            kind="local",
+            cmd=["python", "vid_to_sub.py"],
+            env=None,
+            stdin_payload=None,
+        )
+
+        def raise_from_ui(_callback, *_args):
+            raise RuntimeError("ui callback failed")
+
+        with patch("vid_to_sub_app.tui.app.subprocess.Popen", return_value=proc), patch.object(
+            app, "call_from_thread", side_effect=raise_from_ui
+        ), patch.object(app, "_log", return_value=None), patch.object(
+            app, "_apply_progress_event", return_value=None
+        ), patch.object(app, "_finalize_executor_failure", return_value=None):
+            with self.assertRaisesRegex(RuntimeError, "ui callback failed"):
+                VidToSubApp._stream.__wrapped__(app, [plan])
+
+        self.assertEqual(1, proc.wait_calls)
+        self.assertEqual({}, app._procs)
+        self.assertIsNone(app._proc)
+        self.assertEqual(0, proc.terminate_calls)
+
+    def test_stream_reaps_process_when_stdout_reader_crashes(self) -> None:
+        app = VidToSubApp()
+        logs: list[str] = []
+
+        class BrokenStdout:
+            def __init__(self) -> None:
+                self.closed = False
+
+            def readline(self) -> str:
+                raise RuntimeError("read failed")
+
+            def close(self) -> None:
+                self.closed = True
+
+        class FakeProc:
+            def __init__(self) -> None:
+                self.stdout = BrokenStdout()
+                self.stdin = None
+                self.wait_calls = 0
+
+            def poll(self) -> int | None:
+                return 0
+
+            def wait(self, timeout: float | None = None) -> int:
+                self.wait_calls += 1
+                return 0
+
+            def terminate(self) -> None:
+                raise AssertionError("terminate should not be called")
+
+        proc = FakeProc()
+        plan = SimpleNamespace(
+            label="local",
+            kind="local",
+            cmd=["python", "vid_to_sub.py"],
+            env=None,
+            stdin_payload=None,
+        )
+
+        with patch("vid_to_sub_app.tui.app.subprocess.Popen", return_value=proc), patch.object(
+            app,
+            "call_from_thread",
+            side_effect=lambda callback, *args: callback(*args),
+        ), patch.object(app, "_log", side_effect=logs.append), patch.object(
+            app, "_apply_progress_event", return_value=None
+        ), patch.object(app, "_finalize_executor_failure", return_value=None):
+            VidToSubApp._stream.__wrapped__(app, [plan])
+
+        self.assertTrue(proc.stdout.closed)
+        self.assertEqual(1, proc.wait_calls)
+        self.assertEqual({}, app._procs)
+        self.assertIsNone(app._proc)
+        self.assertIn("\n[bold green]✓ Completed (exit 0)[/]", logs)
+
 
 if __name__ == "__main__":
     unittest.main()

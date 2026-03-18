@@ -3086,105 +3086,143 @@ class VidToSubApp(App):
             ]
         ] = []
         multi_executor = len(plans) > 1
+        completed_labels: list[str] = []
+        failed_executors: list[tuple[ExecutorPlan, int]] = []
+        stream_completed = False
 
         def _pump_stdout(executor_name: str, proc: subprocess.Popen[str]) -> None:
             assert proc.stdout
-            for raw in iter(proc.stdout.readline, ""):
-                output_queue.put((executor_name, raw.rstrip("\n")))
-            proc.stdout.close()
-            output_queue.put((executor_name, None))
+            try:
+                for raw in iter(proc.stdout.readline, ""):
+                    output_queue.put((executor_name, raw.rstrip("\n")))
+            except Exception:
+                pass
+            finally:
+                try:
+                    proc.stdout.close()
+                except Exception:
+                    pass
+                output_queue.put((executor_name, None))
 
         def _pump_stdin(proc: subprocess.Popen[str], payload: str) -> None:
             if proc.stdin is None:
                 return
             try:
                 proc.stdin.write(payload)
+            except BrokenPipeError:
+                pass
             finally:
-                proc.stdin.close()
+                try:
+                    proc.stdin.close()
+                except Exception:
+                    pass
 
-        for plan in plans:
-            try:
-                proc = subprocess.Popen(
-                    plan.cmd,
-                    stdin=subprocess.PIPE if plan.stdin_payload is not None else None,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.STDOUT,
-                    text=True,
-                    bufsize=1,
-                    env=plan.env,
-                )
-            except FileNotFoundError as exc:
-                self.call_from_thread(
-                    self._log, f"[bold red]✕ {plan.label}: not found: {exc}[/]"
-                )
-                self.call_from_thread(self._finalize_executor_failure, plan, 127)
-                continue
-            except Exception as exc:
-                self.call_from_thread(
-                    self._log, f"[bold red]✕ {plan.label}: {exc}[/]"
-                )
-                self.call_from_thread(self._finalize_executor_failure, plan, 1)
-                continue
+        try:
+            for plan in plans:
+                try:
+                    proc = subprocess.Popen(
+                        plan.cmd,
+                        stdin=subprocess.PIPE if plan.stdin_payload is not None else None,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.STDOUT,
+                        text=True,
+                        bufsize=1,
+                        env=plan.env,
+                    )
+                except FileNotFoundError as exc:
+                    self.call_from_thread(
+                        self._log, f"[bold red]✕ {plan.label}: not found: {exc}[/]"
+                    )
+                    self.call_from_thread(self._finalize_executor_failure, plan, 127)
+                    continue
+                except Exception as exc:
+                    self.call_from_thread(
+                        self._log, f"[bold red]✕ {plan.label}: {exc}[/]"
+                    )
+                    self.call_from_thread(self._finalize_executor_failure, plan, 1)
+                    continue
 
-            self._procs[plan.label] = proc
-            if plan.kind == "local":
-                self._proc = proc
+                self._procs[plan.label] = proc
+                if plan.kind == "local":
+                    self._proc = proc
 
-            reader = threading.Thread(
-                target=_pump_stdout,
-                args=(plan.label, proc),
-                daemon=True,
-            )
-            reader.start()
-            writer: threading.Thread | None = None
-            if plan.stdin_payload is not None:
-                writer = threading.Thread(
-                    target=_pump_stdin,
-                    args=(proc, plan.stdin_payload),
+                reader = threading.Thread(
+                    target=_pump_stdout,
+                    args=(plan.label, proc),
                     daemon=True,
                 )
-                writer.start()
-            launched.append((plan, proc, reader, writer))
+                reader.start()
+                writer: threading.Thread | None = None
+                if plan.stdin_payload is not None:
+                    writer = threading.Thread(
+                        target=_pump_stdin,
+                        args=(proc, plan.stdin_payload),
+                        daemon=True,
+                    )
+                    writer.start()
+                launched.append((plan, proc, reader, writer))
 
-        active_streams = len(launched)
-        while active_streams > 0:
-            try:
-                executor, line = output_queue.get(timeout=0.2)
-            except queue.Empty:
-                continue
-            if line is None:
-                active_streams -= 1
-                continue
+            active_streams = len(launched)
+            while active_streams > 0:
+                try:
+                    executor, line = output_queue.get(timeout=0.2)
+                except queue.Empty:
+                    continue
+                if line is None:
+                    active_streams -= 1
+                    continue
 
-            event = parse_progress_event(line)
-            if event:
-                self.call_from_thread(self._apply_progress_event, executor, event)
-                continue
+                event = parse_progress_event(line)
+                if event:
+                    self.call_from_thread(self._apply_progress_event, executor, event)
+                    continue
 
-            rendered = _colorize(line)
-            if multi_executor:
-                rendered = f"[bold blue]{executor}[/] {rendered}"
-            self.call_from_thread(self._log, rendered)
+                rendered = _colorize(line)
+                if multi_executor:
+                    rendered = f"[bold blue]{executor}[/] {rendered}"
+                self.call_from_thread(self._log, rendered)
 
-        had_error = False
-        for plan, proc, reader, writer in launched:
-            reader.join(timeout=1)
-            if writer is not None:
-                writer.join(timeout=1)
-            rc = proc.wait()
-            self._procs.pop(plan.label, None)
-            if self._proc is proc:
-                self._proc = None
-            if rc != 0:
-                had_error = True
-                self.call_from_thread(
-                    self._log, f"\n[bold red]✕ {plan.label} exited with code {rc}[/]"
-                )
-                self.call_from_thread(self._finalize_executor_failure, plan, rc)
-            elif multi_executor:
-                self.call_from_thread(
-                    self._log, f"[green]{plan.label} finished (exit 0)[/]"
-                )
+            stream_completed = True
+        finally:
+            # Always reap launched subprocesses, even if a UI callback raises or the
+            # worker is cancelled mid-stream, so exited children don't remain zombies.
+            for plan, proc, reader, writer in launched:
+                reader.join(timeout=1)
+                if writer is not None:
+                    writer.join(timeout=1)
+
+                rc = proc.poll()
+                if rc is None and not stream_completed:
+                    try:
+                        proc.terminate()
+                    except OSError:
+                        pass
+                    rc = proc.poll()
+
+                try:
+                    rc = proc.wait(timeout=1) if rc is None else proc.wait()
+                except subprocess.TimeoutExpired:
+                    continue
+
+                self._procs.pop(plan.label, None)
+                if self._proc is proc:
+                    self._proc = None
+
+                if rc != 0:
+                    failed_executors.append((plan, rc))
+                elif multi_executor:
+                    completed_labels.append(plan.label)
+
+        had_error = bool(failed_executors)
+        for plan, rc in failed_executors:
+            self.call_from_thread(
+                self._log, f"\n[bold red]✕ {plan.label} exited with code {rc}[/]"
+            )
+            self.call_from_thread(self._finalize_executor_failure, plan, rc)
+        for label in completed_labels:
+            self.call_from_thread(
+                self._log, f"[green]{label} finished (exit 0)[/]"
+            )
 
         if had_error:
             self.call_from_thread(
