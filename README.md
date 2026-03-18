@@ -17,7 +17,9 @@ Default flow:
 - Translation mode that keeps original `start/end` timings and only replaces subtitle text
 - OpenAI-compatible translation config via environment variables
 - `--skip-existing`, `--dry-run`, `--workers`
-- **Interactive TUI** (`tui.py`) — 5-tab terminal UI backed by SQLite
+- **Interactive TUI** (`tui.py`) — 6-tab terminal UI backed by SQLite
+- Best-effort automatic setup that can install missing system tools, Python deps, build `whisper.cpp`, and fetch a GGML model
+- Bounded AI Agent tab that turns natural-language setup requests into reviewable executable actions
 
 ## TUI
 
@@ -29,12 +31,13 @@ python tui.py
 
 Tabs:
 - **1 Browse** — DirectoryTree path browser, quick recursive path search, manual path entry, recent paths
-- **2 Setup** — auto-detect deps and installed ggml models, build whisper.cpp, download ggml models, pip install
+- **2 Setup** — auto-detect deps and installed ggml models, one-click auto setup/full install, build whisper.cpp, download ggml models, pip install
 - **3 Transcribe** — all job settings (backend, model, format, translation) with automatic ggml model matching for `whisper.cpp`
 - **4 History** — SQLite-backed job history with status and timing
 - **5 Settings** — persistent config (replaces `.env`), export to `.env`
+- **6 Agent** — OpenAI-compatible bounded agent that plans and can apply safe setup actions
 
-Keyboard shortcuts: `Ctrl+R` run · `Ctrl+D` dry-run · `Ctrl+K` kill · `Ctrl+S` save · `1-5` tabs · `Ctrl+Q` quit
+Keyboard shortcuts: `Ctrl+R` run · `Ctrl+D` dry-run · `Ctrl+K` kill · `Ctrl+S` save · `1-6` tabs · `Ctrl+Q` quit
 
 ## Requirements
 
