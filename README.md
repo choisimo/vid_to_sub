@@ -1,58 +1,222 @@
 # vid_to_sub
-<img width="942" height="1122" alt="스크린샷_20260318_033855" src="https://github.com/user-attachments/assets/33bb1db1-2656-4112-8e60-0342816332ff" />
 
-Recursively transcribe video files to subtitle files.
+English | [한국어](README.ko.md)
 
-Default flow:
-- transcription: `whisper.cpp` on CPU with `large-v3`
-- output: `.srt`
-- optional translation: OpenAI-compatible API while preserving the original subtitle timings/frame boundaries exactly
+`vid_to_sub` recursively discovers video files and writes subtitle or transcript files next to the source video or into a dedicated output directory. The default path is CPU transcription through `ffmpeg` + `whisper.cpp`, with optional subtitle translation through an OpenAI-compatible API.
 
-## Features
+## Screenshots
 
-- Recursive directory scan for common video formats
-- Default CPU pipeline via `whisper.cpp` + `ffmpeg`
-- Optional backends: `faster-whisper`, `openai-whisper`, `whisperX`
-- Output formats: `srt`, `vtt`, `txt`, `tsv`, `json`
-- Translation mode that keeps original `start/end` timings and only replaces subtitle text
-- OpenAI-compatible translation config via environment variables
-- `--skip-existing`, `--dry-run`, `--workers`
-- **Interactive TUI** (`tui.py`) — 6-tab terminal UI backed by SQLite
-- Live run dashboard with elapsed time, processed percentage, active-job list, and SQLite history updates
-- Distributed execution mode that can split discovered files across local workers and SSH-connected remote Linux/GPU resources
-- Best-effort automatic setup that can install missing system tools, Python deps, build `whisper.cpp`, and fetch a GGML model
-- Bounded AI Agent tab that turns natural-language setup/history requests into reviewable executable actions
+### Browse inputs and prepare a queue
 
-## TUI
+![Browse tab](docs/images/tui-browse.png)
+
+Use the Browse tab to add folders or individual files, search under the current root, and choose an output directory before starting a run.
+
+### Detect dependencies and install missing pieces
+
+![Setup tab](docs/images/tui-setup.png)
+
+The Setup tab checks for `ffmpeg`, `whisper-cli`, GGML models, and optional Python backends, then exposes install/build actions in one place.
+
+### Configure transcription and translation
+
+![Transcribe tab](docs/images/tui-transcribe.png)
+
+The Transcribe tab controls backend, model, device, execution mode, output formats, translation, and advanced overrides.
+
+## What This Project Supports
+
+- Recursive discovery of common video formats such as `mp4`, `mkv`, `mov`, `avi`, `webm`, and `ts`.
+- Default CPU transcription through `whisper.cpp` using `ffmpeg` audio extraction.
+- Optional backends: `faster-whisper`, `openai-whisper`, and `whisperX`.
+- Output formats: `srt`, `vtt`, `txt`, `tsv`, `json`, or `all`.
+- Optional translation with an OpenAI-compatible chat-completions API while preserving the original subtitle timing boundaries.
+- A 6-tab Textual TUI: Browse, Setup, Transcribe, History, Settings, and Agent.
+- SQLite-backed saved settings and job history.
+- Optional distributed execution through SSH resource profiles.
+
+## Entry Points
+
+- `python vid_to_sub.py ...`
+  CLI entrypoint for recursive discovery and batch transcription.
+- `python tui.py`
+  Textual TUI entrypoint. On first run it creates a project-local `.venv` and installs missing requirement groups before relaunching.
+- `python init_checker.py`
+  Bootstrap helper that prepares the managed virtual environment.
+
+## Requirements
+
+### System
+
+- Python 3.9+
+- `ffmpeg` on `PATH`
+- For the default backend, `whisper-cli` from `whisper.cpp`
+- For the default model, `ggml-large-v3.bin`
+
+### Python packages
+
+Base packages:
 
 ```bash
-./tui.py
-# or
+pip install -r requirements.txt
+```
+
+Optional backend packages:
+
+```bash
+pip install -r requirements-faster-whisper.txt
+pip install -r requirements-whisper.txt
+pip install -r requirements-whisperx.txt
+```
+
+## Quick Start
+
+### 1. Default local transcription
+
+```bash
+python vid_to_sub.py /path/to/videos
+```
+
+By default this:
+
+- scans directories recursively,
+- uses `whisper-cpp`,
+- uses model `large-v3`,
+- writes `movie.srt` beside each source file.
+
+### 2. Translate subtitles while keeping the original timing
+
+Set the translation endpoint first:
+
+```bash
+export VID_TO_SUB_TRANSLATION_BASE_URL=https://your-host/v1
+export VID_TO_SUB_TRANSLATION_API_KEY=your_api_key
+export VID_TO_SUB_TRANSLATION_MODEL=your_model
+```
+
+Then run:
+
+```bash
+python vid_to_sub.py /path/to/videos --translate-to ko
+```
+
+This writes both the original transcription and the translated file, for example:
+
+- `movie.srt`
+- `movie.ko.srt`
+
+Only subtitle text changes. `start` and `end` timestamps are copied from the original segments.
+
+### 3. Use the TUI
+
+```bash
 python tui.py
 ```
 
-Tabs:
-- **1 Browse** — DirectoryTree path browser, quick recursive path search, manual path entry, recent paths
-- **2 Setup** — auto-detect deps and installed ggml models, one-click auto setup/full install, build whisper.cpp, download ggml models, pip install
-- **3 Transcribe** — all job settings (backend, model, format, translation) with automatic ggml model matching for `whisper.cpp`
-- **4 History** — SQLite-backed job history with status, timing, load-row, and rerun controls
-- **5 Settings** — persistent config (replaces `.env`), export to `.env`, remote SSH resource profiles
-- **6 Agent** — OpenAI-compatible bounded agent that can analyze live runs and propose safe setup/history actions
+Recommended flow inside the TUI:
 
-Keyboard shortcuts: `Ctrl+R` run · `Ctrl+D` dry-run · `Ctrl+K` kill · `Ctrl+S` save · `1-6` tabs · `Ctrl+Q` quit
+1. `Browse`: add source folders or files, optionally set `Output dir`, and decide whether `No recurse` or `Skip existing` should be enabled.
+2. `Setup`: run dependency detection, install Python backend packages, build `whisper.cpp`, or download a GGML model.
+3. `Transcribe`: choose backend, model, device, output formats, translation target, and execution mode.
+4. Start with `Ctrl+R`, preview with `Ctrl+D`, stop with `Ctrl+K`.
+5. Review previous jobs in `History`, persist defaults in `Settings`, and use `Agent` when you want reviewable guidance or a proposed action plan.
 
-### Distributed execution
+Useful TUI shortcuts:
 
-`Settings -> Remote Resources` accepts a JSON array of SSH profiles. The current implementation is designed for shared storage or explicit prefix remapping between local and remote paths.
+- `Ctrl+R` run
+- `Ctrl+D` dry run
+- `Ctrl+K` kill
+- `Ctrl+S` save settings
+- `1` to `6` switch tabs
+- `Ctrl+Q` quit
 
-Example:
+## Common CLI Examples
+
+Write output files into a separate folder:
+
+```bash
+python vid_to_sub.py /path/to/videos -o /path/to/output
+```
+
+Disable recursive scan:
+
+```bash
+python vid_to_sub.py /path/to/videos --no-recurse
+```
+
+Skip videos that already have a primary output:
+
+```bash
+python vid_to_sub.py /path/to/videos --skip-existing
+```
+
+Preview the queue without running transcription:
+
+```bash
+python vid_to_sub.py /path/to/videos --dry-run
+```
+
+Write multiple formats:
+
+```bash
+python vid_to_sub.py /path/to/videos --format srt --format json
+```
+
+Use an explicit `whisper.cpp` model path:
+
+```bash
+python vid_to_sub.py /path/to/videos \
+  --backend whisper-cpp \
+  --model large-v3 \
+  --whisper-cpp-model-path /models/ggml-large-v3.bin
+```
+
+List built-in model identifiers:
+
+```bash
+python vid_to_sub.py --list-models
+```
+
+## Environment Variables
+
+### `whisper.cpp`
+
+- `VID_TO_SUB_WHISPER_CPP_BIN`
+  Override the `whisper-cli` executable path.
+- `VID_TO_SUB_WHISPER_CPP_MODEL`
+  Override the GGML model path.
+
+If `VID_TO_SUB_WHISPER_CPP_MODEL` is not set, the project searches common model directories such as `./models`, `~/.cache/whisper`, `~/models`, `/models`, and `/opt/models`.
+
+### Translation API
+
+- `VID_TO_SUB_TRANSLATION_BASE_URL`
+  Accepts either an API root such as `https://host/v1` or the full `/chat/completions` endpoint.
+- `VID_TO_SUB_TRANSLATION_API_KEY`
+  Bearer token for the translation service.
+- `VID_TO_SUB_TRANSLATION_MODEL`
+  Model name used for translation.
+
+### Agent tab
+
+- `VID_TO_SUB_AGENT_BASE_URL`
+- `VID_TO_SUB_AGENT_API_KEY`
+- `VID_TO_SUB_AGENT_MODEL`
+
+When these are blank in the TUI, the Agent tab falls back to the Translation API settings.
+
+## Distributed Execution
+
+The TUI supports a distributed mode backed by SSH resource profiles. Configure profiles in `Settings -> Remote Resources`, then switch `Execution -> Mode` to `distributed` in the Transcribe tab before starting a run.
+
+Example profile JSON:
 
 ```json
 [
   {
     "name": "gpu-box",
     "ssh_target": "user@gpu-host",
-    "remote_workdir": "/home/user/vid_to_sub",
+    "remote_workdir": "/srv/vid_to_sub",
     "slots": 2,
     "path_map": {
       "/mnt/media": "/srv/media"
@@ -64,167 +228,46 @@ Example:
 ]
 ```
 
-Notes:
-- `slots` controls how much of the discovered file queue is assigned to that remote host.
-- `path_map` rewrites local prefixes before the remote command runs.
-- nothing runs remotely until `Execution -> Mode` is switched to `distributed` in the Transcribe tab.
+Field behavior:
 
-## Requirements
+- `slots` controls how much work is assigned to that host.
+- `path_map` rewrites local path prefixes before the remote command runs.
+- `env` injects per-remote environment overrides.
 
-### System
+## Output Naming
 
-- Python 3.9+
-- `ffmpeg` on `PATH`
-- For default backend: `whisper-cli` from `whisper.cpp` on `PATH`
-- `ggml-large-v3.bin` model file for `whisper.cpp`
+Default transcription output:
 
-### Python packages
-
-```bash
-pip install -r requirements.txt
-```
-
-Optional backends:
-
-```bash
-pip install -r requirements-faster-whisper.txt  # faster-whisper (recommended Python backend)
-pip install -r requirements-whisper.txt          # openai-whisper
-pip install -r requirements-whisperx.txt         # whisperX + diarization
-```
-
-## whisper.cpp setup
-
-Example build/install flow:
-
-```bash
-git clone https://github.com/ggerganov/whisper.cpp
-cd whisper.cpp
-cmake -B build
-cmake --build build -j
-```
-
-Then either:
-- put `whisper-cli` on `PATH`, or
-- set `VID_TO_SUB_WHISPER_CPP_BIN`
-
-For the model file, either:
-- place it at `./models/ggml-large-v3.bin`, or
-- set `VID_TO_SUB_WHISPER_CPP_MODEL`
-
-Example:
-
-```bash
-export VID_TO_SUB_WHISPER_CPP_BIN=/path/to/whisper.cpp/build/bin/whisper-cli
-export VID_TO_SUB_WHISPER_CPP_MODEL=/path/to/models/ggml-large-v3.bin
-```
-
-## Translation environment variables
-
-Set these to use subtitle translation with an OpenAI-compatible server:
-
-```bash
-export VID_TO_SUB_TRANSLATION_BASE_URL=https://your-openai-compatible-host/v1
-export VID_TO_SUB_TRANSLATION_API_KEY=your_api_key
-export VID_TO_SUB_TRANSLATION_MODEL=your_translation_model
-```
-
-Notes:
-- base URL can be either the API root like `.../v1` or the full `.../chat/completions` URL
-- translated subtitle files are written with a language suffix, for example `movie.ko.srt`
-- timings are copied from the original transcription, so subtitle frames stay identical
-
-## Quick start
-
-Default CPU transcription with `whisper.cpp large-v3`:
-
-```bash
-python vid_to_sub.py ./videos
-```
-
-This writes `movie.srt` next to each video.
-
-Translate to Korean while preserving subtitle frames:
-
-```bash
-python vid_to_sub.py ./videos --translate-to ko
-```
-
-This writes both:
-- `movie.srt`
-- `movie.ko.srt`
-
-## Common examples
-
-Use explicit `whisper.cpp` model path:
-
-```bash
-python vid_to_sub.py ./videos \
-  --backend whisper-cpp \
-  --model large-v3 \
-  --device cpu \
-  --whisper-cpp-model-path /models/ggml-large-v3.bin
-```
-
-Translate to Japanese with a specific API model override:
-
-```bash
-python vid_to_sub.py ./videos \
-  --translate-to ja \
-  --translation-model gpt-4.1-mini
-```
-
-Write multiple output formats:
-
-```bash
-python vid_to_sub.py ./videos \
-  --format srt \
-  --format json
-```
-
-Dry run:
-
-```bash
-python vid_to_sub.py ./videos --dry-run
-```
-
-Skip files that already have primary outputs:
-
-```bash
-python vid_to_sub.py ./videos --skip-existing
-```
-
-## CLI
-
-```text
-usage: vid_to_sub [-h] [-o DIR] [--no-recurse] [--skip-existing] [--dry-run]
-                  [--backend {whisper-cpp,faster-whisper,whisper,whisperx}]
-                  [--model MODEL] [--language LANG]
-                  [--device {auto,cpu,cuda,mps}] [--compute-type TYPE]
-                  [--beam-size N] [--format FMT]
-                  [--whisper-cpp-model-path PATH] [--hf-token TOKEN]
-                  [--diarize] [--translate-to LANG]
-                  [--translation-model MODEL]
-                  [--translation-base-url URL]
-                  [--translation-api-key KEY]
-                  [--workers N] [-v] [--list-models]
-                  PATH [PATH ...]
-```
-
-## Output naming
-
-Original transcription:
 - `movie.srt`
 - `movie.vtt`
+- `movie.txt`
+- `movie.tsv`
 - `movie.json`
 
 Translated output with `--translate-to ko`:
+
 - `movie.ko.srt`
 - `movie.ko.vtt`
+- `movie.ko.txt`
+- `movie.ko.tsv`
 - `movie.ko.json`
+
+## Recommended Usage Patterns
+
+### Fast local batch transcription
+
+Use the default `whisper.cpp` backend when you want the simplest CPU-only flow with minimal moving parts.
+
+### Translation pass after transcription
+
+Use `--translate-to <lang>` when you already trust the generated subtitle segmentation and only want the text replaced without changing timing.
+
+### Operator workflow through the TUI
+
+Use `tui.py` when you want setup assistance, persistent settings, queue visibility, history, or distributed execution from one terminal UI.
 
 ## Notes
 
-- In this tool, `whisper.cpp` is treated as the default CPU backend.
-- `ffmpeg` is used to extract mono 16k WAV audio before calling `whisper-cli`.
-- Translation only changes subtitle text; timestamps are preserved exactly from the original subtitle segments.
-- `whisperX` diarization still requires Hugging Face access for `pyannote`.
+- `whisperX` diarization needs `--hf-token`; without it, the run continues without diarization.
+- Primary outputs are considered existing by filename and format only, so `--skip-existing` checks for files such as `movie.srt` in the target output directory.
+- The Settings tab can export the current configuration into `.env`.
