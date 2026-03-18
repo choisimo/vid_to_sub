@@ -9,6 +9,13 @@ venv/
 env/
 ENV/
 
+# Root-level virtualenv artifacts from accidental in-place venv creation
+/bin/
+/include/
+/lib/
+/lib64
+/pyvenv.cfg
+
 # Python tooling caches
 .pytest_cache/
 .ruff_cache/

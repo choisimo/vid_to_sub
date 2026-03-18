@@ -98,6 +98,7 @@ from .helpers import (
     partition_folder_groups_by_capacity,
     summarize_ggml_models,
     summarize_remote_resources,
+    resolve_runtime_backend_threads,
 )
 from .state import db as _db
 from .styles import _CSS
@@ -2359,17 +2360,18 @@ class VidToSubApp(App):
             cmd += ["--beam-size", beam]
 
         worker_count = (
-            str(remote_profile.slots)
+            remote_profile.slots
             if remote_profile is not None
             else (
-                str(config.local_workers)
+                config.local_workers
                 if config is not None
-                else (self._val("inp-workers") or "1")
+                else _coerce_positive_int(self._val("inp-workers") or "1", default=1)
             )
         )
-        if worker_count != "1":
-            cmd += ["--workers", worker_count]
-        cmd += ["--backend-threads", "2"]
+        if worker_count != 1:
+            cmd += ["--workers", str(worker_count)]
+        backend_threads = resolve_runtime_backend_threads(backend, device, worker_count)
+        cmd += ["--backend-threads", str(backend_threads)]
 
         whisper_cpp_model_path = (
             config.whisper_cpp_model_path

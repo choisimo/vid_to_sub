@@ -6,8 +6,6 @@ from pathlib import Path
 from typing import Optional
 
 from vid_to_sub_app.shared.constants import (
-    DEFAULT_BACKEND,
-    DEFAULT_DEVICE,
     DEFAULT_FORMAT,
     DEFAULT_MODEL,
     ENV_TRANSLATION_API_KEY,
@@ -17,7 +15,11 @@ from vid_to_sub_app.shared.constants import (
     KNOWN_MODELS,
     SUPPORTED_FORMATS,
 )
-from vid_to_sub_app.shared.env import load_project_env
+from vid_to_sub_app.shared.env import (
+    load_project_env,
+    resolve_runtime_backend_and_device,
+    resolve_runtime_backend_threads,
+)
 
 from .discovery import discover_videos
 from .manifest import build_run_manifest, load_manifest_from_stdin, persist_folder_manifest_state
@@ -26,6 +28,7 @@ from .runner import emit_progress_event, primary_output_exists, run_parallel
 
 
 def build_parser() -> argparse.ArgumentParser:
+    runtime_default_backend, runtime_default_device = resolve_runtime_backend_and_device()
     parser = argparse.ArgumentParser(
         prog="vid_to_sub",
         description="Recursively transcribe video files to subtitle/transcript files.",
@@ -49,13 +52,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--backend",
         choices=["whisper-cpp", "faster-whisper", "whisper", "whisperx"],
-        default=DEFAULT_BACKEND,
+        default=runtime_default_backend,
     )
     parser.add_argument("--model", default=DEFAULT_MODEL, metavar="MODEL")
     parser.add_argument("--language", default=None, metavar="LANG")
     parser.add_argument(
         "--device",
-        default=DEFAULT_DEVICE,
+        default=runtime_default_device,
         choices=["auto", "cpu", "cuda", "mps"],
     )
     parser.add_argument("--compute-type", default=None, metavar="TYPE")
@@ -75,7 +78,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--translation-base-url", default=None, metavar="URL")
     parser.add_argument("--translation-api-key", default=None, metavar="KEY")
     parser.add_argument("--workers", type=int, default=1, metavar="N")
-    parser.add_argument("--backend-threads", type=int, default=2, metavar="N")
+    parser.add_argument("--backend-threads", type=int, default=None, metavar="N")
     parser.add_argument("--manifest-stdin", action="store_true", default=False)
     parser.add_argument("-v", "--verbose", action="store_true", default=False)
     parser.add_argument("--list-models", action="store_true", default=False)
@@ -99,7 +102,14 @@ def main(argv: Optional[list[str]] = None) -> int:
     output_dir = Path(args.output_dir).resolve() if args.output_dir else None
 
     args.workers = max(1, int(args.workers))
-    args.backend_threads = max(2, int(args.backend_threads))
+    if args.backend_threads is None:
+        args.backend_threads = resolve_runtime_backend_threads(
+            args.backend,
+            args.device,
+            args.workers,
+        )
+    else:
+        args.backend_threads = max(1, int(args.backend_threads))
 
     if args.manifest_stdin:
         try:

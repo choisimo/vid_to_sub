@@ -40,6 +40,8 @@ from vid_to_sub_app.shared.env import (
     discover_ggml_models as shared_discover_ggml_models,
     find_whisper_cpp_bin,
     preferred_ggml_model_path as shared_preferred_ggml_model_path,
+    resolve_runtime_backend_and_device,
+    resolve_runtime_backend_threads,
 )
 
 from .state import db as _db
@@ -56,6 +58,10 @@ ENV_TRANS_MOD = ENV_TRANSLATION_MODEL
 ENV_AGENT_URL = ENV_AGENT_BASE_URL
 ENV_AGENT_KEY = ENV_AGENT_API_KEY
 ENV_AGENT_MOD = ENV_AGENT_MODEL
+DEFAULT_BACKEND, DEFAULT_DEVICE = resolve_runtime_backend_and_device(
+    DEFAULT_BACKEND,
+    DEFAULT_DEVICE,
+)
 
 def detect_all() -> DetectResult:
     """Scan system for required / optional dependencies."""

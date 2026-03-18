@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import importlib.util
 import os
 import shutil
+import subprocess
 from pathlib import Path
 from typing import Optional, Sequence
 
@@ -11,6 +13,8 @@ except ImportError:
     load_dotenv = None
 
 from .constants import (
+    DEFAULT_BACKEND,
+    DEFAULT_DEVICE,
     DEFAULT_MODEL,
     ENV_FILE,
     ENV_WHISPER_CPP_BIN,
@@ -67,6 +71,123 @@ def load_project_env(*, override: bool = False) -> bool:
         load_dotenv(ENV_FILE, override=override)
         return True
     return load_env_file(ENV_FILE, override=override)
+
+
+def module_available(module_name: str) -> bool:
+    return importlib.util.find_spec(module_name) is not None
+
+
+def available_cpu_threads() -> int:
+    process_cpu_count = getattr(os, "process_cpu_count", None)
+    detected = process_cpu_count() if callable(process_cpu_count) else os.cpu_count()
+    return max(1, int(detected or 1))
+
+
+def detect_torch_device() -> str:
+    try:
+        import torch
+    except ImportError:
+        return "cpu"
+
+    try:
+        if torch.cuda.is_available():
+            return "cuda"
+    except Exception:
+        pass
+
+    try:
+        mps_backend = getattr(getattr(torch, "backends", None), "mps", None)
+        if mps_backend is not None and torch.backends.mps.is_available():
+            return "mps"
+    except Exception:
+        pass
+
+    return "cpu"
+
+
+def nvidia_gpu_available() -> bool:
+    for device_path in (Path("/dev/nvidiactl"), Path("/dev/nvidia0")):
+        if device_path.exists():
+            return True
+
+    try:
+        result = subprocess.run(
+            ["nvidia-smi", "-L"],
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=2.0,
+        )
+    except (FileNotFoundError, OSError, subprocess.TimeoutExpired):
+        return False
+
+    return result.returncode == 0 and bool(result.stdout.strip())
+
+
+def detect_best_device() -> str:
+    torch_device = detect_torch_device()
+    if torch_device != "cpu":
+        return torch_device
+    if nvidia_gpu_available():
+        return "cuda"
+    return "cpu"
+
+
+def resolve_runtime_backend_and_device(
+    default_backend: str = DEFAULT_BACKEND,
+    default_device: str = DEFAULT_DEVICE,
+) -> tuple[str, str]:
+    best_device = detect_best_device()
+    torch_device = detect_torch_device()
+
+    if best_device == "cuda":
+        if module_available("faster_whisper"):
+            return "faster-whisper", "auto"
+        if torch_device == "cuda" and module_available("whisperx"):
+            return "whisperx", "auto"
+        if torch_device == "cuda" and module_available("whisper"):
+            return "whisper", "auto"
+        return default_backend, default_device
+
+    if torch_device == "mps":
+        if module_available("whisperx"):
+            return "whisperx", "auto"
+        if module_available("whisper"):
+            return "whisper", "auto"
+
+    return default_backend, default_device
+
+
+def resolve_runtime_backend_device(backend: str, requested_device: str) -> str:
+    if backend == "whisper-cpp":
+        return "cpu"
+
+    if requested_device == "auto":
+        if backend == "faster-whisper":
+            detected_device = detect_best_device()
+            return "cuda" if detected_device == "cuda" else "cpu"
+        return detect_torch_device()
+
+    if backend == "faster-whisper" and requested_device == "mps":
+        return "cpu"
+
+    return requested_device
+
+
+def resolve_runtime_backend_threads(
+    backend: str,
+    requested_device: str,
+    worker_count: int = 1,
+    *,
+    default_gpu_threads: int = 2,
+) -> int:
+    resolved_device = resolve_runtime_backend_device(backend, requested_device)
+    if resolved_device != "cpu":
+        return max(1, int(default_gpu_threads))
+
+    workers = max(1, int(worker_count))
+    return max(1, available_cpu_threads() // workers)
 
 
 def resolve_executable(candidate: str) -> Optional[str]:

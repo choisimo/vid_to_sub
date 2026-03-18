@@ -23,6 +23,15 @@ from vid_to_sub import (
     parse_whisper_cpp_progress_seconds,
     transcribe_whisper_cpp,
 )
+from vid_to_sub_app.cli.transcription import (
+    resolve_device_fw,
+    transcribe_faster_whisper,
+    transcribe_openai_whisper,
+)
+from vid_to_sub_app.shared.env import (
+    resolve_runtime_backend_and_device,
+    resolve_runtime_backend_threads,
+)
 from tui import (
     ENV_TRANS_KEY,
     ENV_TRANS_MOD,
@@ -647,11 +656,130 @@ class TuiHelperTests(unittest.TestCase):
             self.assertNotIn("collapsed", panel.classes)
             self.assertEqual("Cmd ▾", button.label)
 
-    def test_build_parser_defaults_backend_threads_to_two(self) -> None:
+    def test_build_parser_leaves_backend_threads_auto_by_default(self) -> None:
         args = build_parser().parse_args(["--manifest-stdin"])
 
-        self.assertEqual(2, args.backend_threads)
+        self.assertIsNone(args.backend_threads)
         self.assertTrue(args.manifest_stdin)
+
+    def test_resolve_runtime_backend_and_device_prefers_faster_whisper_on_cuda(self) -> None:
+        with patch("vid_to_sub_app.shared.env.detect_best_device", return_value="cuda"), patch(
+            "vid_to_sub_app.shared.env.detect_torch_device", return_value="cuda"
+        ), patch(
+            "vid_to_sub_app.shared.env.module_available",
+            side_effect=lambda name: name == "faster_whisper",
+        ):
+            resolved = resolve_runtime_backend_and_device()
+
+        self.assertEqual(("faster-whisper", "auto"), resolved)
+
+    def test_resolve_runtime_backend_and_device_prefers_mps_backend_when_available(self) -> None:
+        with patch("vid_to_sub_app.shared.env.detect_best_device", return_value="mps"), patch(
+            "vid_to_sub_app.shared.env.detect_torch_device", return_value="mps"
+        ), patch(
+            "vid_to_sub_app.shared.env.module_available",
+            side_effect=lambda name: name == "whisper",
+        ):
+            resolved = resolve_runtime_backend_and_device()
+
+        self.assertEqual(("whisper", "auto"), resolved)
+
+    def test_build_parser_uses_runtime_backend_and_device_defaults(self) -> None:
+        with patch(
+            "vid_to_sub_app.cli.main.resolve_runtime_backend_and_device",
+            return_value=("faster-whisper", "auto"),
+        ):
+            args = build_parser().parse_args(["--manifest-stdin"])
+
+        self.assertEqual("faster-whisper", args.backend)
+        self.assertEqual("auto", args.device)
+
+    def test_resolve_device_fw_auto_prefers_cuda(self) -> None:
+        with patch("vid_to_sub_app.cli.transcription.detect_best_device", return_value="cuda"):
+            resolved = resolve_device_fw("auto")
+
+        self.assertEqual(("cuda", "float16"), resolved)
+
+    def test_resolve_runtime_backend_threads_uses_all_cpu_threads_by_default(self) -> None:
+        with patch("vid_to_sub_app.shared.env.available_cpu_threads", return_value=12):
+            resolved = resolve_runtime_backend_threads("whisper-cpp", "cpu", worker_count=1)
+
+        self.assertEqual(12, resolved)
+
+    def test_resolve_runtime_backend_threads_splits_cpu_threads_across_workers(self) -> None:
+        with patch("vid_to_sub_app.shared.env.available_cpu_threads", return_value=12):
+            resolved = resolve_runtime_backend_threads(
+                "faster-whisper",
+                "cpu",
+                worker_count=3,
+            )
+
+        self.assertEqual(4, resolved)
+
+    def test_transcribe_openai_whisper_auto_uses_detected_torch_device(self) -> None:
+        loaded: dict[str, str] = {}
+
+        class FakeModel:
+            def transcribe(self, _video_path: str, **_kwargs):
+                return {"segments": [], "language": "en"}
+
+        fake_whisper = SimpleNamespace(
+            load_model=lambda model_name, device: loaded.update(  # type: ignore[arg-type]
+                {"model": model_name, "device": device}
+            )
+            or FakeModel()
+        )
+
+        with patch.dict("sys.modules", {"whisper": fake_whisper}), patch(
+            "vid_to_sub_app.cli.transcription.detect_torch_device",
+            return_value="mps",
+        ):
+            _segments, info = transcribe_openai_whisper(
+                video=Path("/tmp/sample.mp4"),
+                model_name="base",
+                device="auto",
+                language=None,
+                beam_size=5,
+                threads=8,
+            )
+
+        self.assertEqual("mps", loaded["device"])
+        self.assertEqual("openai-whisper", info["backend"])
+
+    def test_transcribe_faster_whisper_cpu_uses_requested_thread_count(self) -> None:
+        captured: dict[str, object] = {}
+
+        class FakeSegment:
+            start = 0.0
+            end = 1.0
+            text = "hello"
+
+        class FakeInfo:
+            language = "en"
+            language_probability = 0.99
+            duration = 1.0
+
+        class FakeWhisperModel:
+            def __init__(self, *args, **kwargs) -> None:
+                captured.update(kwargs)
+
+            def transcribe(self, *_args, **_kwargs):
+                return [FakeSegment()], FakeInfo()
+
+        with patch.dict("sys.modules", {"faster_whisper": SimpleNamespace(WhisperModel=FakeWhisperModel)}):
+            segments, info = transcribe_faster_whisper(
+                video=Path("/tmp/sample.mp4"),
+                model_name="base",
+                device="cpu",
+                language=None,
+                beam_size=5,
+                compute_type=None,
+                threads=10,
+            )
+
+        self.assertEqual(10, captured["cpu_threads"])
+        self.assertEqual("faster-whisper", info["backend"])
+        self.assertEqual("hello", segments[0]["text"])
 
     def test_find_whisper_cpp_bin_ignores_empty_override_and_uses_fallback(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

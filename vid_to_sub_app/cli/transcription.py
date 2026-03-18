@@ -13,6 +13,8 @@ from vid_to_sub_app.shared.constants import (
     ROOT_DIR,
 )
 from vid_to_sub_app.shared.env import (
+    detect_best_device,
+    detect_torch_device,
     find_whisper_cpp_bin,
     find_whisper_cpp_model_path,
 )
@@ -20,15 +22,37 @@ from vid_to_sub_app.shared.env import (
 from .output import parse_srt, parse_whisper_cpp_progress_seconds
 
 
+def configure_torch_cpu_threads(threads: int) -> None:
+    if threads < 1:
+        return
+
+    try:
+        import torch
+    except ImportError:
+        return
+
+    try:
+        torch.set_num_threads(max(1, int(threads)))
+    except Exception:
+        pass
+
+    try:
+        torch.set_num_interop_threads(max(1, min(int(threads), 4)))
+    except Exception:
+        pass
+
+
 def resolve_device_fw(device: str) -> tuple[str, str]:
     if device == "auto":
-        try:
-            import torch
-
-            if torch.cuda.is_available():
-                return "cuda", "float16"
-        except ImportError:
-            pass
+        detected_device = detect_best_device()
+        if detected_device == "cuda":
+            return "cuda", "float16"
+        if detected_device == "mps":
+            print(
+                "[WARN] faster-whisper does not support MPS; using CPU int8.",
+                file=sys.stderr,
+            )
+            return "cpu", "int8"
         return "cpu", "int8"
     if device == "cuda":
         return "cuda", "float16"
@@ -48,6 +72,7 @@ def transcribe_faster_whisper(
     language: Optional[str],
     beam_size: int,
     compute_type: Optional[str],
+    threads: int,
 ) -> tuple[list[dict], dict]:
     try:
         from faster_whisper import WhisperModel
@@ -62,7 +87,12 @@ def transcribe_faster_whisper(
     dev, default_compute_type = resolve_device_fw(device)
     ct = compute_type or default_compute_type
 
-    model = WhisperModel(model_name, device=dev, compute_type=ct)
+    model = WhisperModel(
+        model_name,
+        device=dev,
+        compute_type=ct,
+        cpu_threads=max(1, int(threads)) if dev == "cpu" else 0,
+    )
     segs_raw, info_raw = model.transcribe(
         str(video),
         language=language,
@@ -87,6 +117,7 @@ def transcribe_openai_whisper(
     device: str,
     language: Optional[str],
     beam_size: int,
+    threads: int,
 ) -> tuple[list[dict], dict]:
     try:
         import whisper as ow
@@ -98,15 +129,9 @@ def transcribe_openai_whisper(
         )
         sys.exit(1)
 
-    dev = "cpu" if device == "auto" else device
-    if device == "auto":
-        try:
-            import torch
-
-            if torch.cuda.is_available():
-                dev = "cuda"
-        except ImportError:
-            pass
+    dev = detect_torch_device() if device == "auto" else device
+    if dev == "cpu":
+        configure_torch_cpu_threads(threads)
 
     model = ow.load_model(model_name, device=dev)
     result = model.transcribe(str(video), language=language, beam_size=beam_size)
@@ -131,6 +156,7 @@ def transcribe_whisperx(
     compute_type: Optional[str],
     hf_token: Optional[str],
     diarize: bool,
+    threads: int,
 ) -> tuple[list[dict], dict]:
     try:
         import whisperx
@@ -141,15 +167,9 @@ def transcribe_whisperx(
         )
         sys.exit(1)
 
-    dev = "cpu" if device == "auto" else device
-    if device == "auto":
-        try:
-            import torch
-
-            if torch.cuda.is_available():
-                dev = "cuda"
-        except ImportError:
-            pass
+    dev = detect_torch_device() if device == "auto" else device
+    if dev == "cpu":
+        configure_torch_cpu_threads(threads)
 
     ct = compute_type or ("float16" if dev == "cuda" else "int8")
     model = whisperx.load_model(model_name, dev, compute_type=ct, language=language)
@@ -412,9 +432,17 @@ def transcribe(
             language,
             beam_size,
             compute_type,
+            threads,
         )
     if backend == "whisper":
-        return transcribe_openai_whisper(video, model_name, device, language, beam_size)
+        return transcribe_openai_whisper(
+            video,
+            model_name,
+            device,
+            language,
+            beam_size,
+            threads,
+        )
     if backend == "whisperx":
         return transcribe_whisperx(
             video,
@@ -425,5 +453,6 @@ def transcribe(
             compute_type,
             hf_token,
             diarize,
+            threads,
         )
     raise ValueError(f"Unknown backend: {backend!r}")

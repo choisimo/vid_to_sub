@@ -2,7 +2,7 @@
 
 English | [한국어](README.ko.md)
 
-`vid_to_sub` recursively discovers video files and writes subtitle or transcript files next to the source video or into a dedicated output directory. The default path is CPU transcription through `ffmpeg` + `whisper.cpp`, with optional subtitle translation through an OpenAI-compatible API.
+`vid_to_sub` recursively discovers video files and writes subtitle or transcript files next to the source video or into a dedicated output directory. The runtime defaults prefer a GPU-capable backend when the local environment exposes one, and otherwise fall back to CPU transcription through `ffmpeg` + `whisper.cpp`, with optional subtitle translation through an OpenAI-compatible API.
 
 ## Screenshots
 
@@ -27,7 +27,7 @@ The Transcribe tab controls backend, model, device, execution mode, output forma
 ## What This Project Supports
 
 - Recursive discovery of common video formats such as `mp4`, `mkv`, `mov`, `avi`, `webm`, and `ts`.
-- Default CPU transcription through `whisper.cpp` using `ffmpeg` audio extraction.
+- Runtime defaults that prefer `faster-whisper` on detected CUDA, `whisperX` or `openai-whisper` on supported Torch devices, and otherwise fall back to `whisper.cpp` on CPU.
 - Optional backends: `faster-whisper`, `openai-whisper`, and `whisperX`.
 - Output formats: `srt`, `vtt`, `txt`, `tsv`, `json`, or `all`.
 - Optional translation with an OpenAI-compatible chat-completions API while preserving the original subtitle timing boundaries.
@@ -80,9 +80,12 @@ python vid_to_sub.py /path/to/videos
 By default this:
 
 - scans directories recursively,
-- uses `whisper-cpp`,
 - uses model `large-v3`,
+- automatically picks the best locally available backend/device, preferring CUDA `faster-whisper`, then Torch-backed `whisperX` or `openai-whisper`, and otherwise CPU `whisper-cpp`,
+- when transcription stays on CPU, automatically uses the available CPU threads divided across `--workers`,
 - writes `movie.srt` beside each source file.
+
+Use `--backend`, `--device`, or `--backend-threads` when you want to override the runtime defaults explicitly.
 
 ### 2. Translate subtitles while keeping the original timing
 
@@ -268,6 +271,7 @@ Use `tui.py` when you want setup assistance, persistent settings, queue visibili
 
 ## Notes
 
+- The CLI and TUI share the same runtime backend/device detection, so GPU-capable hosts preselect a matching backend when the optional package is installed.
 - `whisperX` diarization needs `--hf-token`; without it, the run continues without diarization.
 - Primary outputs are considered existing by filename and format only, so `--skip-existing` checks for files such as `movie.srt` in the target output directory.
 - The Settings tab can export the current configuration into `.env`.
