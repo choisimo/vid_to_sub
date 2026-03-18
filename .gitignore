@@ -15,10 +15,14 @@ ENV/
 .mypy_cache/
 .pyre/
 .hypothesis/
+.tox/
+.nox/
+.cache/
 
 # Coverage and build artifacts
 .coverage
 .coverage.*
+coverage.xml
 htmlcov/
 build/
 dist/
@@ -30,6 +34,7 @@ pip-wheel-metadata/
 .env
 .env.*
 !.env.example
+.python-version
 
 # SQLite database (user data, not version-controlled)
 *.db
@@ -46,5 +51,9 @@ pip-wheel-metadata/
 .idea/
 .vscode/
 .vscode-test/
+.ipynb_checkpoints/
 .DS_Store
 Thumbs.db
+
+# Runtime logs
+*.log

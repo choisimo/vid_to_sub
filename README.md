@@ -18,8 +18,10 @@ Default flow:
 - OpenAI-compatible translation config via environment variables
 - `--skip-existing`, `--dry-run`, `--workers`
 - **Interactive TUI** (`tui.py`) — 6-tab terminal UI backed by SQLite
+- Live run dashboard with elapsed time, processed percentage, active-job list, and SQLite history updates
+- Distributed execution mode that can split discovered files across local workers and SSH-connected remote Linux/GPU resources
 - Best-effort automatic setup that can install missing system tools, Python deps, build `whisper.cpp`, and fetch a GGML model
-- Bounded AI Agent tab that turns natural-language setup requests into reviewable executable actions
+- Bounded AI Agent tab that turns natural-language setup/history requests into reviewable executable actions
 
 ## TUI
 
@@ -33,11 +35,39 @@ Tabs:
 - **1 Browse** — DirectoryTree path browser, quick recursive path search, manual path entry, recent paths
 - **2 Setup** — auto-detect deps and installed ggml models, one-click auto setup/full install, build whisper.cpp, download ggml models, pip install
 - **3 Transcribe** — all job settings (backend, model, format, translation) with automatic ggml model matching for `whisper.cpp`
-- **4 History** — SQLite-backed job history with status and timing
-- **5 Settings** — persistent config (replaces `.env`), export to `.env`
-- **6 Agent** — OpenAI-compatible bounded agent that plans and can apply safe setup actions
+- **4 History** — SQLite-backed job history with status, timing, load-row, and rerun controls
+- **5 Settings** — persistent config (replaces `.env`), export to `.env`, remote SSH resource profiles
+- **6 Agent** — OpenAI-compatible bounded agent that can analyze live runs and propose safe setup/history actions
 
 Keyboard shortcuts: `Ctrl+R` run · `Ctrl+D` dry-run · `Ctrl+K` kill · `Ctrl+S` save · `1-6` tabs · `Ctrl+Q` quit
+
+### Distributed execution
+
+`Settings -> Remote Resources` accepts a JSON array of SSH profiles. The current implementation is designed for shared storage or explicit prefix remapping between local and remote paths.
+
+Example:
+
+```json
+[
+  {
+    "name": "gpu-box",
+    "ssh_target": "user@gpu-host",
+    "remote_workdir": "/home/user/vid_to_sub",
+    "slots": 2,
+    "path_map": {
+      "/mnt/media": "/srv/media"
+    },
+    "env": {
+      "VID_TO_SUB_WHISPER_CPP_MODEL": "/models/ggml-large-v3.bin"
+    }
+  }
+]
+```
+
+Notes:
+- `slots` controls how much of the discovered file queue is assigned to that remote host.
+- `path_map` rewrites local prefixes before the remote command runs.
+- nothing runs remotely until `Execution -> Mode` is switched to `distributed` in the Transcribe tab.
 
 ## Requirements
 
