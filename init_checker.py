@@ -6,9 +6,9 @@ import os
 import subprocess
 import sys
 import venv
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, Sequence
 
 ROOT_DIR = Path(__file__).resolve().parent
 VENV_DIR = ROOT_DIR / ".venv"
@@ -21,6 +21,7 @@ class RequirementGroup:
     name: str
     filename: str
     modules: tuple[str, ...]
+    optional: bool = False
 
     @property
     def path(self) -> Path:
@@ -28,21 +29,24 @@ class RequirementGroup:
 
 
 REQUIREMENT_GROUPS: dict[str, RequirementGroup] = {
-    "base": RequirementGroup("base", "requirements.txt", ("textual", "dotenv")),
+    "base": RequirementGroup("base", "requirements.txt", ("textual", "dotenv"), optional=False),
     "faster-whisper": RequirementGroup(
         "faster-whisper",
         "requirements-faster-whisper.txt",
         ("faster_whisper",),
+        optional=True,
     ),
     "whisper": RequirementGroup(
         "whisper",
         "requirements-whisper.txt",
         ("whisper", "torch", "torchaudio"),
+        optional=True,
     ),
     "whisperx": RequirementGroup(
         "whisperx",
         "requirements-whisperx.txt",
         ("whisperx", "torch", "torchaudio"),
+        optional=True,
     ),
 }
 
@@ -71,7 +75,7 @@ def ensure_venv() -> Path:
 
 
 def ensure_pip(python_executable: str) -> None:
-    subprocess.run(
+    _ = subprocess.run(
         [python_executable, "-m", "ensurepip", "--upgrade"],
         check=False,
         stdout=subprocess.DEVNULL,
@@ -83,15 +87,15 @@ def missing_modules(modules: Iterable[str]) -> list[str]:
     return [module for module in modules if importlib.util.find_spec(module) is None]
 
 
-def install_requirements(python_executable: str, group: RequirementGroup) -> None:
+def install_requirements(python_executable: str, group: RequirementGroup) -> bool:
     if not group.path.exists():
         print(
             f"[bootstrap] requirement file missing, skipping: {group.path}",
             file=sys.stderr,
         )
-        return
+        return False
     print(f"[bootstrap] installing {group.filename}", file=sys.stderr)
-    subprocess.run(
+    result = subprocess.run(
         [
             python_executable,
             "-m",
@@ -101,9 +105,9 @@ def install_requirements(python_executable: str, group: RequirementGroup) -> Non
             "-r",
             str(group.path),
         ],
-        check=True,
         cwd=ROOT_DIR,
     )
+    return result.returncode == 0
 
 
 def resolve_groups(requirement_groups: Sequence[str] | None) -> list[RequirementGroup]:
@@ -140,10 +144,24 @@ def bootstrap_runtime(
 
     ensure_pip(sys.executable)
     installed_any = False
+    failed_optional: list[str] = []
     for group in groups:
         if missing_modules(group.modules):
-            install_requirements(sys.executable, group)
-            installed_any = True
+            success = install_requirements(sys.executable, group)
+            if success:
+                installed_any = True
+            elif group.optional:
+                failed_optional.append(group.name)
+            else:
+                raise RuntimeError(
+                    f"Failed to install required dependency group '{group.name}'"
+                )
+
+    if failed_optional:
+        print(
+            f"[bootstrap] optional groups skipped: {', '.join(failed_optional)}",
+            file=sys.stderr,
+        )
 
     if installed_any and os.environ.get(REEXEC_ENV) != "1":
         relaunch(Path(sys.executable), sys.argv, [group.name for group in groups])
