@@ -22,7 +22,9 @@ ENV/
 htmlcov/
 build/
 dist/
+site/
 *.egg-info/
+pip-wheel-metadata/
 
 # Local environment files
 .env
@@ -31,11 +33,18 @@ dist/
 
 # SQLite database (user data, not version-controlled)
 *.db
+*.db-journal
 *.db-shm
 *.db-wal
+*.sqlite
+*.sqlite3
+
+# TUI/runtime state
+.textual/
 
 # Editor and OS metadata
 .idea/
 .vscode/
+.vscode-test/
 .DS_Store
 Thumbs.db
