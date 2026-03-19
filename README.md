@@ -110,6 +110,10 @@ This writes both the original transcription and the translated file, for example
 
 Only subtitle text changes. `start` and `end` timestamps are copied from the original segments.
 
+Actual output after translating to Korean:
+
+![Translation result with original and Korean subtitles](docs/images/result.png)
+
 ### 3. Use the TUI
 
 ```bash
