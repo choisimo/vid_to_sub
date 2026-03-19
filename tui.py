@@ -53,7 +53,7 @@ def __getattr__(name: str):
 def main() -> int:
     from init_checker import bootstrap_runtime
 
-    bootstrap_runtime(requirement_groups=("base", "faster-whisper", "whisper", "whisperx"))
+    bootstrap_runtime(requirement_groups=("base",))
     module = _load_public_module()
     return int(module.main() or 0)
 

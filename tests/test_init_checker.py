@@ -5,12 +5,28 @@ import subprocess
 import sys
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import init_checker
+import tui
 
 
 class InitCheckerTests(unittest.TestCase):
+    def test_tui_main_bootstraps_base_group_only(self) -> None:
+        with (
+            patch("init_checker.bootstrap_runtime") as bootstrap_runtime,
+            patch.object(
+                tui,
+                "_load_public_module",
+                return_value=SimpleNamespace(main=lambda: 0),
+            ),
+        ):
+            result = tui.main()
+
+        bootstrap_runtime.assert_called_once_with(requirement_groups=("base",))
+        self.assertEqual(0, result)
+
     def test_resolve_groups_rejects_unknown_group(self) -> None:
         with self.assertRaises(ValueError):
             _ = init_checker.resolve_groups(("missing",))
@@ -18,15 +34,18 @@ class InitCheckerTests(unittest.TestCase):
     def test_bootstrap_runtime_relaunches_into_project_venv(self) -> None:
         target_python = Path("/tmp/project/.venv/bin/python")
 
-        with patch.object(init_checker, "ensure_venv", return_value=target_python), patch.object(
-            init_checker,
-            "is_same_interpreter",
-            return_value=False,
-        ), patch.object(init_checker, "ensure_pip"), patch.object(
-            init_checker, "missing_modules", return_value=[]
-        ), patch.object(init_checker, "install_requirements", return_value=True), patch.object(
-            init_checker, "relaunch"
-        ) as relaunch:
+        with (
+            patch.object(init_checker, "ensure_venv", return_value=target_python),
+            patch.object(
+                init_checker,
+                "is_same_interpreter",
+                return_value=False,
+            ),
+            patch.object(init_checker, "ensure_pip"),
+            patch.object(init_checker, "missing_modules", return_value=[]),
+            patch.object(init_checker, "install_requirements", return_value=True),
+            patch.object(init_checker, "relaunch") as relaunch,
+        ):
             init_checker.bootstrap_runtime(requirement_groups=("base",))
 
         relaunch.assert_called_once()
@@ -35,18 +54,28 @@ class InitCheckerTests(unittest.TestCase):
     def test_bootstrap_runtime_installs_missing_groups_and_reexecs(self) -> None:
         current_python = Path(sys.executable)
 
-        with patch.object(init_checker, "ensure_venv", return_value=current_python), patch.object(
-            init_checker,
-            "is_same_interpreter",
-            return_value=True,
-        ), patch.object(init_checker, "ensure_pip"), patch.object(
-            init_checker,
-            "missing_modules",
-            side_effect=[["textual"], []],
-        ), patch.object(init_checker, "install_requirements", return_value=True) as install_requirements, patch.object(
-            init_checker, "relaunch"
-        ) as relaunch, patch.dict(os.environ, {}, clear=False):
-            init_checker.bootstrap_runtime(requirement_groups=("base", "faster-whisper"))
+        with (
+            patch.object(init_checker, "ensure_venv", return_value=current_python),
+            patch.object(
+                init_checker,
+                "is_same_interpreter",
+                return_value=True,
+            ),
+            patch.object(init_checker, "ensure_pip"),
+            patch.object(
+                init_checker,
+                "missing_modules",
+                side_effect=[["textual"], []],
+            ),
+            patch.object(
+                init_checker, "install_requirements", return_value=True
+            ) as install_requirements,
+            patch.object(init_checker, "relaunch") as relaunch,
+            patch.dict(os.environ, {}, clear=False),
+        ):
+            init_checker.bootstrap_runtime(
+                requirement_groups=("base", "faster-whisper")
+            )
 
         install_requirements.assert_called_once_with(
             sys.executable, init_checker.REQUIREMENT_GROUPS["base"]
@@ -78,24 +107,26 @@ class InitCheckerTests(unittest.TestCase):
 
     def test_bootstrap_skips_optional_group_on_pip_failure(self) -> None:
         current_python = Path(sys.executable)
-        with patch.object(init_checker, "ensure_venv", return_value=current_python), patch.object(
-            init_checker, "is_same_interpreter", return_value=True
-        ), patch.object(init_checker, "ensure_pip"), patch.object(
-            init_checker, "missing_modules", return_value=["whisperx"]
-        ), patch.object(init_checker, "install_requirements", return_value=False), patch.object(
-            init_checker, "relaunch"
-        ) as relaunch:
+        with (
+            patch.object(init_checker, "ensure_venv", return_value=current_python),
+            patch.object(init_checker, "is_same_interpreter", return_value=True),
+            patch.object(init_checker, "ensure_pip"),
+            patch.object(init_checker, "missing_modules", return_value=["whisperx"]),
+            patch.object(init_checker, "install_requirements", return_value=False),
+            patch.object(init_checker, "relaunch") as relaunch,
+        ):
             init_checker.bootstrap_runtime(requirement_groups=("whisperx",))
         relaunch.assert_not_called()
 
     def test_bootstrap_raises_on_required_group_pip_failure(self) -> None:
         current_python = Path(sys.executable)
-        with patch.object(init_checker, "ensure_venv", return_value=current_python), patch.object(
-            init_checker, "is_same_interpreter", return_value=True
-        ), patch.object(init_checker, "ensure_pip"), patch.object(
-            init_checker, "missing_modules", return_value=["textual"]
-        ), patch.object(init_checker, "install_requirements", return_value=False), self.assertRaises(
-            RuntimeError
+        with (
+            patch.object(init_checker, "ensure_venv", return_value=current_python),
+            patch.object(init_checker, "is_same_interpreter", return_value=True),
+            patch.object(init_checker, "ensure_pip"),
+            patch.object(init_checker, "missing_modules", return_value=["textual"]),
+            patch.object(init_checker, "install_requirements", return_value=False),
+            self.assertRaises(RuntimeError),
         ):
             init_checker.bootstrap_runtime(requirement_groups=("base",))
 

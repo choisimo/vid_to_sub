@@ -1,0 +1,2 @@
+- 2026-03-20: Normal  startup only needs ; optional backend installs remain available through Setup actions and full setup flows.
+- 2026-03-20: Normal python tui.py startup only needs bootstrap_runtime(requirement_groups=("base",)); optional backend installs remain available through Setup actions and full setup flows.
