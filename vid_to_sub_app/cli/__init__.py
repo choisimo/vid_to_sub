@@ -10,8 +10,19 @@ from .manifest import (
     load_manifest_from_stdin,
     persist_folder_manifest_state,
 )
-from .output import fmt_seconds, parse_srt, parse_whisper_cpp_progress_seconds, probe_media_duration
-from .runner import emit_progress_event, primary_output_exists, process_one, run_parallel
+from .output import (
+    fmt_seconds,
+    parse_srt,
+    parse_whisper_cpp_progress_seconds,
+    probe_media_duration,
+)
+from .runner import (
+    emit_progress_event,
+    primary_output_exists,
+    process_one,
+    run_parallel,
+    translation_capable,
+)
 from .transcription import (
     default_whisper_cpp_model_path,
     extract_audio_for_whisper_cpp,

@@ -193,6 +193,26 @@ List built-in model identifiers:
 python vid_to_sub.py --list-models
 ```
 
+Run transcription only and save a stage artifact for later translation:
+
+```bash
+python vid_to_sub.py /path/to/videos --stage1-only --translate-to ko
+```
+
+This writes `movie.srt` and a sidecar `movie.stage1.json` next to each source file.
+When a translation API becomes available, replay stage 2 on the artifact without
+re-transcribing:
+
+```bash
+python vid_to_sub.py --translate-from-artifact /path/to/movie.stage1.json
+```
+
+To force re-translation even when the artifact already records a completed
+translation pass:
+
+```bash
+python vid_to_sub.py --translate-from-artifact /path/to/movie.stage1.json --overwrite-translation
+```
 ## Environment Variables
 
 ### `whisper.cpp`

@@ -1,0 +1,20 @@
+test_process_one_no_translation_skips_stage2 (tests.test_translation_pipeline.TestRunnerStageSplit.test_process_one_no_translation_skips_stage2) ... ▶  /tmp/tmpwr908ozy/movie.mp4
+@@VID_TO_SUB_EVENT@@ {"event": "job_started", "folder_hash": "folder-hash", "folder_path": "/tmp/tmpwr908ozy", "video_duration": null, "video_path": "/tmp/tmpwr908ozy/movie.mp4", "worker_id": 0}
+   ✓ [en]  video=0:00:01  wall=0:00:00  movie.srt
+ok
+test_stage1_writes_artifact (tests.test_translation_pipeline.TestRunnerStageSplit.test_stage1_writes_artifact) ... ▶  /tmp/tmpy0avu375/movie.mp4
+@@VID_TO_SUB_EVENT@@ {"event": "job_started", "folder_hash": "folder-hash", "folder_path": "/tmp/tmpy0avu375", "video_duration": null, "video_path": "/tmp/tmpy0avu375/movie.mp4", "worker_id": 0}
+ok
+test_stage2_does_not_call_transcribe (tests.test_translation_pipeline.TestRunnerStageSplit.test_stage2_does_not_call_transcribe) ... ok
+test_artifact_path_for_source_only (tests.test_translation_pipeline.TestStageArtifact.test_artifact_path_for_source_only) ... ok
+test_artifact_path_for_with_output_dir (tests.test_translation_pipeline.TestStageArtifact.test_artifact_path_for_with_output_dir) ... ok
+test_load_unsupported_version_raises (tests.test_translation_pipeline.TestStageArtifact.test_load_unsupported_version_raises) ... ok
+test_write_and_load_roundtrip (tests.test_translation_pipeline.TestStageArtifact.test_write_and_load_roundtrip) ... ok
+test_main_rejects_postprocess_without_translation_target (tests.test_translation_pipeline.TranslationPipelineTests.test_main_rejects_postprocess_without_translation_target) ... ok
+test_postprocess_uses_translation_config_as_fallback (tests.test_translation_pipeline.TranslationPipelineTests.test_postprocess_uses_translation_config_as_fallback) ... ok
+test_translate_segments_openai_compatible_preserves_segment_boundaries (tests.test_translation_pipeline.TranslationPipelineTests.test_translate_segments_openai_compatible_preserves_segment_boundaries) ... ok
+
+----------------------------------------------------------------------
+Ran 10 tests in 0.090s
+
+OK

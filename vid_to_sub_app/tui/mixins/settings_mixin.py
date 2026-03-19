@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import json
 import os
-from typing import Mapping
+from collections.abc import Mapping
+from typing import Any
 
 from textual.css.query import NoMatches
-from textual.widgets import DataTable, Input, Select, Static, TextArea
+from textual.widgets import DataTable, Input, Select, Static, Switch, TextArea
 
-from vid_to_sub_app.shared.env import load_project_env
+from vid_to_sub_app.db import TUI_DEFAULT_TRANSLATE_ENABLED_KEY
 
 from ..helpers import (
     ENV_AGENT_KEY,
@@ -28,6 +29,34 @@ from ..state import db as _db
 
 
 class SettingsMixin:
+    _ssh_selected_id: int | None = None
+
+    def query_one(self, *args: object, **kwargs: object) -> Any:
+        raise NotImplementedError
+
+    def _sel(self, widget_id: str, default: str = "") -> str:
+        raise NotImplementedError
+
+    def _val(self, widget_id: str) -> str:
+        raise NotImplementedError
+
+    def _load_remote_resources(self) -> None:
+        raise NotImplementedError
+
+    def _run_detection(self) -> Any:
+        raise NotImplementedError
+
+    def _update_wcpp_model_status(self) -> None:
+        raise NotImplementedError
+
+    def _update_remote_status(self) -> None:
+        raise NotImplementedError
+
+    def _update_agent_config_status(self) -> None:
+        raise NotImplementedError
+
+    def _update_cmd_preview(self) -> None:
+        raise NotImplementedError
 
     # ── Settings ──────────────────────────────────────────────────────────
 
@@ -56,6 +85,12 @@ class SettingsMixin:
                 self.query_one(f"#{wid}", Input).value = _db.get(key)
             except NoMatches:
                 pass
+        try:
+            self.query_one("#sw-stg-translate-enabled", Switch).value = bool(
+                _db.get_setting(TUI_DEFAULT_TRANSLATE_ENABLED_KEY, True)
+            )
+        except NoMatches:
+            pass
         try:
             self.query_one("#stg-remote-resources", TextArea).text = _db.get(
                 "tui.remote_resources", "[]"
@@ -95,6 +130,12 @@ class SettingsMixin:
                     self.query_one(f"#{wid}", Input).value = val
             except NoMatches:
                 pass
+        try:
+            self.query_one("#sw-translate", Switch).value = bool(
+                _db.get_setting(TUI_DEFAULT_TRANSLATE_ENABLED_KEY, True)
+            )
+        except NoMatches:
+            pass
 
     def _sync_transcribe_overrides_from_settings(
         self,
@@ -144,6 +185,17 @@ class SettingsMixin:
                 continue
 
             widget.value = (updated_values.get(key) or "").strip()
+        try:
+            switch = self.query_one("#sw-translate", Switch)
+        except NoMatches:
+            switch = None
+        if switch is not None and (
+            updated_values.get(TUI_DEFAULT_TRANSLATE_ENABLED_KEY)
+            != previous_values.get(TUI_DEFAULT_TRANSLATE_ENABLED_KEY)
+        ):
+            switch.value = bool(
+                _db.get_setting(TUI_DEFAULT_TRANSLATE_ENABLED_KEY, True)
+            )
 
     def _save_settings(self) -> None:
         pairs = [
@@ -172,14 +224,22 @@ class SettingsMixin:
             except NoMatches:
                 pass
         try:
-            data["tui.remote_resources"] = self.query_one(
-                "#stg-remote-resources", TextArea
-            ).text.strip() or "[]"
+            data[TUI_DEFAULT_TRANSLATE_ENABLED_KEY] = (
+                "1"
+                if self.query_one("#sw-stg-translate-enabled", Switch).value
+                else "0"
+            )
+        except NoMatches:
+            pass
+        try:
+            data["tui.remote_resources"] = (
+                self.query_one("#stg-remote-resources", TextArea).text.strip() or "[]"
+            )
         except NoMatches:
             pass
         data["tui.execution_mode"] = self._sel("sel-execution-mode", "local")
         try:
-            parse_remote_resources(data.get("tui.remote_resources", "[]"))
+            _ = parse_remote_resources(data.get("tui.remote_resources", "[]"))
         except ValueError as exc:
             try:
                 self.query_one("#stg-status", Static).update(f"[red]✗ {exc}[/]")
@@ -187,6 +247,9 @@ class SettingsMixin:
                 pass
             return
         previous_values = {key: _db.get(key) for _, key in pairs}
+        previous_values[TUI_DEFAULT_TRANSLATE_ENABLED_KEY] = _db.get(
+            TUI_DEFAULT_TRANSLATE_ENABLED_KEY
+        )
         _db.set_many(data)
         self._apply_db_to_env()
         self._sync_transcribe_overrides_from_settings(previous_values, data)
@@ -248,6 +311,7 @@ class SettingsMixin:
         was set by shell or a previous .env load.
         """
         from vid_to_sub_app.shared.env import load_env_from_sqlite
+
         load_env_from_sqlite(_db.get_all, override=True)
 
     def _migrate_env_to_db(self) -> None:
@@ -258,12 +322,14 @@ class SettingsMixin:
         and .env is no longer automatically consulted.
         """
         from vid_to_sub_app.shared.env import import_env_file_to_sqlite
+
         import_env_file_to_sqlite(
             ENV_FILE,
             _db.set_many,
             _db.get_all,
             overwrite=False,
         )
+
     def _import_env_to_sqlite(self) -> None:
         """Import .env file into SQLite (overwrite=False: only fills blank keys).
 
@@ -271,6 +337,7 @@ class SettingsMixin:
         source of truth and .env is no longer consulted automatically.
         """
         from vid_to_sub_app.shared.env import import_env_file_to_sqlite
+
         if not ENV_FILE.exists():
             try:
                 self.query_one("#stg-status", Static).update(
@@ -304,7 +371,9 @@ class SettingsMixin:
         """Initialize the SSH connections DataTable columns."""
         try:
             table = self.query_one("#ssh-conn-table", DataTable)
-            table.add_columns("ID", "Label", "Host", "User", "Port", "Workdir", "Slots", "Enabled")
+            table.add_columns(
+                "ID", "Label", "Host", "User", "Port", "Workdir", "Slots", "Enabled"
+            )
         except (NoMatches, Exception):
             pass
 
@@ -328,7 +397,11 @@ class SettingsMixin:
                 "✔" if row.get("enabled", True) else "✘",
                 key=str(row.get("id", "")),
             )
-        hint = f"[dim]{len(connections)} connection(s)[/]" if connections else "[dim]No SSH connections configured[/]"
+        hint = (
+            f"[dim]{len(connections)} connection(s)[/]"
+            if connections
+            else "[dim]No SSH connections configured[/]"
+        )
         try:
             self.query_one("#ssh-conn-hint", Static).update(hint)
         except NoMatches:
@@ -350,7 +423,9 @@ class SettingsMixin:
             "env_json": self._val("ssh-env-json"),
         }
 
-    def _ssh_parse_json_field(self, value: str, field_name: str) -> dict[str, str] | None:
+    def _ssh_parse_json_field(
+        self, value: str, field_name: str
+    ) -> dict[str, str] | None:
         """Parse a JSON dict field from the SSH form. Returns None on error."""
         stripped = value.strip()
         if not stripped:
@@ -392,10 +467,17 @@ class SettingsMixin:
                 pass
         self._ssh_set_status("")
 
-    def _ssh_fill_form_from_row(self, row: dict) -> None:
+    def _ssh_fill_form_from_row(self, row: dict[str, object]) -> None:
         """Fill SSH form fields from a DB row dict."""
         import json as _json
-        self._ssh_selected_id = row.get("id")
+
+        raw_selected_id = row.get("id")
+        selected_id: int | None
+        if isinstance(raw_selected_id, int):
+            selected_id = raw_selected_id
+        else:
+            selected_id = None
+        self._ssh_selected_id = selected_id
         for wid, key, default in [
             ("ssh-label", "label", ""),
             ("ssh-host", "host", ""),
@@ -457,7 +539,9 @@ class SettingsMixin:
         self._refresh_ssh_table()
         self._load_remote_resources()
         self._update_remote_status()
-        self._ssh_set_status(f"[green]✓ Added connection: {form['label'] or form['host']}[/]")
+        self._ssh_set_status(
+            f"[green]✓ Added connection: {form['label'] or form['host']}[/]"
+        )
 
     def _ssh_update_connection(self) -> None:
         """Update the selected SSH connection with current form values."""
@@ -497,7 +581,9 @@ class SettingsMixin:
         self._refresh_ssh_table()
         self._load_remote_resources()
         self._update_remote_status()
-        self._ssh_set_status(f"[green]✓ Updated connection ID {self._ssh_selected_id}[/]")
+        self._ssh_set_status(
+            f"[green]✓ Updated connection ID {self._ssh_selected_id}[/]"
+        )
 
     def _ssh_delete_connection(self) -> None:
         if self._ssh_selected_id is None:

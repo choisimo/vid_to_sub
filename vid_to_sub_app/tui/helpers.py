@@ -7,14 +7,15 @@ import re
 import shutil
 import time
 from pathlib import Path
-from typing import Any, Sequence
+from collections.abc import Sequence
+from typing import Any
 
 from vid_to_sub_app.cli.discovery import hash_video_folder
 from vid_to_sub_app.shared.constants import (
     BACKENDS,
-    DEFAULT_BACKEND,
-    DEFAULT_DEVICE,
-    DEFAULT_MODEL,
+    DEFAULT_BACKEND as BASE_DEFAULT_BACKEND,
+    DEFAULT_DEVICE as BASE_DEFAULT_DEVICE,
+    DEFAULT_MODEL as BASE_DEFAULT_MODEL,
     ENV_AGENT_API_KEY,
     ENV_AGENT_BASE_URL,
     ENV_AGENT_MODEL,
@@ -75,14 +76,15 @@ ENV_AGENT_URL = ENV_AGENT_BASE_URL
 ENV_AGENT_KEY = ENV_AGENT_API_KEY
 ENV_AGENT_MOD = ENV_AGENT_MODEL
 DEFAULT_BACKEND, DEFAULT_DEVICE = resolve_runtime_backend_and_device(
-    DEFAULT_BACKEND,
-    DEFAULT_DEVICE,
+    BASE_DEFAULT_BACKEND,
+    BASE_DEFAULT_DEVICE,
 )
 DEFAULT_MODEL = resolve_runtime_model(
     DEFAULT_BACKEND,
     DEFAULT_DEVICE,
-    DEFAULT_MODEL,
+    BASE_DEFAULT_MODEL,
 )
+
 
 def detect_all() -> DetectResult:
     """Scan system for required / optional dependencies."""
@@ -130,7 +132,7 @@ def detect_all() -> DetectResult:
 # ---------------------------------------------------------------------------
 
 
-def _opts(values: list[str], default: str) -> list[tuple[str, str]]:
+def _opts(values: Sequence[str], default: str) -> list[tuple[str, str]]:
     ordered = [default] + [v for v in values if v != default]
     return [(v, v) for v in ordered]
 
@@ -164,6 +166,33 @@ def _mask(cmd: list[str]) -> list[str]:
     return out
 
 
+def filter_subtitle_paths(output_paths: list[str]) -> list[str]:
+    allowed_suffixes = {".srt", ".vtt", ".txt", ".tsv", ".json"}
+    subtitle_paths: list[str] = []
+    for path_str in output_paths:
+        path = Path(path_str)
+        if path.name.lower().endswith(".stage1.json"):
+            continue
+        if path.suffix.lower() in allowed_suffixes:
+            subtitle_paths.append(path_str)
+    return subtitle_paths
+
+
+def resolve_copy_dest(source: Path, dest_dir: Path, existing: set[str]) -> Path:
+    candidate_name = source.name
+    if candidate_name not in existing:
+        existing.add(candidate_name)
+        return dest_dir / candidate_name
+
+    index = 1
+    while True:
+        candidate_name = f"{source.stem} ({index}){source.suffix}"
+        if candidate_name not in existing:
+            existing.add(candidate_name)
+            return dest_dir / candidate_name
+        index += 1
+
+
 def _candidate_model_dirs() -> list[Path]:
     dirs: list[Path] = []
     seen: set[str] = set()
@@ -186,7 +215,11 @@ def discover_ggml_models(
     search_dirs: Sequence[str | Path] | None = None,
 ) -> dict[str, str]:
     """Return whisper.cpp model names mapped to absolute ggml file paths."""
-    dirs = [Path(p) for p in search_dirs] if search_dirs is not None else _candidate_model_dirs()
+    dirs = (
+        [Path(p) for p in search_dirs]
+        if search_dirs is not None
+        else _candidate_model_dirs()
+    )
     return shared_discover_ggml_models(dirs)
 
 
@@ -217,7 +250,9 @@ def _matches_search(path: Path, root: Path, terms: Sequence[str]) -> bool:
     return all(term in name or term in rel for term in terms)
 
 
-def discover_input_matches(root: Path, query: str, limit: int = SEARCH_RESULT_LIMIT) -> list[str]:
+def discover_input_matches(
+    root: Path, query: str, limit: int = SEARCH_RESULT_LIMIT
+) -> list[str]:
     """Search *root* recursively for directories and video files matching *query*."""
     if limit < 1:
         return []
@@ -456,9 +491,11 @@ def _compact_progress_markup(ratio: float | None, width: int = 6) -> str:
     bar = "█" * filled + "─" * empty
     return f"[yellow]{bar} {ratio * 100:4.1f}%[/]"
 
+
 # RemoteResourceProfile, ExecutorPlan, RunJobState, RunConfig are defined in
 # .models and re-exported here for backward compatibility.
 # (old definitions removed — use models.py as the single source of truth)
+
 
 def _coerce_positive_int(value: Any, default: int = 1) -> int:
     try:
@@ -498,7 +535,9 @@ def parse_remote_resources(raw: str) -> list[RemoteResourceProfile]:
         raw_path_map = item.get("path_map")
         if isinstance(raw_path_map, dict):
             for local_prefix, remote_prefix in raw_path_map.items():
-                if not isinstance(local_prefix, str) or not isinstance(remote_prefix, str):
+                if not isinstance(local_prefix, str) or not isinstance(
+                    remote_prefix, str
+                ):
                     continue
                 local_prefix = local_prefix.strip()
                 remote_prefix = remote_prefix.strip()
@@ -520,7 +559,8 @@ def parse_remote_resources(raw: str) -> list[RemoteResourceProfile]:
                 name=name,
                 ssh_target=ssh_target,
                 remote_workdir=remote_workdir,
-                python_bin=str(item.get("python_bin") or "python3").strip() or "python3",
+                python_bin=str(item.get("python_bin") or "python3").strip()
+                or "python3",
                 script_path=str(item.get("script_path") or "").strip(),
                 slots=_coerce_positive_int(item.get("slots"), default=1),
                 path_map=path_map,
@@ -538,7 +578,9 @@ def summarize_remote_resources(resources: Sequence[RemoteResourceProfile]) -> st
     names = ", ".join(profile.name for profile in resources[:3])
     extra = len(resources) - 3
     suffix = f" (+{extra} more)" if extra > 0 else ""
-    return f"{len(resources)} remote resource(s), {total_slots} slot(s): {names}{suffix}"
+    return (
+        f"{len(resources)} remote resource(s), {total_slots} slot(s): {names}{suffix}"
+    )
 
 
 def map_path_for_remote(path: str, path_map: dict[str, str]) -> str:
@@ -598,14 +640,19 @@ def partition_folder_groups_by_capacity(
     capacities: Sequence[tuple[str, int]],
 ) -> dict[str, list[str]]:
     assignments = {name: [] for name, capacity in capacities if capacity > 0}
-    capacity_map = {name: max(1, capacity) for name, capacity in capacities if capacity > 0}
+    capacity_map = {
+        name: max(1, capacity) for name, capacity in capacities if capacity > 0
+    }
     load_map = {name: 0 for name in assignments}
     if not assignments:
         return assignments
 
     ordered_groups = sorted(
         groups,
-        key=lambda item: (-len(item.get("videos", [])), str(item.get("folder_path") or "")),
+        key=lambda item: (
+            -len(item.get("videos", [])),
+            str(item.get("folder_path") or ""),
+        ),
     )
     for group in ordered_groups:
         target = min(

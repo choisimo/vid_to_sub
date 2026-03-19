@@ -1,0 +1,10 @@
+/usr/bin/python: No module named pytest
+test_artifact_path_for_source_only (tests.test_translation_pipeline.TestStageArtifact.test_artifact_path_for_source_only) ... ok
+test_artifact_path_for_with_output_dir (tests.test_translation_pipeline.TestStageArtifact.test_artifact_path_for_with_output_dir) ... ok
+test_load_unsupported_version_raises (tests.test_translation_pipeline.TestStageArtifact.test_load_unsupported_version_raises) ... ok
+test_write_and_load_roundtrip (tests.test_translation_pipeline.TestStageArtifact.test_write_and_load_roundtrip) ... ok
+
+----------------------------------------------------------------------
+Ran 4 tests in 0.001s
+
+OK
