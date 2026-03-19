@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import io
+import json
 import os
 import tempfile
 import unittest
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -28,8 +29,11 @@ from vid_to_sub_app.cli.transcription import (
     transcribe_faster_whisper,
     transcribe_openai_whisper,
 )
+from vid_to_sub_app.cli.translation import translate_segments_openai_compatible
 from vid_to_sub_app.shared.env import (
+    faster_whisper_model_candidates,
     resolve_runtime_backend_and_device,
+    resolve_runtime_model,
     resolve_runtime_backend_threads,
 )
 from tui import (
@@ -688,11 +692,35 @@ class TuiHelperTests(unittest.TestCase):
         with patch(
             "vid_to_sub_app.cli.main.resolve_runtime_backend_and_device",
             return_value=("faster-whisper", "auto"),
+        ), patch(
+            "vid_to_sub_app.cli.main.resolve_runtime_model",
+            return_value="small",
         ):
             args = build_parser().parse_args(["--manifest-stdin"])
 
         self.assertEqual("faster-whisper", args.backend)
         self.assertEqual("auto", args.device)
+        self.assertEqual("small", args.model)
+
+    def test_faster_whisper_model_candidates_filter_by_vram(self) -> None:
+        candidates = faster_whisper_model_candidates(
+            "large-v3",
+            available_vram_gb=4.5,
+        )
+
+        self.assertEqual(["small", "base", "tiny"], candidates)
+
+    def test_resolve_runtime_model_picks_first_fitting_cuda_candidate(self) -> None:
+        with patch(
+            "vid_to_sub_app.shared.env.resolve_runtime_backend_device",
+            return_value="cuda",
+        ), patch(
+            "vid_to_sub_app.shared.env.detect_cuda_total_memory_gb",
+            return_value=4.5,
+        ):
+            resolved = resolve_runtime_model("faster-whisper", "auto", "large-v3")
+
+        self.assertEqual("small", resolved)
 
     def test_resolve_device_fw_auto_prefers_cuda(self) -> None:
         with patch("vid_to_sub_app.cli.transcription.detect_best_device", return_value="cuda"):
@@ -780,6 +808,170 @@ class TuiHelperTests(unittest.TestCase):
         self.assertEqual(10, captured["cpu_threads"])
         self.assertEqual("faster-whisper", info["backend"])
         self.assertEqual("hello", segments[0]["text"])
+
+    def test_transcribe_faster_whisper_logs_model_loading_hint(self) -> None:
+        class FakeSegment:
+            start = 0.0
+            end = 1.0
+            text = "hello"
+
+        class FakeInfo:
+            language = "en"
+            language_probability = 0.99
+            duration = 1.0
+
+        class FakeWhisperModel:
+            def __init__(self, *_args, **_kwargs) -> None:
+                pass
+
+            def transcribe(self, *_args, **_kwargs):
+                return [FakeSegment()], FakeInfo()
+
+        captured_stdout = io.StringIO()
+        with patch.dict(
+            "sys.modules",
+            {"faster_whisper": SimpleNamespace(WhisperModel=FakeWhisperModel)},
+        ), redirect_stdout(captured_stdout):
+            _segments, _info = transcribe_faster_whisper(
+                video=Path("/tmp/sample.mp4"),
+                model_name="large-v3",
+                device="cpu",
+                language=None,
+                beam_size=5,
+                compute_type=None,
+                threads=4,
+            )
+
+        self.assertIn("Loading faster-whisper model 'large-v3'", captured_stdout.getvalue())
+
+    def test_transcribe_faster_whisper_reports_incomplete_cache(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cache_root = Path(tmpdir) / "models--Systran--faster-whisper-large-v3"
+            snapshot_dir = cache_root / "snapshots" / "abc123"
+            blob_dir = cache_root / "blobs"
+            snapshot_dir.mkdir(parents=True)
+            blob_dir.mkdir(parents=True)
+            incomplete_blob = blob_dir / "broken-model.incomplete"
+            incomplete_blob.write_bytes(b"partial")
+
+            class FakeWhisperModel:
+                def __init__(self, *_args, **_kwargs) -> None:
+                    raise RuntimeError(
+                        f"Unable to open file 'model.bin' in model '{snapshot_dir}'"
+                    )
+
+            with patch.dict(
+                "sys.modules",
+                {"faster_whisper": SimpleNamespace(WhisperModel=FakeWhisperModel)},
+            ):
+                with self.assertRaises(RuntimeError) as ctx:
+                    transcribe_faster_whisper(
+                        video=Path("/tmp/sample.mp4"),
+                        model_name="large-v3",
+                        device="cpu",
+                        language=None,
+                        beam_size=5,
+                        compute_type=None,
+                        threads=4,
+                    )
+
+        message = str(ctx.exception)
+        self.assertIn("cache is incomplete or corrupted", message)
+        self.assertIn(str(cache_root), message)
+        self.assertIn(incomplete_blob.name, message)
+
+    def test_transcribe_faster_whisper_auto_falls_back_to_cpu_after_cuda_oom(self) -> None:
+        attempts: list[tuple[str, str]] = []
+
+        class FakeSegment:
+            start = 0.0
+            end = 1.0
+            text = "hello"
+
+        class FakeInfo:
+            language = "en"
+            language_probability = 0.99
+            duration = 1.0
+
+        class FakeWhisperModel:
+            def __init__(self, model_name: str, *, device: str, **_kwargs) -> None:
+                attempts.append((model_name, device))
+                if device == "cuda":
+                    raise RuntimeError("CUDA failed with error out of memory")
+
+            def transcribe(self, *_args, **_kwargs):
+                return [FakeSegment()], FakeInfo()
+
+        captured_stdout = io.StringIO()
+        captured_stderr = io.StringIO()
+        with patch.dict(
+            "sys.modules",
+            {"faster_whisper": SimpleNamespace(WhisperModel=FakeWhisperModel)},
+        ), patch(
+            "vid_to_sub_app.cli.transcription.detect_best_device",
+            return_value="cuda",
+        ), patch(
+            "vid_to_sub_app.cli.transcription.detect_cuda_total_memory_gb",
+            return_value=4.5,
+        ), redirect_stdout(captured_stdout), redirect_stderr(captured_stderr):
+            segments, info = transcribe_faster_whisper(
+                video=Path("/tmp/sample.mp4"),
+                model_name="large-v3",
+                device="auto",
+                language=None,
+                beam_size=5,
+                compute_type=None,
+                threads=4,
+            )
+
+        self.assertEqual(
+            [
+                ("small", "cuda"),
+                ("base", "cuda"),
+                ("tiny", "cuda"),
+                ("tiny", "cpu"),
+            ],
+            attempts,
+        )
+        self.assertEqual("hello", segments[0]["text"])
+        self.assertEqual("faster-whisper", info["backend"])
+        self.assertEqual("tiny", info["model"])
+        self.assertIn("falling back to CPU int8", captured_stderr.getvalue())
+
+    def test_translate_segments_openai_compatible_sends_accept_and_user_agent(self) -> None:
+        captured_headers: dict[str, str] = {}
+
+        class FakeResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def read(self) -> bytes:
+                payload = {"choices": [{"message": {"content": "[\"안녕하세요\"]"}}]}
+                return json.dumps(payload, ensure_ascii=False).encode("utf-8")
+
+        def fake_urlopen(request):
+            nonlocal captured_headers
+            captured_headers = dict(request.header_items())
+            return FakeResponse()
+
+        with patch("urllib.request.urlopen", side_effect=fake_urlopen):
+            translated, info = translate_segments_openai_compatible(
+                segments=[{"start": 0.0, "end": 1.0, "text": "hello"}],
+                target_language="ko",
+                translation_model="gpt-5.4",
+                translation_base_url="https://example.com/v1",
+                translation_api_key="secret",
+                source_language="en",
+            )
+
+        self.assertEqual("안녕하세요", translated[0]["text"])
+        self.assertEqual("openai-compatible-translation", info["backend"])
+        self.assertEqual("application/json", captured_headers["Content-type"])
+        self.assertEqual("application/json", captured_headers["Accept"])
+        self.assertIn("vid_to_sub/1.0", captured_headers["User-agent"])
 
     def test_find_whisper_cpp_bin_ignores_empty_override_and_uses_fallback(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

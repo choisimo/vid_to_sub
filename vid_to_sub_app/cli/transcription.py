@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import subprocess
+import re
 import sys
 import tempfile
 from pathlib import Path
@@ -13,8 +14,10 @@ from vid_to_sub_app.shared.constants import (
     ROOT_DIR,
 )
 from vid_to_sub_app.shared.env import (
+    detect_cuda_total_memory_gb,
     detect_best_device,
     detect_torch_device,
+    faster_whisper_model_candidates,
     find_whisper_cpp_bin,
     find_whisper_cpp_model_path,
 )
@@ -65,6 +68,68 @@ def resolve_device_fw(device: str) -> tuple[str, str]:
     return "cpu", "int8"
 
 
+def _extract_faster_whisper_model_dir(error_message: str) -> Path | None:
+    match = re.search(r"in model ['\"]([^'\"]+)['\"]", error_message)
+    if not match:
+        return None
+    return Path(match.group(1)).expanduser()
+
+
+def _describe_faster_whisper_load_error(model_name: str, exc: Exception) -> str:
+    raw_message = str(exc).strip() or exc.__class__.__name__
+    model_dir = _extract_faster_whisper_model_dir(raw_message)
+    if "Unable to open file 'model.bin'" not in raw_message or model_dir is None:
+        return f"faster-whisper failed while loading model '{model_name}': {raw_message}"
+
+    cache_dir = model_dir
+    if model_dir.parent.name == "snapshots":
+        cache_dir = model_dir.parent.parent
+
+    message_parts = [
+        f"faster-whisper model cache is incomplete or corrupted for '{model_name}'.",
+        f"Remove '{cache_dir}' and rerun to download the model again.",
+    ]
+
+    blob_dir = cache_dir / "blobs"
+    if blob_dir.exists():
+        incomplete_blobs = sorted(path.name for path in blob_dir.glob("*.incomplete"))
+        if incomplete_blobs:
+            displayed = ", ".join(incomplete_blobs[:3])
+            remaining = len(incomplete_blobs) - 3
+            if remaining > 0:
+                displayed = f"{displayed}, +{remaining} more"
+            message_parts.append(f"Incomplete blob(s) detected: {displayed}.")
+
+    message_parts.append(f"Original error: {raw_message}")
+    return " ".join(message_parts)
+
+
+def _is_cuda_oom_error(exc: Exception) -> bool:
+    message = str(exc).lower()
+    return "cuda" in message and "out of memory" in message
+
+
+def _release_cuda_cache() -> None:
+    try:
+        import torch
+    except ImportError:
+        return
+
+    try:
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except Exception:
+        pass
+
+
+def _announce_faster_whisper_load(model_name: str, device: str, compute_type: str) -> None:
+    print(
+        f"[INFO] Loading faster-whisper model '{model_name}' on {device} ({compute_type}). "
+        "First run may take time while the model is downloaded or loaded.",
+        flush=True,
+    )
+
+
 def transcribe_faster_whisper(
     video: Path,
     model_name: str,
@@ -86,19 +151,122 @@ def transcribe_faster_whisper(
 
     dev, default_compute_type = resolve_device_fw(device)
     ct = compute_type or default_compute_type
+    candidate_chain = faster_whisper_model_candidates(model_name)
+    selected_model = model_name
 
-    model = WhisperModel(
-        model_name,
-        device=dev,
-        compute_type=ct,
-        cpu_threads=max(1, int(threads)) if dev == "cpu" else 0,
-    )
-    segs_raw, info_raw = model.transcribe(
-        str(video),
-        language=language,
-        beam_size=beam_size,
-        word_timestamps=False,
-    )
+    def load_model(target_model: str, target_device: str, target_compute_type: str):
+        return WhisperModel(
+            target_model,
+            device=target_device,
+            compute_type=target_compute_type,
+            cpu_threads=max(1, int(threads)) if target_device == "cpu" else 0,
+        )
+
+    if dev == "cuda":
+        available_vram_gb = detect_cuda_total_memory_gb()
+        gpu_candidates = faster_whisper_model_candidates(
+            model_name,
+            available_vram_gb=available_vram_gb,
+        )
+        gpu_succeeded = False
+        if gpu_candidates and gpu_candidates[0] != model_name:
+            vram_summary = (
+                f"{available_vram_gb:.1f} GiB"
+                if available_vram_gb is not None
+                else "unknown VRAM"
+            )
+            print(
+                f"[WARN] Detected CUDA memory {vram_summary}; "
+                f"starting with model '{gpu_candidates[0]}' instead of '{model_name}'.",
+                file=sys.stderr,
+                flush=True,
+            )
+
+        if gpu_candidates:
+            for index, candidate_model in enumerate(gpu_candidates):
+                selected_model = candidate_model
+                _announce_faster_whisper_load(selected_model, dev, ct)
+                try:
+                    model = load_model(selected_model, dev, ct)
+                except Exception as exc:
+                    if _is_cuda_oom_error(exc):
+                        _release_cuda_cache()
+                        next_candidate = gpu_candidates[index + 1] if index + 1 < len(gpu_candidates) else None
+                        if next_candidate:
+                            print(
+                                f"[WARN] faster-whisper model '{selected_model}' "
+                                "ran out of CUDA memory during model load; "
+                                f"retrying with '{next_candidate}'.",
+                                file=sys.stderr,
+                                flush=True,
+                            )
+                            continue
+                        break
+                    raise RuntimeError(
+                        _describe_faster_whisper_load_error(selected_model, exc)
+                    ) from exc
+
+                try:
+                    segs_raw, info_raw = model.transcribe(
+                        str(video),
+                        language=language,
+                        beam_size=beam_size,
+                        word_timestamps=False,
+                    )
+                    gpu_succeeded = True
+                    break
+                except Exception as exc:
+                    if _is_cuda_oom_error(exc):
+                        del model
+                        _release_cuda_cache()
+                        next_candidate = gpu_candidates[index + 1] if index + 1 < len(gpu_candidates) else None
+                        if next_candidate:
+                            print(
+                                f"[WARN] faster-whisper model '{selected_model}' "
+                                "ran out of CUDA memory during transcription; "
+                                f"retrying with '{next_candidate}'.",
+                                file=sys.stderr,
+                                flush=True,
+                            )
+                            continue
+                        break
+                    raise
+        if not gpu_candidates or not gpu_succeeded:
+            fallback_model = candidate_chain[-1] if candidate_chain else model_name
+            print(
+                f"[WARN] faster-whisper GPU candidates exhausted; "
+                f"falling back to CPU int8 with '{fallback_model}'.",
+                file=sys.stderr,
+                flush=True,
+            )
+            dev = "cpu"
+            ct = "int8"
+            selected_model = fallback_model
+            _announce_faster_whisper_load(selected_model, dev, ct)
+            try:
+                model = load_model(selected_model, dev, ct)
+            except Exception as exc:
+                raise RuntimeError(
+                    _describe_faster_whisper_load_error(selected_model, exc)
+                ) from exc
+            segs_raw, info_raw = model.transcribe(
+                str(video),
+                language=language,
+                beam_size=beam_size,
+                word_timestamps=False,
+            )
+    else:
+        _announce_faster_whisper_load(selected_model, dev, ct)
+        try:
+            model = load_model(selected_model, dev, ct)
+        except Exception as exc:
+            raise RuntimeError(_describe_faster_whisper_load_error(selected_model, exc)) from exc
+        segs_raw, info_raw = model.transcribe(
+            str(video),
+            language=language,
+            beam_size=beam_size,
+            word_timestamps=False,
+        )
 
     segments = [{"start": seg.start, "end": seg.end, "text": seg.text} for seg in segs_raw]
     info = {
@@ -106,7 +274,7 @@ def transcribe_faster_whisper(
         "language_probability": round(info_raw.language_probability, 4),
         "duration": round(info_raw.duration, 3),
         "backend": "faster-whisper",
-        "model": model_name,
+        "model": selected_model,
     }
     return segments, info
 

@@ -90,7 +90,9 @@ def translate_segments_openai_compatible(
             data=json.dumps(payload).encode("utf-8"),
             headers={
                 "Content-Type": "application/json",
+                "Accept": "application/json",
                 "Authorization": f"Bearer {api_key}",
+                "User-Agent": "vid_to_sub/1.0 (+https://local.cli)",
             },
         )
         try:

@@ -17,6 +17,8 @@ from .constants import (
     DEFAULT_DEVICE,
     DEFAULT_MODEL,
     ENV_FILE,
+    FASTER_WHISPER_MODEL_FALLBACKS,
+    FASTER_WHISPER_MODEL_MIN_VRAM_GB,
     ENV_WHISPER_CPP_BIN,
     ENV_WHISPER_CPP_MODEL,
     MODEL_SEARCH_DIRS,
@@ -132,6 +134,100 @@ def detect_best_device() -> str:
     if nvidia_gpu_available():
         return "cuda"
     return "cpu"
+
+
+def detect_cuda_total_memory_gb() -> float | None:
+    try:
+        import torch
+    except ImportError:
+        torch = None  # type: ignore[assignment]
+
+    if torch is not None:
+        try:
+            if torch.cuda.is_available():
+                device_count = max(1, int(torch.cuda.device_count()))
+                totals = [
+                    float(torch.cuda.get_device_properties(index).total_memory)
+                    / (1024**3)
+                    for index in range(device_count)
+                ]
+                if totals:
+                    return max(totals)
+        except Exception:
+            pass
+
+    try:
+        result = subprocess.run(
+            [
+                "nvidia-smi",
+                "--query-gpu=memory.total",
+                "--format=csv,noheader,nounits",
+            ],
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=2.0,
+        )
+    except (FileNotFoundError, OSError, subprocess.TimeoutExpired):
+        return None
+
+    if result.returncode != 0:
+        return None
+
+    values: list[float] = []
+    for raw_line in result.stdout.splitlines():
+        stripped = raw_line.strip()
+        if not stripped:
+            continue
+        try:
+            mib = float(stripped)
+        except ValueError:
+            continue
+        values.append(mib / 1024.0)
+    return max(values) if values else None
+
+
+def faster_whisper_model_candidates(
+    model_name: str,
+    *,
+    available_vram_gb: float | None = None,
+) -> list[str]:
+    raw_candidates = FASTER_WHISPER_MODEL_FALLBACKS.get(model_name, (model_name,))
+    deduped_candidates: list[str] = []
+    seen: set[str] = set()
+    for candidate in raw_candidates:
+        if candidate in seen:
+            continue
+        seen.add(candidate)
+        deduped_candidates.append(candidate)
+
+    if available_vram_gb is None:
+        return deduped_candidates
+
+    fitting_candidates = [
+        candidate
+        for candidate in deduped_candidates
+        if FASTER_WHISPER_MODEL_MIN_VRAM_GB.get(candidate, 0.0) <= available_vram_gb
+    ]
+    return fitting_candidates
+
+
+def resolve_runtime_model(
+    backend: str,
+    requested_device: str,
+    preferred_model: str = DEFAULT_MODEL,
+) -> str:
+    resolved_device = resolve_runtime_backend_device(backend, requested_device)
+    if backend != "faster-whisper" or resolved_device != "cuda":
+        return preferred_model
+
+    available_vram_gb = detect_cuda_total_memory_gb()
+    candidates = faster_whisper_model_candidates(
+        preferred_model,
+        available_vram_gb=available_vram_gb,
+    )
+    return candidates[0] if candidates else preferred_model
 
 
 def resolve_runtime_backend_and_device(

@@ -64,3 +64,7 @@ Thumbs.db
 
 # Runtime logs
 *.log
+
+# Local model downloads and test media artifacts
+/models/
+/media/

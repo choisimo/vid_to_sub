@@ -41,6 +41,7 @@ from vid_to_sub_app.shared.env import (
     find_whisper_cpp_bin,
     preferred_ggml_model_path as shared_preferred_ggml_model_path,
     resolve_runtime_backend_and_device,
+    resolve_runtime_model,
     resolve_runtime_backend_threads,
 )
 
@@ -61,6 +62,11 @@ ENV_AGENT_MOD = ENV_AGENT_MODEL
 DEFAULT_BACKEND, DEFAULT_DEVICE = resolve_runtime_backend_and_device(
     DEFAULT_BACKEND,
     DEFAULT_DEVICE,
+)
+DEFAULT_MODEL = resolve_runtime_model(
+    DEFAULT_BACKEND,
+    DEFAULT_DEVICE,
+    DEFAULT_MODEL,
 )
 
 def detect_all() -> DetectResult:

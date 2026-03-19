@@ -16,6 +16,7 @@ from vid_to_sub_app.shared.constants import (
     SUPPORTED_FORMATS,
 )
 from vid_to_sub_app.shared.env import (
+    resolve_runtime_model,
     load_project_env,
     resolve_runtime_backend_and_device,
     resolve_runtime_backend_threads,
@@ -29,6 +30,11 @@ from .runner import emit_progress_event, primary_output_exists, run_parallel
 
 def build_parser() -> argparse.ArgumentParser:
     runtime_default_backend, runtime_default_device = resolve_runtime_backend_and_device()
+    runtime_default_model = resolve_runtime_model(
+        runtime_default_backend,
+        runtime_default_device,
+        DEFAULT_MODEL,
+    )
     parser = argparse.ArgumentParser(
         prog="vid_to_sub",
         description="Recursively transcribe video files to subtitle/transcript files.",
@@ -54,7 +60,7 @@ def build_parser() -> argparse.ArgumentParser:
         choices=["whisper-cpp", "faster-whisper", "whisper", "whisperx"],
         default=runtime_default_backend,
     )
-    parser.add_argument("--model", default=DEFAULT_MODEL, metavar="MODEL")
+    parser.add_argument("--model", default=runtime_default_model, metavar="MODEL")
     parser.add_argument("--language", default=None, metavar="LANG")
     parser.add_argument(
         "--device",
