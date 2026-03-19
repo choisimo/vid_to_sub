@@ -2,7 +2,7 @@
 
 [English](README.md) | 한국어
 
-`vid_to_sub`는 비디오 파일을 재귀적으로 찾아 자막 또는 텍스트 파일로 저장하는 도구입니다. 런타임 기본값은 로컬 환경에서 GPU를 활용할 수 있으면 그에 맞는 백엔드를 우선 선택하고, 그렇지 않으면 `ffmpeg` + `whisper.cpp` 기반 CPU 전사로 되돌아가며, 필요하면 OpenAI 호환 API로 자막 번역도 추가할 수 있습니다.
+`vid_to_sub`는 비디오 파일을 재귀적으로 찾아 자막 또는 텍스트 파일로 저장하는 도구입니다. 런타임 기본값은 로컬 환경에서 GPU를 활용할 수 있으면 그에 맞는 백엔드를 우선 선택하고, 그렇지 않으면 `ffmpeg` + `whisper.cpp` 기반 CPU 전사로 되돌아가며, 필요하면 OpenAI 호환 API로 자막 번역과 후처리 교정 agent 단계도 추가할 수 있습니다.
 
 ## 스크린샷
 
@@ -31,6 +31,8 @@
 - 선택형 백엔드: `faster-whisper`, `openai-whisper`, `whisperX`
 - 출력 형식: `srt`, `vtt`, `txt`, `tsv`, `json`, `all`
 - OpenAI 호환 Chat Completions API 기반 번역
+- 별도 모델/API 설정이 가능한 후처리 교정 agent
+- `auto` 모드에서 웹 검색/MCP 도구가 가능하면 참조 교정을 시도하고, 불가능하면 문맥 기반으로 자연스럽게 다듬는 후처리
 - 번역 시 원본 자막의 타임스탬프 경계 유지
 - Browse / Setup / Transcribe / History / Settings / Agent 로 구성된 6탭 TUI
 - SQLite 기반 설정 저장 및 실행 이력 관리
@@ -103,6 +105,14 @@ export VID_TO_SUB_TRANSLATION_MODEL=your_model
 ```bash
 python vid_to_sub.py /path/to/videos --translate-to ko
 ```
+
+1차 번역 뒤에 별도 교정 agent를 한 번 더 태우려면 다음처럼 실행합니다.
+
+```bash
+python vid_to_sub.py /path/to/videos --translate-to ko --postprocess-translation
+```
+
+후처리 전략은 `--postprocess-mode auto|web_lookup|context_polish`로 고를 수 있습니다. `auto`는 서빙 agent가 웹 검색이나 MCP 도구를 지원하면 표준 가사/유사 텍스트 확인을 우선 시도하고, 그런 도구가 없으면 자연스럽게 문맥 보정으로 넘어가도록 프롬프트를 구성합니다.
 
 예를 들어 아래 두 파일이 함께 생성됩니다.
 
@@ -200,6 +210,15 @@ python vid_to_sub.py --list-models
   번역 서비스 Bearer 토큰입니다.
 - `VID_TO_SUB_TRANSLATION_MODEL`
   번역에 사용할 모델 이름입니다.
+
+### 후처리 API
+
+- `VID_TO_SUB_POSTPROCESS_BASE_URL`
+  자막 후처리 agent 전용 엔드포인트입니다. 비어 있으면 번역 Base URL을 재사용합니다.
+- `VID_TO_SUB_POSTPROCESS_API_KEY`
+  자막 후처리 agent 전용 Bearer 토큰입니다. 비어 있으면 번역 API 키를 재사용합니다.
+- `VID_TO_SUB_POSTPROCESS_MODEL`
+  자막 후처리 agent 전용 모델입니다. 비어 있으면 번역 모델을 재사용합니다.
 
 ### Agent 탭
 

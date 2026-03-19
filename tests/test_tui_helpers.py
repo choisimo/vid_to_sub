@@ -37,6 +37,9 @@ from vid_to_sub_app.shared.env import (
     resolve_runtime_backend_threads,
 )
 from tui import (
+    ENV_POST_KEY,
+    ENV_POST_MOD,
+    ENV_POST_URL,
     ENV_TRANS_KEY,
     ENV_TRANS_MOD,
     ENV_TRANS_URL,
@@ -344,6 +347,11 @@ class TuiHelperTests(unittest.TestCase):
                 translation_model=None,
                 translation_base_url=None,
                 translation_api_key=None,
+                postprocess_enabled=False,
+                postprocess_mode="auto",
+                postprocess_model=None,
+                postprocess_base_url=None,
+                postprocess_api_key=None,
                 diarize=False,
                 hf_token=None,
                 execution_mode="local",
@@ -381,11 +389,19 @@ class TuiHelperTests(unittest.TestCase):
             translation_model="gpt-4.1-mini",
             translation_base_url="https://example.com/v1",
             translation_api_key="secret",
+            postprocess_enabled=True,
+            postprocess_mode="web_lookup",
+            postprocess_model="gpt-4.1",
+            postprocess_base_url="https://post.example/v1",
+            postprocess_api_key="post-secret",
             diarize=False,
             hf_token=None,
             execution_mode="local",
             remote_resources=[],
-            run_env={"VID_TO_SUB_TRANSLATION_MODEL": "gpt-4.1-mini"},
+            run_env={
+                "VID_TO_SUB_TRANSLATION_MODEL": "gpt-4.1-mini",
+                "VID_TO_SUB_POSTPROCESS_MODEL": "gpt-4.1",
+            },
         )
 
         plans = app._build_executor_plans(
@@ -400,7 +416,16 @@ class TuiHelperTests(unittest.TestCase):
         self.assertIn("--workers", plans[0].cmd)
         self.assertIn("--backend-threads", plans[0].cmd)
         self.assertIn("--translate-to", plans[0].cmd)
-        self.assertEqual({"VID_TO_SUB_TRANSLATION_MODEL": "gpt-4.1-mini"}, plans[0].env)
+        self.assertIn("--postprocess-translation", plans[0].cmd)
+        self.assertIn("--postprocess-mode", plans[0].cmd)
+        self.assertIn("--postprocess-model", plans[0].cmd)
+        self.assertEqual(
+            {
+                "VID_TO_SUB_TRANSLATION_MODEL": "gpt-4.1-mini",
+                "VID_TO_SUB_POSTPROCESS_MODEL": "gpt-4.1",
+            },
+            plans[0].env,
+        )
         self.assertNotIn("/tmp/input.mp4", plans[0].cmd)
         self.assertIsNotNone(plans[0].stdin_payload)
         self.assertIn("/tmp/input.mp4", plans[0].stdin_payload or "")
@@ -411,6 +436,9 @@ class TuiHelperTests(unittest.TestCase):
             "#inp-trans-url": SimpleNamespace(value="https://old.example/v1"),
             "#inp-trans-key": SimpleNamespace(value="manual-key"),
             "#inp-trans-model": SimpleNamespace(value="old-model"),
+            "#inp-post-url": SimpleNamespace(value="https://old-post.example/v1"),
+            "#inp-post-key": SimpleNamespace(value="manual-post-key"),
+            "#inp-post-model": SimpleNamespace(value="old-post-model"),
             "#inp-wcpp-bin": SimpleNamespace(value=""),
         }
 
@@ -423,12 +451,18 @@ class TuiHelperTests(unittest.TestCase):
                     ENV_TRANS_URL: "https://old.example/v1",
                     ENV_TRANS_KEY: "saved-key",
                     ENV_TRANS_MOD: "old-model",
+                    ENV_POST_URL: "https://old-post.example/v1",
+                    ENV_POST_KEY: "saved-post-key",
+                    ENV_POST_MOD: "old-post-model",
                     ENV_WHISPER_CPP_BIN: "/old/bin/whisper-cli",
                 },
                 updated_values={
                     ENV_TRANS_URL: "https://new.example/v1",
                     ENV_TRANS_KEY: "new-key",
                     ENV_TRANS_MOD: "new-model",
+                    ENV_POST_URL: "https://new-post.example/v1",
+                    ENV_POST_KEY: "new-post-key",
+                    ENV_POST_MOD: "new-post-model",
                     ENV_WHISPER_CPP_BIN: "/new/bin/whisper-cli",
                 },
             )
@@ -436,6 +470,9 @@ class TuiHelperTests(unittest.TestCase):
         self.assertEqual("https://new.example/v1", widgets["#inp-trans-url"].value)
         self.assertEqual("manual-key", widgets["#inp-trans-key"].value)
         self.assertEqual("new-model", widgets["#inp-trans-model"].value)
+        self.assertEqual("https://new-post.example/v1", widgets["#inp-post-url"].value)
+        self.assertEqual("manual-post-key", widgets["#inp-post-key"].value)
+        self.assertEqual("new-post-model", widgets["#inp-post-model"].value)
         self.assertEqual("/new/bin/whisper-cli", widgets["#inp-wcpp-bin"].value)
 
     def test_sync_run_defaults_updates_inherited_values_only(self) -> None:
@@ -469,6 +506,9 @@ class TuiHelperTests(unittest.TestCase):
             "#inp-trans-url": SimpleNamespace(value=""),
             "#inp-trans-key": SimpleNamespace(value=""),
             "#inp-trans-model": SimpleNamespace(value=""),
+            "#inp-post-url": SimpleNamespace(value=""),
+            "#inp-post-key": SimpleNamespace(value=""),
+            "#inp-post-model": SimpleNamespace(value=""),
             "#inp-wcpp-bin": SimpleNamespace(value=""),
             "#inp-output-dir": SimpleNamespace(value=""),
             "#inp-translate-to": SimpleNamespace(value=""),
@@ -484,6 +524,9 @@ class TuiHelperTests(unittest.TestCase):
                     ENV_TRANS_URL: "https://sqlite.example/v1",
                     ENV_TRANS_KEY: "sqlite-key",
                     ENV_TRANS_MOD: "sqlite-model",
+                    ENV_POST_URL: "https://sqlite-post.example/v1",
+                    ENV_POST_KEY: "sqlite-post-key",
+                    ENV_POST_MOD: "sqlite-post-model",
                     ENV_WHISPER_CPP_BIN: "/sqlite/bin/whisper-cli",
                     "tui.default_output_dir": "/sqlite/output",
                     "tui.default_translate_to": "ko",
@@ -498,6 +541,9 @@ class TuiHelperTests(unittest.TestCase):
         self.assertEqual("https://sqlite.example/v1", widgets["#inp-trans-url"].value)
         self.assertEqual("sqlite-key", widgets["#inp-trans-key"].value)
         self.assertEqual("sqlite-model", widgets["#inp-trans-model"].value)
+        self.assertEqual("https://sqlite-post.example/v1", widgets["#inp-post-url"].value)
+        self.assertEqual("sqlite-post-key", widgets["#inp-post-key"].value)
+        self.assertEqual("sqlite-post-model", widgets["#inp-post-model"].value)
         self.assertEqual("/sqlite/bin/whisper-cli", widgets["#inp-wcpp-bin"].value)
         self.assertEqual("/sqlite/output", widgets["#inp-output-dir"].value)
         self.assertEqual("ko", widgets["#inp-translate-to"].value)
@@ -512,6 +558,9 @@ class TuiHelperTests(unittest.TestCase):
                     ENV_TRANS_URL: "https://sqlite.example/v1",
                     ENV_TRANS_KEY: "sqlite-key",
                     ENV_TRANS_MOD: "sqlite-model",
+                    ENV_POST_URL: "https://sqlite-post.example/v1",
+                    ENV_POST_KEY: "sqlite-post-key",
+                    ENV_POST_MOD: "sqlite-post-model",
                     ENV_WHISPER_CPP_BIN: "/sqlite/bin/whisper-cli",
                 }
             )
@@ -521,6 +570,9 @@ class TuiHelperTests(unittest.TestCase):
                 "inp-trans-url": "",
                 "inp-trans-key": "",
                 "inp-trans-model": "",
+                "inp-post-url": "",
+                "inp-post-key": "",
+                "inp-post-model": "",
             }
             with patch("vid_to_sub_app.tui.app._db", temp_db), patch.object(
                 app, "_val", side_effect=lambda wid: values.get(wid, "")
@@ -534,6 +586,9 @@ class TuiHelperTests(unittest.TestCase):
         self.assertEqual("https://sqlite.example/v1", env[ENV_TRANS_URL])
         self.assertEqual("sqlite-key", env[ENV_TRANS_KEY])
         self.assertEqual("sqlite-model", env[ENV_TRANS_MOD])
+        self.assertEqual("https://sqlite-post.example/v1", env[ENV_POST_URL])
+        self.assertEqual("sqlite-post-key", env[ENV_POST_KEY])
+        self.assertEqual("sqlite-post-model", env[ENV_POST_MOD])
         self.assertEqual("/sqlite/bin/whisper-cli", env[ENV_WHISPER_CPP_BIN])
 
     def test_refresh_history_shows_progress_for_running_job(self) -> None:

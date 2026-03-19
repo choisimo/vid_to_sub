@@ -8,6 +8,7 @@ from typing import Optional
 from vid_to_sub_app.shared.constants import (
     DEFAULT_FORMAT,
     DEFAULT_MODEL,
+    POSTPROCESS_MODES,
     ENV_TRANSLATION_API_KEY,
     ENV_TRANSLATION_BASE_URL,
     ENV_TRANSLATION_MODEL,
@@ -83,6 +84,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--translation-model", default=None, metavar="MODEL")
     parser.add_argument("--translation-base-url", default=None, metavar="URL")
     parser.add_argument("--translation-api-key", default=None, metavar="KEY")
+    parser.add_argument("--postprocess-translation", action="store_true", default=False)
+    parser.add_argument(
+        "--postprocess-mode",
+        choices=POSTPROCESS_MODES,
+        default="auto",
+        metavar="MODE",
+    )
+    parser.add_argument("--postprocess-model", default=None, metavar="MODEL")
+    parser.add_argument("--postprocess-base-url", default=None, metavar="URL")
+    parser.add_argument("--postprocess-api-key", default=None, metavar="KEY")
     parser.add_argument("--workers", type=int, default=1, metavar="N")
     parser.add_argument("--backend-threads", type=int, default=None, metavar="N")
     parser.add_argument("--manifest-stdin", action="store_true", default=False)
@@ -96,6 +107,9 @@ def main(argv: Optional[list[str]] = None) -> int:
     load_project_env(override=False)
     parser = build_parser()
     args = parser.parse_args(argv)
+
+    if args.postprocess_translation and not args.translate_to:
+        parser.error("--postprocess-translation requires --translate-to.")
 
     if args.list_models:
         print("Known model identifiers:")

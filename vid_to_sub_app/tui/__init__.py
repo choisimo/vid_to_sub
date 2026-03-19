@@ -2,11 +2,16 @@ from __future__ import annotations
 
 from .app import VidToSubApp, main
 from .helpers import (
+    ENV_POST_KEY,
+    ENV_POST_MOD,
+    ENV_POST_URL,
     ENV_TRANS_KEY,
     ENV_TRANS_MOD,
     ENV_TRANS_URL,
     RunConfig,
     RunJobState,
+    SSHConnection,
+    ssh_connection_from_row,
     build_search_preview,
     build_system_install_commands,
     detect_all,

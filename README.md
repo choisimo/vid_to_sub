@@ -2,7 +2,7 @@
 
 English | [한국어](README.ko.md)
 
-`vid_to_sub` recursively discovers video files and writes subtitle or transcript files next to the source video or into a dedicated output directory. The runtime defaults prefer a GPU-capable backend when the local environment exposes one, and otherwise fall back to CPU transcription through `ffmpeg` + `whisper.cpp`, with optional subtitle translation through an OpenAI-compatible API.
+`vid_to_sub` recursively discovers video files and writes subtitle or transcript files next to the source video or into a dedicated output directory. The runtime defaults prefer a GPU-capable backend when the local environment exposes one, and otherwise fall back to CPU transcription through `ffmpeg` + `whisper.cpp`, with optional subtitle translation through an OpenAI-compatible API plus an optional post-editing agent pass for cleanup and correction.
 
 ## Screenshots
 
@@ -31,6 +31,7 @@ The Transcribe tab controls backend, model, device, execution mode, output forma
 - Optional backends: `faster-whisper`, `openai-whisper`, and `whisperX`.
 - Output formats: `srt`, `vtt`, `txt`, `tsv`, `json`, or `all`.
 - Optional translation with an OpenAI-compatible chat-completions API while preserving the original subtitle timing boundaries.
+- Optional post-editing agent pass with separate model/API settings and an `auto` mode that prefers web lookup when available, then falls back to contextual polishing.
 - A 6-tab Textual TUI: Browse, Setup, Transcribe, History, Settings, and Agent.
 - SQLite-backed saved settings and job history.
 - Optional distributed execution through SSH resource profiles.
@@ -102,6 +103,14 @@ Then run:
 ```bash
 python vid_to_sub.py /path/to/videos --translate-to ko
 ```
+
+To split first-pass translation and a second-pass correction agent, enable post-processing:
+
+```bash
+python vid_to_sub.py /path/to/videos --translate-to ko --postprocess-translation
+```
+
+You can force a strategy with `--postprocess-mode auto|web_lookup|context_polish`. In `auto`, the second pass is prompted to use lyric/reference lookup when the serving agent supports web search or MCP tools, and otherwise silently falls back to contextual cleanup.
 
 This writes both the original transcription and the translated file, for example:
 
@@ -203,6 +212,15 @@ If `VID_TO_SUB_WHISPER_CPP_MODEL` is not set, the project searches common model 
   Bearer token for the translation service.
 - `VID_TO_SUB_TRANSLATION_MODEL`
   Model name used for translation.
+
+### Post-edit API
+
+- `VID_TO_SUB_POSTPROCESS_BASE_URL`
+  Optional dedicated endpoint for the subtitle post-editing agent. When blank, translation base URL is reused.
+- `VID_TO_SUB_POSTPROCESS_API_KEY`
+  Optional dedicated Bearer token for post-editing. When blank, translation API key is reused.
+- `VID_TO_SUB_POSTPROCESS_MODEL`
+  Optional dedicated model for post-editing. When blank, translation model is reused.
 
 ### Agent tab
 

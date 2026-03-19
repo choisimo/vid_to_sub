@@ -5,7 +5,7 @@ import os
 import shutil
 import subprocess
 from pathlib import Path
-from typing import Optional, Sequence
+from typing import Callable, Optional, Sequence
 
 try:
     from dotenv import load_dotenv
@@ -25,6 +25,119 @@ from .constants import (
     ROOT_DIR,
     WHISPER_CLI_CANDIDATES,
 )
+
+
+# ---------------------------------------------------------------------------
+# SQLite-first env loading
+# ---------------------------------------------------------------------------
+#
+# load_env_from_sqlite() / import_env_file_to_sqlite() are the canonical
+# entry points for env bootstrapping.  .env is a *backup* only — it is never
+# loaded unless explicitly imported via import_env_file_to_sqlite().
+#
+# Callers that need a live DB handle pass it as a protocol-compatible getter.
+# This avoids circular imports (env.py must not import from db.py).
+#
+# Protocol: SettingsProvider = Callable[[], dict[str, str]]
+
+
+def load_env_from_sqlite(
+    get_all: Callable[[], dict[str, str]],
+    *,
+    override: bool = True,
+) -> int:
+    """Push VID_TO_SUB_* settings from SQLite into os.environ.
+
+    This is the **primary** env bootstrap path.  Call early in startup before
+    any subprocess or os.getenv access.
+
+    Args:
+        get_all: callable that returns ``{key: value}`` from the settings
+                 table (i.e. ``db.get_all``).
+        override: when True (default) SQLite values always win over any value
+                  that may already be in os.environ (e.g. leftover from a
+                  previous .env load).  Pass False only when you want to
+                  preserve values set by the shell before startup.
+
+    Returns:
+        Number of keys injected into os.environ.
+    """
+    settings = get_all()
+    count = 0
+    for key, value in settings.items():
+        if not key.startswith("VID_TO_SUB_"):
+            continue
+        if value:
+            if override or key not in os.environ:
+                os.environ[key] = value
+                count += 1
+        else:
+            # Explicit blank in DB means "clear" — remove whatever .env put there.
+            if override:
+                os.environ.pop(key, None)
+    return count
+
+
+def import_env_file_to_sqlite(
+    env_path: Path,
+    set_many: Callable[[dict[str, str]], None],
+    get_all: Callable[[], dict[str, str]],
+    *,
+    overwrite: bool = False,
+) -> dict[str, str]:
+    """Parse *env_path* and upsert matching keys into SQLite.
+
+    This is how .env values enter the system.  After import the .env file
+    itself is no longer consulted — SQLite becomes the source of truth.
+
+    Args:
+        env_path: path to the .env file to read.
+        set_many: callable that writes ``{key: value}`` to the settings table
+                  (i.e. ``db.set_many``).
+        get_all:  callable that reads all settings (i.e. ``db.get_all``).
+        overwrite: when True, import even for keys that already have a
+                   non-empty value in SQLite.  When False (default) only
+                   keys that are blank or missing in SQLite are updated.
+
+    Returns:
+        Dict of keys that were actually written to SQLite.
+    """
+    if not env_path.is_file():
+        return {}
+
+    parsed: dict[str, str] = {}
+    for raw_line in env_path.read_text(encoding="utf-8").splitlines():
+        assignment = parse_env_assignment(raw_line)
+        if assignment is None:
+            continue
+        key, value = assignment
+        parsed[key] = value
+
+    if not parsed:
+        return {}
+
+    existing = get_all() if not overwrite else {}
+    to_write: dict[str, str] = {}
+    for key, value in parsed.items():
+        if overwrite or not (existing.get(key) or "").strip():
+            to_write[key] = value
+
+    if to_write:
+        set_many(to_write)
+    return to_write
+
+
+def load_project_env_fallback(*, override: bool = False) -> bool:
+    """Load .env into os.environ **only as a last-resort fallback**.
+
+    Prefer :func:`load_env_from_sqlite` for all production code paths.
+    This function exists solely for the CLI bootstrap before the DB is
+    available (e.g. ``vid_to_sub.py --help`` without TUI).
+
+    SQLite always wins: if a key is already in os.environ (set by
+    load_env_from_sqlite) it will *not* be overwritten here (override=False).
+    """
+    return load_project_env(override=False)
 
 
 def parse_env_assignment(line: str) -> Optional[tuple[str, str]]:
@@ -67,6 +180,13 @@ def load_env_file(env_path: Path, *, override: bool = False) -> bool:
 
 
 def load_project_env(*, override: bool = False) -> bool:
+    """Low-level: load .env into os.environ.
+
+    .. warning::
+        Direct callers should prefer :func:`load_env_from_sqlite` for the
+        primary bootstrap and :func:`load_project_env_fallback` everywhere
+        else.  This function does *not* consult SQLite.
+    """
     if not ENV_FILE.is_file():
         return False
     if load_dotenv is not None:

@@ -6,7 +6,6 @@ import os
 import re
 import shutil
 import time
-from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Sequence
 
@@ -19,6 +18,9 @@ from vid_to_sub_app.shared.constants import (
     ENV_AGENT_API_KEY,
     ENV_AGENT_BASE_URL,
     ENV_AGENT_MODEL,
+    ENV_POSTPROCESS_API_KEY,
+    ENV_POSTPROCESS_BASE_URL,
+    ENV_POSTPROCESS_MODEL,
     ENV_TRANSLATION_API_KEY,
     ENV_TRANSLATION_BASE_URL,
     ENV_TRANSLATION_MODEL,
@@ -30,6 +32,7 @@ from vid_to_sub_app.shared.constants import (
     HF_MODEL_BASE,
     KNOWN_MODELS,
     MODEL_SEARCH_DIRS,
+    POSTPROCESS_MODES,
     PIP_REQUIREMENT_FILES,
     ROOT_DIR,
     SEARCH_RESULT_LIMIT,
@@ -46,6 +49,15 @@ from vid_to_sub_app.shared.env import (
 )
 
 from .state import db as _db
+from .models import (
+    ExecutorPlan,
+    RemoteResourceProfile,
+    RunConfig,
+    RunJobState,
+    SSHConnection,
+    ssh_connection_from_row,
+)
+
 
 DetectResult = dict[str, tuple[bool, str]]
 SCRIPT_PATH = ROOT_DIR / "vid_to_sub.py"
@@ -56,6 +68,9 @@ ENV_WCPP_MODEL = ENV_WHISPER_CPP_MODEL
 ENV_TRANS_URL = ENV_TRANSLATION_BASE_URL
 ENV_TRANS_KEY = ENV_TRANSLATION_API_KEY
 ENV_TRANS_MOD = ENV_TRANSLATION_MODEL
+ENV_POST_URL = ENV_POSTPROCESS_BASE_URL
+ENV_POST_KEY = ENV_POSTPROCESS_API_KEY
+ENV_POST_MOD = ENV_POSTPROCESS_MODEL
 ENV_AGENT_URL = ENV_AGENT_BASE_URL
 ENV_AGENT_KEY = ENV_AGENT_API_KEY
 ENV_AGENT_MOD = ENV_AGENT_MODEL
@@ -135,7 +150,7 @@ def _colorize(line: str) -> str:
 
 
 def _mask(cmd: list[str]) -> list[str]:
-    SENSITIVE = {"--translation-api-key", "--hf-token"}
+    SENSITIVE = {"--translation-api-key", "--postprocess-api-key", "--hf-token"}
     out, skip = [], False
     for tok in cmd:
         if skip:
@@ -441,73 +456,9 @@ def _compact_progress_markup(ratio: float | None, width: int = 6) -> str:
     bar = "█" * filled + "─" * empty
     return f"[yellow]{bar} {ratio * 100:4.1f}%[/]"
 
-
-@dataclass(slots=True)
-class RemoteResourceProfile:
-    name: str
-    ssh_target: str
-    remote_workdir: str
-    python_bin: str = "python3"
-    script_path: str = ""
-    slots: int = 1
-    path_map: dict[str, str] = field(default_factory=dict)
-    env: dict[str, str] = field(default_factory=dict)
-
-
-@dataclass(slots=True)
-class ExecutorPlan:
-    name: str
-    kind: str
-    label: str
-    cmd: list[str]
-    env: dict[str, str] | None
-    assigned_paths: list[str]
-    capacity: int
-    manifest: dict[str, Any]
-    stdin_payload: str | None = None
-
-
-@dataclass(slots=True)
-class RunJobState:
-    video_path: str
-    executor: str
-    job_id: int | None
-    started_at: float
-    status: str = "running"
-    video_duration: float | None = None
-    progress_seconds: float | None = None
-    progress_ratio: float | None = None
-
-
-@dataclass(slots=True)
-class RunConfig:
-    request_id: int
-    selected_paths: list[str]
-    output_dir: str | None
-    formats: frozenset[str]
-    no_recurse: bool
-    skip_existing: bool
-    dry_run: bool
-    verbose: bool
-    backend: str
-    model: str
-    device: str
-    language: str | None
-    compute_type: str | None
-    beam_size: str
-    local_workers: int
-    whisper_cpp_model_path: str | None
-    translate_enabled: bool
-    translate_to: str | None
-    translation_model: str | None
-    translation_base_url: str | None
-    translation_api_key: str | None
-    diarize: bool
-    hf_token: str | None
-    execution_mode: str
-    remote_resources: list[RemoteResourceProfile]
-    run_env: dict[str, str]
-
+# RemoteResourceProfile, ExecutorPlan, RunJobState, RunConfig are defined in
+# .models and re-exported here for backward compatibility.
+# (old definitions removed — use models.py as the single source of truth)
 
 def _coerce_positive_int(value: Any, default: int = 1) -> int:
     try:

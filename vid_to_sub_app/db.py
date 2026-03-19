@@ -3,9 +3,10 @@
 db.py — SQLite persistence layer for vid_to_sub
 =================================================
 Stores:
-  settings     — all configuration (replaces .env)
-  jobs         — per-file transcription history
-  recent_paths — recently used input paths
+  settings        — all configuration (replaces .env); SQLite is primary source of truth
+  ssh_connections — SSH remote server connection profiles (structured, not raw JSON)
+  jobs            — per-file transcription history
+  recent_paths    — recently used input paths
 """
 
 from __future__ import annotations
@@ -62,6 +63,26 @@ CREATE TABLE IF NOT EXISTS folder_queue_state (
     is_completed    INTEGER NOT NULL DEFAULT 0,
     updated_at      TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS ssh_connections (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    label        TEXT NOT NULL DEFAULT '',
+    host         TEXT NOT NULL,
+    user         TEXT NOT NULL DEFAULT '',
+    port         INTEGER NOT NULL DEFAULT 22,
+    key_path     TEXT NOT NULL DEFAULT '',
+    remote_workdir TEXT NOT NULL,
+    python_bin   TEXT NOT NULL DEFAULT 'python3',
+    script_path  TEXT NOT NULL DEFAULT '',
+    slots        INTEGER NOT NULL DEFAULT 1,
+    path_map     TEXT NOT NULL DEFAULT '{}',
+    env          TEXT NOT NULL DEFAULT '{}',
+    enabled      INTEGER NOT NULL DEFAULT 1,
+    created_at   TEXT NOT NULL,
+    updated_at   TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_ssh_connections_label ON ssh_connections(label);
+
 
 CREATE INDEX IF NOT EXISTS idx_jobs_ts   ON jobs(created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_recent_ts ON recent_paths(used_at DESC);
@@ -76,6 +97,9 @@ ENV_KEYS = (
     "VID_TO_SUB_TRANSLATION_BASE_URL",
     "VID_TO_SUB_TRANSLATION_API_KEY",
     "VID_TO_SUB_TRANSLATION_MODEL",
+    "VID_TO_SUB_POSTPROCESS_BASE_URL",
+    "VID_TO_SUB_POSTPROCESS_API_KEY",
+    "VID_TO_SUB_POSTPROCESS_MODEL",
     "VID_TO_SUB_AGENT_BASE_URL",
     "VID_TO_SUB_AGENT_API_KEY",
     "VID_TO_SUB_AGENT_MODEL",
@@ -88,6 +112,9 @@ _DEFAULT_SETTINGS: dict[str, str] = {
     "VID_TO_SUB_TRANSLATION_BASE_URL": "",
     "VID_TO_SUB_TRANSLATION_API_KEY": "",
     "VID_TO_SUB_TRANSLATION_MODEL": "",
+    "VID_TO_SUB_POSTPROCESS_BASE_URL": "",
+    "VID_TO_SUB_POSTPROCESS_API_KEY": "",
+    "VID_TO_SUB_POSTPROCESS_MODEL": "",
     "VID_TO_SUB_AGENT_BASE_URL": "",
     "VID_TO_SUB_AGENT_API_KEY": "",
     "VID_TO_SUB_AGENT_MODEL": "",
@@ -105,6 +132,8 @@ _DEFAULT_SETTINGS: dict[str, str] = {
     "tui.default_formats": '["srt"]',
     "tui.execution_mode": "local",
     "tui.remote_resources": "[]",
+    # SSH connection manager (structured, see ssh_connections table)
+    # legacy: tui.remote_resources kept for backward compat but new code uses ssh_connections table
 }
 
 
@@ -344,3 +373,149 @@ class Database:
     def remove_path(self, path: str) -> None:
         self._conn().execute("DELETE FROM recent_paths WHERE path=?", (path,))
         self._conn().commit()
+
+    # ── SSH Connections ───────────────────────────────────────────────────
+
+    def add_ssh_connection(
+        self,
+        host: str,
+        *,
+        label: str = "",
+        user: str = "",
+        port: int = 22,
+        key_path: str = "",
+        remote_workdir: str = "",
+        python_bin: str = "python3",
+        script_path: str = "",
+        slots: int = 1,
+        path_map: dict[str, str] | None = None,
+        env: dict[str, str] | None = None,
+        enabled: bool = True,
+    ) -> int:
+        """Insert a new SSH connection profile.  Returns the new row id."""
+        now = datetime.now().isoformat(timespec="seconds")
+        cur = self._conn().execute(
+            """INSERT INTO ssh_connections
+               (label,host,user,port,key_path,remote_workdir,python_bin,script_path,
+                slots,path_map,env,enabled,created_at,updated_at)
+               VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (
+                label.strip(),
+                host.strip(),
+                user.strip(),
+                max(1, int(port)),
+                key_path.strip(),
+                remote_workdir.strip(),
+                python_bin.strip() or "python3",
+                script_path.strip(),
+                max(1, int(slots)),
+                json.dumps(path_map or {}),
+                json.dumps(env or {}),
+                1 if enabled else 0,
+                now,
+                now,
+            ),
+        )
+        self._conn().commit()
+        return cur.lastrowid  # type: ignore[return-value]
+
+    def update_ssh_connection(
+        self,
+        conn_id: int,
+        *,
+        label: str | None = None,
+        host: str | None = None,
+        user: str | None = None,
+        port: int | None = None,
+        key_path: str | None = None,
+        remote_workdir: str | None = None,
+        python_bin: str | None = None,
+        script_path: str | None = None,
+        slots: int | None = None,
+        path_map: dict[str, str] | None = None,
+        env: dict[str, str] | None = None,
+        enabled: bool | None = None,
+    ) -> None:
+        """Partial-update an SSH connection profile by id."""
+        fields: list[str] = []
+        values: list[Any] = []
+
+        def _add(col: str, val: Any, transform: Any = None) -> None:
+            if val is None:
+                return
+            fields.append(f"{col}=?")
+            values.append(transform(val) if transform else val)
+
+        _add("label", label, str.strip if label is not None else None)
+        _add("host", host, str.strip if host is not None else None)
+        _add("user", user, str.strip if user is not None else None)
+        _add("port", port, lambda p: max(1, int(p)))
+        _add("key_path", key_path, str.strip if key_path is not None else None)
+        _add("remote_workdir", remote_workdir, str.strip if remote_workdir is not None else None)
+        _add("python_bin", python_bin, lambda p: p.strip() or "python3")
+        _add("script_path", script_path, str.strip if script_path is not None else None)
+        _add("slots", slots, lambda s: max(1, int(s)))
+        if path_map is not None:
+            fields.append("path_map=?")
+            values.append(json.dumps(path_map))
+        if env is not None:
+            fields.append("env=?")
+            values.append(json.dumps(env))
+        if enabled is not None:
+            fields.append("enabled=?")
+            values.append(1 if enabled else 0)
+
+        if not fields:
+            return
+
+        fields.append("updated_at=?")
+        values.append(datetime.now().isoformat(timespec="seconds"))
+        values.append(conn_id)
+        self._conn().execute(
+            f"UPDATE ssh_connections SET {', '.join(fields)} WHERE id=?",
+            values,
+        )
+        self._conn().commit()
+
+    def delete_ssh_connection(self, conn_id: int) -> None:
+        self._conn().execute("DELETE FROM ssh_connections WHERE id=?", (conn_id,))
+        self._conn().commit()
+
+    def get_ssh_connections(self, *, enabled_only: bool = False) -> list[dict[str, Any]]:
+        """Return all SSH connection profiles, newest first."""
+        if enabled_only:
+            rows = self._conn().execute(
+                "SELECT * FROM ssh_connections WHERE enabled=1 ORDER BY label, id",
+            ).fetchall()
+        else:
+            rows = self._conn().execute(
+                "SELECT * FROM ssh_connections ORDER BY label, id",
+            ).fetchall()
+        result = []
+        for r in rows:
+            row = dict(r)
+            # Deserialize JSON fields
+            for field in ("path_map", "env"):
+                raw = row.get(field, "{}")
+                try:
+                    row[field] = json.loads(raw) if raw else {}
+                except (json.JSONDecodeError, TypeError):
+                    row[field] = {}
+            result.append(row)
+        return result
+
+    def get_ssh_connection(self, conn_id: int) -> dict[str, Any] | None:
+        row = self._conn().execute(
+            "SELECT * FROM ssh_connections WHERE id=?", (conn_id,)
+        ).fetchone()
+        if row is None:
+            return None
+        result = dict(row)
+        for field in ("path_map", "env"):
+            raw = result.get(field, "{}")
+            try:
+                result[field] = json.loads(raw) if raw else {}
+            except (json.JSONDecodeError, TypeError):
+                result[field] = {}
+        return result
+

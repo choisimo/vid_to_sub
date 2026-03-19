@@ -4,6 +4,9 @@ from __future__ import annotations
 from importlib import import_module
 
 PUBLIC_EXPORTS = [
+    "ENV_POST_KEY",
+    "ENV_POST_MOD",
+    "ENV_POST_URL",
     "ENV_TRANS_KEY",
     "ENV_TRANS_MOD",
     "ENV_TRANS_URL",

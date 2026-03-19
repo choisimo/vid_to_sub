@@ -14,7 +14,10 @@ from .discovery import hash_video_folder
 from .manifest import FolderAwareScheduler, ProcessResult
 from .output import fmt_seconds, probe_media_duration, srt_timestamp, write_outputs
 from .transcription import transcribe
-from .translation import translate_segments_openai_compatible
+from .translation import (
+    postprocess_translated_segments_openai_compatible,
+    translate_segments_openai_compatible,
+)
 
 
 def emit_progress_event(event: str, **payload: object) -> None:
@@ -140,6 +143,23 @@ def process_one(
                 translation_api_key=args.translation_api_key,
                 source_language=info.get("language"),
             )
+            if args.postprocess_translation:
+                translated_segments, postprocess_info = (
+                    postprocess_translated_segments_openai_compatible(
+                        source_segments=segments,
+                        translated_segments=translated_segments,
+                        target_language=args.translate_to,
+                        postprocess_mode=args.postprocess_mode,
+                        postprocess_model=args.postprocess_model,
+                        postprocess_base_url=args.postprocess_base_url,
+                        postprocess_api_key=args.postprocess_api_key,
+                        source_language=info.get("language"),
+                        translation_model=args.translation_model,
+                        translation_base_url=args.translation_base_url,
+                        translation_api_key=args.translation_api_key,
+                    )
+                )
+                translation_info["postprocess"] = postprocess_info
             translated_info = dict(info)
             translated_info["translation"] = translation_info
             translated_written = write_outputs(

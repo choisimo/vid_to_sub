@@ -22,4 +22,8 @@ from .transcription import (
     transcribe_whisper_cpp,
     transcribe_whisperx,
 )
-from .translation import extract_json_array, translate_segments_openai_compatible
+from .translation import (
+    extract_json_array,
+    postprocess_translated_segments_openai_compatible,
+    translate_segments_openai_compatible,
+)
