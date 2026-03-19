@@ -156,3 +156,8 @@ class HistoryMixin:
         except NoMatches:
             pass
 
+    def _rerun_history_job(self, job_id: int) -> None:
+        """Load a history job's settings into the form then immediately trigger a run."""
+        self._load_history_job(job_id)
+        self._trigger(dry_run=False)
+

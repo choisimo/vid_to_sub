@@ -1270,6 +1270,7 @@ class VidToSubApp(
             self._ssh_delete_connection()
         elif bid == "btn-ssh-clear":
             self._ssh_clear_form()
+        elif bid == "btn-agent-plan":
             self._request_agent_plan()
         elif bid == "btn-agent-apply":
             self._apply_agent_plan()
@@ -1465,17 +1466,22 @@ class VidToSubApp(
                     self.query_one("#stg-status", Static).update(f"[yellow]Legacy remote JSON warning: {exc}[/]")
                 except NoMatches:
                     pass
-            self._ssh_set_status("[yellow]Select a connection from the table first[/]")
-            return
-        _db.delete_ssh_connection(self._ssh_selected_id)
-        self._ssh_selected_id = None
-        self._ssh_clear_form()
-        self._refresh_ssh_table()
-        self._load_remote_resources()
-        self._update_remote_status()
-        self._ssh_set_status("[green]✓ Connection deleted[/]")
+        self._remote_resources = profiles
 
-
+    def _update_remote_status(self) -> None:
+        """Refresh the remote-status label in the Transcribe tab."""
+        from .helpers import summarize_remote_resources
+        try:
+            mode = self._sel("sel-execution-mode", _db.get("tui.execution_mode") or "local")
+            if mode == "distributed" and self._remote_resources:
+                msg = f"[cyan]Distributed:[/] {summarize_remote_resources(self._remote_resources)}"
+            elif mode == "distributed":
+                msg = "[yellow]Distributed mode selected but no remote resources configured.[/]"
+            else:
+                msg = "[dim]Local execution.[/]"
+            self.query_one("#remote-status", Static).update(msg)
+        except NoMatches:
+            pass
     # ── Widget accessors ──────────────────────────────────────────────────
 
     def _val(self, wid: str) -> str:
