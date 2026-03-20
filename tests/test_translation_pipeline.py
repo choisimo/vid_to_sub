@@ -17,6 +17,7 @@ from vid_to_sub_app.cli.stage_artifact import (
     ARTIFACT_SCHEMA_VERSION,
     StageArtifact,
     artifact_path_for,
+    build_stage_artifact_metadata,
     load_stage_artifact,
     write_stage_artifact,
 )
@@ -392,8 +393,19 @@ class TestRunnerStageSplit(unittest.TestCase):
             ):
                 result = run_stage1(task, args, frozenset({"srt"}), output_dir, 2, 0)
 
+        metadata = result.artifact_metadata
+        assert metadata is not None
         self.assertTrue(result.success)
         self.assertEqual(str(artifact_path), result.artifact_path)
+        self.assertEqual(
+            build_stage_artifact_metadata(artifact_path).get("path"),
+            metadata.get("path"),
+        )
+        self.assertEqual("ko", metadata.get("target_lang"))
+        self.assertTrue(metadata.get("transcription_complete"))
+        self.assertTrue(metadata.get("translation_pending"))
+        self.assertFalse(metadata.get("translation_complete"))
+        self.assertFalse(metadata.get("translation_failed"))
         write_artifact.assert_called_once()
 
     def test_stage2_does_not_call_transcribe(self) -> None:
@@ -447,8 +459,16 @@ class TestRunnerStageSplit(unittest.TestCase):
 
             loaded_artifact = load_stage_artifact(artifact_path)
 
+        metadata = result.artifact_metadata
+        assert metadata is not None
         self.assertTrue(result.success)
         self.assertEqual(str(artifact_path), result.artifact_path)
+        self.assertEqual(str(artifact_path), metadata.get("path"))
+        self.assertEqual("ko", metadata.get("target_lang"))
+        self.assertFalse(metadata.get("translation_pending"))
+        self.assertTrue(metadata.get("translation_complete"))
+        self.assertFalse(metadata.get("translation_failed"))
+        self.assertIsNone(metadata.get("translation_error"))
         self.assertTrue(loaded_artifact["stage_status"]["translation_complete"])
 
     def test_process_one_no_translation_skips_stage2(self) -> None:
@@ -553,8 +573,14 @@ class TestRunStage2Idempotency(unittest.TestCase):
             ) as mock_translate:
                 result = run_stage2(artifact_path, args)
 
+            metadata = result.artifact_metadata
+            assert metadata is not None
             self.assertTrue(result.success, result.error)
             mock_translate.assert_not_called()
+            self.assertEqual(str(artifact_path), metadata.get("path"))
+            self.assertTrue(metadata.get("translation_complete"))
+            self.assertFalse(metadata.get("translation_failed"))
+            self.assertIsNone(metadata.get("translation_error"))
 
     def test_run_stage2_proceeds_when_output_missing(self) -> None:
         """run_stage2 proceeds normally when translation_complete=True but
@@ -603,8 +629,14 @@ class TestRunStage2Idempotency(unittest.TestCase):
             ) as mock_translate:
                 result = run_stage2(artifact_path, args)
 
+            metadata = result.artifact_metadata
+            assert metadata is not None
             mock_translate.assert_called_once()
             self.assertTrue(result.success, result.error)
+            self.assertEqual(str(artifact_path), metadata.get("path"))
+            self.assertTrue(metadata.get("translation_complete"))
+            self.assertFalse(metadata.get("translation_failed"))
+
 
 if __name__ == "__main__":
     _ = unittest.main()
@@ -629,9 +661,13 @@ class TestOverwriteTranslationFlag(unittest.TestCase):
             source = tmpdir / "movie.mp4"
             source.write_bytes(b"video")
             srt = tmpdir / "movie.srt"
-            srt.write_text("1\n00:00:00,000 --> 00:00:01,000\nHello\n", encoding="utf-8")
+            srt.write_text(
+                "1\n00:00:00,000 --> 00:00:01,000\nHello\n", encoding="utf-8"
+            )
             translated_srt = tmpdir / "movie.ko.srt"
-            translated_srt.write_text("1\n00:00:00,000 --> 00:00:01,000\n\uc548\ub155\n", encoding="utf-8")
+            translated_srt.write_text(
+                "1\n00:00:00,000 --> 00:00:01,000\n\uc548\ub155\n", encoding="utf-8"
+            )
 
             artifact: StageArtifact = {
                 "schema_version": ARTIFACT_SCHEMA_VERSION,
@@ -676,6 +712,7 @@ class TestLegacyInlineRollback(unittest.TestCase):
 
     def test_legacy_inline_env_var_calls_inline_path(self) -> None:
         import os
+
         """When VID_TO_SUB_LEGACY_INLINE=1, process_one should use the inline path,
         not write any stage artifact, and return successfully."""
         with TemporaryDirectory() as tmp:
@@ -711,9 +748,16 @@ class TestLegacyInlineRollback(unittest.TestCase):
             )
             formats = frozenset({"srt"})
             fake_segments = [{"start": 0.0, "end": 1.0, "text": "Hello"}]
-            fake_info = {"backend": "faster-whisper", "language": "en", "duration": 1.0, "model": "large-v3"}
+            fake_info = {
+                "backend": "faster-whisper",
+                "language": "en",
+                "duration": 1.0,
+                "model": "large-v3",
+            }
             fake_srt = tmpdir / "movie.srt"
-            fake_srt.write_text("1\n00:00:00,000 --> 00:00:01,000\nHello\n", encoding="utf-8")
+            fake_srt.write_text(
+                "1\n00:00:00,000 --> 00:00:01,000\nHello\n", encoding="utf-8"
+            )
 
             with (
                 patch.dict(os.environ, {"VID_TO_SUB_LEGACY_INLINE": "1"}),
@@ -731,9 +775,10 @@ class TestLegacyInlineRollback(unittest.TestCase):
 
             # No artifact should be written in legacy inline mode
             artifact_files = list(tmpdir.glob("*.stage1.json"))
-            self.assertEqual([], artifact_files,
-                             "Legacy inline mode must not write stage artifacts")
+            self.assertEqual(
+                [], artifact_files, "Legacy inline mode must not write stage artifacts"
+            )
             self.assertTrue(result.success, result.error)
-            self.assertIsNone(result.artifact_path,
-                              "Legacy inline result must have no artifact_path")
-
+            self.assertIsNone(
+                result.artifact_path, "Legacy inline result must have no artifact_path"
+            )

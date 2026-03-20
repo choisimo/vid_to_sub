@@ -148,6 +148,7 @@ class VidToSubApp(
         Binding("4", "tab('tab-history')", show=False),
         Binding("5", "tab('tab-settings')", show=False),
         Binding("6", "tab('tab-agent')", show=False),
+        Binding("7", "tab('tab-logs')", show=False),
     ]
 
     def __init__(self) -> None:
@@ -941,6 +942,18 @@ class VidToSubApp(
                             max_lines=4000,
                         )
 
+                # -- Tab 7: Logs ------------------------------------------------
+                with TabPane("7 Logs", id="tab-logs"):
+                    log_full = RichLog(
+                        id="log-full",
+                        highlight=True,
+                        markup=True,
+                        auto_scroll=True,
+                        wrap=True,
+                        max_lines=5000,
+                    )
+                    yield log_full
+
         # ── Bottom panel (always visible) ─────────────────────────────────
         with Vertical(id="bottom"):
             with Horizontal(id="run-toolbar"):
@@ -1002,6 +1015,7 @@ class VidToSubApp(
         self._refresh_live_panels()
         self._update_agent_config_status()
         self._sync_run_command_panel()
+        self._sync_bottom_visibility()
         self.set_interval(1.0, self._refresh_live_panels)
 
     def _sync_translation_switch_state(self) -> None:
@@ -1042,6 +1056,37 @@ class VidToSubApp(
         else:
             panel.remove_class("collapsed")
             toggle.label = "Cmd ▾"
+
+    def _is_logs_tab(self, active_tab: str | None) -> bool:
+        return active_tab == "tab-logs"
+
+    def _sync_bottom_visibility(self, active_tab: str | None = None) -> None:
+        try:
+            bottom = self.query_one("#bottom")
+        except NoMatches:
+            return
+
+        if active_tab is None:
+            try:
+                active_tab = self.query_one("TabbedContent", TabbedContent).active
+            except NoMatches:
+                active_tab = None
+
+        if self._is_logs_tab(active_tab):
+            bottom.add_class("hidden-on-logs")
+        else:
+            bottom.remove_class("hidden-on-logs")
+
+    def _clear_runtime_logs(self) -> None:
+        try:
+            self.query_one("#log", RichLog).clear()
+        except NoMatches:
+            pass
+
+        try:
+            self.query_one("#log-full", RichLog).clear()
+        except NoMatches:
+            pass
 
     # ── Event handlers ────────────────────────────────────────────────────
 
@@ -1191,6 +1236,12 @@ class VidToSubApp(
             if event.worker.name == "_stream":
                 self._refresh_history()
         self._refresh_live_panels()
+
+    def on_tabbed_content_tab_activated(
+        self, event: TabbedContent.TabActivated
+    ) -> None:
+        pane = getattr(event, "pane", None)
+        self._sync_bottom_visibility(getattr(pane, "id", None))
 
     def on_button_pressed(self, event: Button.Pressed) -> None:  # noqa: C901
         bid = event.button.id or ""
@@ -1399,9 +1450,10 @@ class VidToSubApp(
 
     def action_tab(self, tab: str) -> None:
         try:
-            self.query_one(TabbedContent).active = tab
+            self.query_one("TabbedContent", TabbedContent).active = tab
         except NoMatches:
             pass
+        self._sync_bottom_visibility(tab)
 
     async def action_quit_app(self) -> None:
         self.action_kill()
@@ -1617,6 +1669,11 @@ class VidToSubApp(
     def _log(self, text: str) -> None:
         try:
             self.query_one("#log", RichLog).write(text)
+        except NoMatches:
+            pass
+
+        try:
+            self.query_one("#log-full", RichLog).write(text)
         except NoMatches:
             pass
 

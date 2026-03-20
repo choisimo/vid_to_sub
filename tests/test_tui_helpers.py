@@ -27,6 +27,10 @@ from vid_to_sub import (
     transcribe_whisper_cpp,
 )
 from vid_to_sub_app.cli import translation_capable
+from vid_to_sub_app.cli.stage_artifact import (
+    build_stage_artifact_metadata,
+    write_stage_artifact,
+)
 from vid_to_sub_app.cli.transcription import (
     resolve_device_fw,
     transcribe_faster_whisper,
@@ -503,16 +507,25 @@ class TuiHelperTests(unittest.TestCase):
 
         # At least one remote plan must be stage1 only
         for rp in remote_plans:
-            self.assertEqual("stage1", rp.stage,
-                             f"Remote plan '{rp.name}' should be stage1 but got '{rp.stage}'")
+            self.assertEqual(
+                "stage1",
+                rp.stage,
+                f"Remote plan '{rp.name}' should be stage1 but got '{rp.stage}'",
+            )
             remote_cmd = " ".join(rp.cmd)
-            self.assertIn("--stage1-only", remote_cmd,
-                          "Remote plan command must include --stage1-only")
+            self.assertIn(
+                "--stage1-only",
+                remote_cmd,
+                "Remote plan command must include --stage1-only",
+            )
 
         # Local plans (if any) run the full pass
         for lp in local_plans:
-            self.assertEqual("full", lp.stage,
-                             f"Local plan should be stage='full' but got '{lp.stage}'")
+            self.assertEqual(
+                "full",
+                lp.stage,
+                f"Local plan should be stage='full' but got '{lp.stage}'",
+            )
 
     def test_sync_transcribe_overrides_updates_inherited_values_only(self) -> None:
         app = VidToSubApp()
@@ -640,6 +653,47 @@ class TestTranslationDefaultSetting(unittest.TestCase):
 
             db.set_setting(TUI_DEFAULT_TRANSLATE_ENABLED_KEY, False)
             self.assertFalse(db.get_setting(TUI_DEFAULT_TRANSLATE_ENABLED_KEY, True))
+
+    def test_get_jobs_backfills_artifact_path_from_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db = Database(Path(tmpdir) / "state.db")
+            artifact_path = Path(tmpdir) / "movie.stage1.json"
+            job_id = db.create_job("/tmp/movie.mp4", "whisper-cpp", "large-v3")
+
+            db.finish_job(
+                job_id,
+                "done",
+                output_paths=["/tmp/movie.srt"],
+                artifact_metadata=build_stage_artifact_metadata(artifact_path),
+            )
+
+            job = db.get_jobs(limit=1)[0]
+
+        metadata = job.get("artifact_metadata")
+        self.assertEqual(str(artifact_path), job.get("artifact_path"))
+        self.assertIsInstance(metadata, dict)
+        assert metadata is not None
+        metadata_dict = metadata
+        self.assertEqual(str(artifact_path), metadata_dict.get("path"))
+
+    def test_get_jobs_keeps_legacy_artifact_path_readable_when_metadata_missing(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db = Database(Path(tmpdir) / "state.db")
+            artifact_path = str(Path(tmpdir) / "legacy.stage1.json")
+            job_id = db.create_job("/tmp/movie.mp4", "whisper-cpp", "large-v3")
+
+            db.finish_job(job_id, "done", artifact_path=artifact_path)
+
+            job = db.get_jobs(limit=1)[0]
+
+        metadata = job.get("artifact_metadata")
+        self.assertEqual(artifact_path, job.get("artifact_path"))
+        self.assertIsInstance(metadata, dict)
+        assert metadata is not None
+        metadata_dict = metadata
+        self.assertEqual(artifact_path, metadata_dict.get("path"))
 
     def test_loading_settings_restores_toggle_correctly(self) -> None:
         app = VidToSubApp()
@@ -891,6 +945,114 @@ class TestTranslationDefaultSetting(unittest.TestCase):
         self.assertIn("Progress:", updates[-1])
         self.assertIn("42.0%", updates[-1])
         self.assertIn("00:00:42 / 00:01:40", updates[-1])
+
+    def test_show_hist_detail_prefers_persisted_artifact_metadata_over_output_scan(
+        self,
+    ) -> None:
+        app = VidToSubApp()
+        updates: list[str] = []
+        preferred_path = "/tmp/preferred.stage1.json"
+        job = {
+            "id": 11,
+            "created_at": "2026-03-18T13:57:49",
+            "video_path": "/tmp/a.mp4",
+            "backend": "whisper-cpp",
+            "model": "large-v3",
+            "status": "done",
+            "language": "auto",
+            "target_lang": "ko",
+            "output_dir": None,
+            "wall_sec": None,
+            "error": None,
+            "artifact_path": preferred_path,
+            "artifact_metadata": {
+                "path": preferred_path,
+                "translation_complete": True,
+            },
+            "output_paths": json.dumps(["/tmp/legacy.stage1.json", "/tmp/a.srt"]),
+        }
+
+        with (
+            patch("vid_to_sub_app.tui.app._db.get_jobs", return_value=[job]),
+            patch(
+                "vid_to_sub_app.tui.mixins.history_mixin.load_stage_artifact",
+                side_effect=AssertionError(
+                    "should not read artifact file when metadata is enough"
+                ),
+            ),
+            patch.object(
+                app,
+                "query_one",
+                return_value=SimpleNamespace(
+                    update=lambda value: updates.append(value)
+                ),
+            ),
+        ):
+            app._show_hist_detail("11")
+
+        self.assertTrue(updates)
+        self.assertIn("Stage artifact: preferred.stage1.json", updates[-1])
+        self.assertIn("Stage status: translate=complete", updates[-1])
+        self.assertIn("Outputs: legacy.stage1.json  a.srt", updates[-1])
+
+    def test_show_hist_detail_falls_back_to_legacy_output_stage_artifact(self) -> None:
+        app = VidToSubApp()
+        updates: list[str] = []
+        with tempfile.TemporaryDirectory() as tmpdir:
+            artifact_path = write_stage_artifact(
+                {
+                    "schema_version": "1",
+                    "source_path": "/tmp/a.mp4",
+                    "output_base": "/tmp/a",
+                    "source_fingerprint": "abc123",
+                    "backend": "whisper-cpp",
+                    "device": "cpu",
+                    "model": "large-v3",
+                    "language": "en",
+                    "target_lang": "ko",
+                    "formats": ["srt"],
+                    "primary_outputs": ["/tmp/a.srt"],
+                    "segments": [],
+                    "stage_status": {
+                        "transcription_complete": True,
+                        "translation_pending": True,
+                    },
+                },
+                output_dir=Path(tmpdir),
+                source_path=Path("/tmp/a.mp4"),
+            )
+            job = {
+                "id": 11,
+                "created_at": "2026-03-18T13:57:49",
+                "video_path": "/tmp/a.mp4",
+                "backend": "whisper-cpp",
+                "model": "large-v3",
+                "status": "done",
+                "language": "auto",
+                "target_lang": "ko",
+                "output_dir": None,
+                "wall_sec": None,
+                "error": None,
+                "artifact_path": None,
+                "artifact_metadata": None,
+                "output_paths": json.dumps([str(artifact_path), "/tmp/a.srt"]),
+            }
+
+            with (
+                patch("vid_to_sub_app.tui.app._db.get_jobs", return_value=[job]),
+                patch.object(
+                    app,
+                    "query_one",
+                    return_value=SimpleNamespace(
+                        update=lambda value: updates.append(value)
+                    ),
+                ),
+            ):
+                app._show_hist_detail("11")
+
+        self.assertTrue(updates)
+        self.assertIn("Stage artifact: a.stage1.json", updates[-1])
+        self.assertIn("Stage status: translate=pending", updates[-1])
 
     def test_sync_run_command_panel_updates_visibility_and_label(self) -> None:
         app = VidToSubApp()
@@ -1864,11 +2026,14 @@ class TestSubtitleCopyHelper(unittest.TestCase):
             dst_dir.mkdir()
             srt = src_dir / "movie.srt"
             srt.write_text("1\n00:00:00,000 --> 00:00:01,000\nHello")
-            jobs = [{"output_paths": json.dumps([str(srt)])}]
+            jobs: list[dict[str, object]] = [{"output_paths": json.dumps([str(srt)])}]
             results = bulk_copy_subtitles(jobs, dst_dir)
             self.assertEqual(1, len(results))
             self.assertTrue(results[0]["success"])
-            self.assertTrue(Path(results[0]["destination"]).exists())
+            destination = results[0]["destination"]
+            self.assertIsNotNone(destination)
+            assert destination is not None
+            self.assertTrue(Path(destination).exists())
 
     def test_bulk_copy_renames_duplicates(self) -> None:
         import json
@@ -1886,7 +2051,7 @@ class TestSubtitleCopyHelper(unittest.TestCase):
             # Two jobs referencing files with identical names
             srt2 = src_dir / "other.srt"
             srt2.write_text("1\n00:00:00,000 --> 00:00:01,000\nB")
-            jobs = [
+            jobs: list[dict[str, object]] = [
                 {"output_paths": json.dumps([str(srt_a)])},
                 {"output_paths": json.dumps([str(srt_b)])},
             ]
@@ -1906,7 +2071,9 @@ class TestSubtitleCopyHelper(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             dst_dir = Path(tmp) / "dst"
             missing = Path(tmp) / "nosuchfile.srt"
-            jobs = [{"output_paths": json.dumps([str(missing)])}]
+            jobs: list[dict[str, object]] = [
+                {"output_paths": json.dumps([str(missing)])}
+            ]
             results = bulk_copy_subtitles(jobs, dst_dir)
             self.assertEqual(1, len(results))
             self.assertFalse(results[0]["success"])
@@ -1919,7 +2086,10 @@ class TestSubtitleCopyHelper(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmp:
             dst_dir = Path(tmp) / "dst"
-            jobs = [{"output_paths": None}, {"output_paths": "[]"}]
+            jobs: list[dict[str, object]] = [
+                {"output_paths": None},
+                {"output_paths": "[]"},
+            ]
             results = bulk_copy_subtitles(jobs, dst_dir)
             self.assertEqual(0, len(results))
 

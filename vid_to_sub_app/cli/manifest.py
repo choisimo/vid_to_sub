@@ -10,6 +10,7 @@ from typing import Any, Sequence
 from vid_to_sub_app.db import Database
 
 from .discovery import hash_video_folder
+from .stage_artifact import StageArtifactMetadata
 
 _folder_state_db = Database()
 
@@ -231,6 +232,7 @@ class ProcessResult:
     error: str | None = None
     stage: str | None = None
     artifact_path: str | None = None
+    artifact_metadata: StageArtifactMetadata | None = None
 
 
 class FolderAwareScheduler:

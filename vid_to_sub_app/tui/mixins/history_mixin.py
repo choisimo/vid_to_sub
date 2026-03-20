@@ -231,7 +231,20 @@ class HistoryMixin:
         if job.get("error"):
             lines.append(f"[red]Error: {job['error']}[/]")
 
-        stage_artifact_path: str | None = None
+        artifact_metadata = job.get("artifact_metadata")
+        if not isinstance(artifact_metadata, dict):
+            artifact_metadata = {}
+        stage_artifact_path = (
+            str(job.get("artifact_path") or artifact_metadata.get("path") or "").strip()
+            or None
+        )
+        stage_state: str | None = None
+        if artifact_metadata.get("translation_failed"):
+            stage_state = "failed"
+        elif artifact_metadata.get("translation_complete"):
+            stage_state = "complete"
+        elif artifact_metadata.get("translation_pending"):
+            stage_state = "pending"
         try:
             output_paths = json.loads(job.get("output_paths") or "[]")
             if output_paths:
@@ -239,26 +252,29 @@ class HistoryMixin:
                     "Outputs: "
                     + "  ".join(Path(output_path).name for output_path in output_paths)
                 )
-            stage_artifact_path = next(
-                (
-                    output_path
-                    for output_path in output_paths
-                    if Path(output_path).name.lower().endswith(".stage1.json")
-                ),
-                None,
-            )
+            if stage_artifact_path is None:
+                stage_artifact_path = next(
+                    (
+                        output_path
+                        for output_path in output_paths
+                        if Path(output_path).name.lower().endswith(".stage1.json")
+                    ),
+                    None,
+                )
         except (json.JSONDecodeError, TypeError):
-            stage_artifact_path = None
+            if not stage_artifact_path:
+                stage_artifact_path = None
 
         if stage_artifact_path:
             lines.append(f"Stage artifact: {Path(stage_artifact_path).name}")
+            if stage_state:
+                lines.append(f"Stage status: translate={stage_state}")
             artifact_path = Path(stage_artifact_path)
-            if artifact_path.exists():
+            if artifact_path.exists() and stage_state is None:
                 try:
                     stage_status = (
                         load_stage_artifact(artifact_path).get("stage_status") or {}
                     )
-                    stage_state = None
                     if stage_status.get("translation_failed"):
                         stage_state = "failed"
                     elif stage_status.get("translation_complete"):

@@ -16,7 +16,12 @@ import sqlite3
 import threading
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any, cast
+
+if TYPE_CHECKING:
+    from vid_to_sub_app.cli.stage_artifact import StageArtifactMetadata
+else:
+    StageArtifactMetadata = dict[str, Any]
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
 DB_PATH = ROOT_DIR / "vid_to_sub.db"
@@ -45,7 +50,8 @@ CREATE TABLE IF NOT EXISTS jobs (
     wall_sec     REAL,
     video_dur    REAL,
     segments     INTEGER,
-    artifact_path TEXT
+    artifact_path TEXT,
+    artifact_metadata TEXT
 );
 
 CREATE TABLE IF NOT EXISTS recent_paths (
@@ -162,12 +168,58 @@ class Database:
     def _init_schema(self) -> None:
         self._conn().executescript(_SCHEMA)
         # Backward-safe column additions for existing databases
-        for stmt in ("ALTER TABLE jobs ADD COLUMN artifact_path TEXT",):
+        for stmt in (
+            "ALTER TABLE jobs ADD COLUMN artifact_path TEXT",
+            "ALTER TABLE jobs ADD COLUMN artifact_metadata TEXT",
+        ):
             try:
                 self._conn().execute(stmt)
                 self._conn().commit()
             except Exception:
                 pass  # column already exists
+
+    def _normalize_artifact_metadata(
+        self,
+        raw_metadata: Any,
+        artifact_path: str | None,
+    ) -> StageArtifactMetadata | None:
+        metadata: StageArtifactMetadata | None = None
+        if isinstance(raw_metadata, str) and raw_metadata.strip():
+            try:
+                decoded = json.loads(raw_metadata)
+            except json.JSONDecodeError:
+                decoded = None
+            if isinstance(decoded, dict):
+                metadata = cast(
+                    StageArtifactMetadata,
+                    cast(
+                        object,
+                        {
+                            str(key): value
+                            for key, value in decoded.items()
+                            if isinstance(key, str)
+                        },
+                    ),
+                )
+        elif isinstance(raw_metadata, dict):
+            metadata = cast(
+                StageArtifactMetadata,
+                cast(
+                    object,
+                    {
+                        str(key): value
+                        for key, value in raw_metadata.items()
+                        if isinstance(key, str)
+                    },
+                ),
+            )
+
+        resolved_path = str(artifact_path or "").strip()
+        if metadata is None:
+            return {"path": resolved_path} if resolved_path else None
+        if resolved_path and not str(metadata.get("path") or "").strip():
+            metadata["path"] = resolved_path
+        return metadata or None
 
     # ── Settings ──────────────────────────────────────────────────────────
 
@@ -267,11 +319,12 @@ class Database:
         video_dur: float | None = None,
         segments: int | None = None,
         artifact_path: str | None = None,
+        artifact_metadata: StageArtifactMetadata | dict[str, Any] | None = None,
     ) -> None:
         self._conn().execute(
             """UPDATE jobs
                SET status=?,output_paths=?,error=?,wall_sec=?,video_dur=?,segments=?,
-                   artifact_path=?
+                   artifact_path=?,artifact_metadata=?
                WHERE id=?""",
             (
                 status,
@@ -281,6 +334,9 @@ class Database:
                 video_dur,
                 segments,
                 artifact_path,
+                json.dumps(artifact_metadata)
+                if artifact_metadata is not None
+                else None,
                 job_id,
             ),
         )
@@ -292,7 +348,18 @@ class Database:
             .execute("SELECT * FROM jobs ORDER BY created_at DESC LIMIT ?", (limit,))
             .fetchall()
         )
-        return [dict(r) for r in rows]
+        normalized_rows: list[dict[str, Any]] = []
+        for row in rows:
+            item = dict(row)
+            metadata = self._normalize_artifact_metadata(
+                item.get("artifact_metadata"),
+                item.get("artifact_path"),
+            )
+            item["artifact_metadata"] = metadata
+            if not item.get("artifact_path") and metadata is not None:
+                item["artifact_path"] = metadata.get("path")
+            normalized_rows.append(item)
+        return normalized_rows
 
     def delete_job(self, job_id: int) -> None:
         self._conn().execute("DELETE FROM jobs WHERE id=?", (job_id,))

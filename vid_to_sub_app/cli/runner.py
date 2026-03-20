@@ -17,6 +17,7 @@ from .output import fmt_seconds, probe_media_duration, srt_timestamp, write_outp
 from .stage_artifact import (
     ARTIFACT_SCHEMA_VERSION,
     StageArtifact,
+    build_stage_artifact_metadata,
     load_stage_artifact,
     write_stage_artifact,
 )
@@ -33,6 +34,7 @@ from .translation import (
 # pre-split behaviour). Useful as a quick rollback knob without code changes.
 # ---------------------------------------------------------------------------
 _LEGACY_INLINE = os.environ.get("VID_TO_SUB_LEGACY_INLINE", "").strip() == "1"
+
 
 def translation_capable(args: argparse.Namespace) -> bool:
     return bool(getattr(args, "translate_to", None)) and bool(
@@ -153,21 +155,29 @@ def _process_one_inline(
                 source_language=info.get("language"),
             )
             if getattr(args, "postprocess_translation", False):
-                translated_segments, _ = postprocess_translated_segments_openai_compatible(
-                    source_segments=segments,
-                    translated_segments=translated_segments,
-                    target_language=args.translate_to,
-                    postprocess_mode=getattr(args, "postprocess_mode", "auto"),
-                    postprocess_model=getattr(args, "postprocess_model", None),
-                    postprocess_base_url=getattr(args, "postprocess_base_url", None),
-                    postprocess_api_key=getattr(args, "postprocess_api_key", None),
-                    source_language=info.get("language"),
-                    translation_model=args.translation_model,
-                    translation_base_url=args.translation_base_url,
-                    translation_api_key=args.translation_api_key,
+                translated_segments, _ = (
+                    postprocess_translated_segments_openai_compatible(
+                        source_segments=segments,
+                        translated_segments=translated_segments,
+                        target_language=args.translate_to,
+                        postprocess_mode=getattr(args, "postprocess_mode", "auto"),
+                        postprocess_model=getattr(args, "postprocess_model", None),
+                        postprocess_base_url=getattr(
+                            args, "postprocess_base_url", None
+                        ),
+                        postprocess_api_key=getattr(args, "postprocess_api_key", None),
+                        source_language=info.get("language"),
+                        translation_model=args.translation_model,
+                        translation_base_url=args.translation_base_url,
+                        translation_api_key=args.translation_api_key,
+                    )
                 )
             translated_written = write_outputs(
-                video, translated_segments, formats, output_dir, info,
+                video,
+                translated_segments,
+                formats,
+                output_dir,
+                info,
                 name_suffix=f".{args.translate_to}",
             )
             all_paths.extend(str(p) for p in translated_written)
@@ -196,6 +206,7 @@ def _process_one_inline(
         segments=len(segments),
     )
 
+
 def process_one(
     task: dict[str, str],
     args: argparse.Namespace,
@@ -205,7 +216,9 @@ def process_one(
     worker_id: int = 0,
 ) -> ProcessResult:
     if _LEGACY_INLINE:
-        return _process_one_inline(task, args, formats, output_dir, backend_threads, worker_id)
+        return _process_one_inline(
+            task, args, formats, output_dir, backend_threads, worker_id
+        )
     stage1_result = run_stage1(
         task, args, formats, output_dir, backend_threads, worker_id
     )
@@ -230,6 +243,7 @@ def process_one(
             output_paths=stage1_result.output_paths,
             segments=stage1_result.segments,
             artifact_path=stage1_result.artifact_path,
+            artifact_metadata=stage1_result.artifact_metadata,
         )
 
     stage2_result = run_stage2(Path(stage1_result.artifact_path), args)
@@ -349,6 +363,7 @@ def run_stage1(
             },
         }
         artifact_path = write_stage_artifact(artifact, output_dir, video)
+        artifact_metadata = build_stage_artifact_metadata(artifact_path, artifact)
     except Exception as exc:
         print(f"{prefix}[ERROR] Output/artifact failed: {exc}", file=sys.stderr)
         return ProcessResult(
@@ -377,6 +392,7 @@ def run_stage1(
         output_paths=[str(path) for path in written],
         segments=len(segments),
         artifact_path=str(artifact_path),
+        artifact_metadata=artifact_metadata,
     )
 
 
@@ -385,6 +401,7 @@ def run_stage2(artifact_path: Path, args: argparse.Namespace) -> ProcessResult:
 
     try:
         artifact = load_stage_artifact(artifact_path)
+        artifact_metadata = build_stage_artifact_metadata(artifact_path, artifact)
     except Exception as exc:
         print(f"[ERROR] Stage 2 setup failed: {exc}", file=sys.stderr)
         return ProcessResult(
@@ -397,6 +414,7 @@ def run_stage2(artifact_path: Path, args: argparse.Namespace) -> ProcessResult:
             stage="translate",
             elapsed_sec=round(time.monotonic() - started_at, 3),
             artifact_path=str(artifact_path),
+            artifact_metadata=build_stage_artifact_metadata(artifact_path),
         )
 
     source_path = Path(artifact["source_path"])
@@ -411,6 +429,7 @@ def run_stage2(artifact_path: Path, args: argparse.Namespace) -> ProcessResult:
         artifact["stage_status"]["translation_failed"] = True
         artifact["stage_status"]["translation_error"] = error
         write_stage_artifact(artifact, output_dir, source_path)
+        artifact_metadata = build_stage_artifact_metadata(artifact_path, artifact)
         return ProcessResult(
             success=False,
             video_path=str(source_path),
@@ -423,17 +442,20 @@ def run_stage2(artifact_path: Path, args: argparse.Namespace) -> ProcessResult:
             language=artifact.get("language"),
             segments=len(artifact["segments"]),
             artifact_path=str(artifact_path),
+            artifact_metadata=artifact_metadata,
         )
 
     # Idempotency guard: skip if translation already completed and outputs exist.
     stage_status = artifact.get("stage_status") or {}
-    if stage_status.get("translation_complete") and not getattr(args, "overwrite_translation", False):
+    if stage_status.get("translation_complete") and not getattr(
+        args, "overwrite_translation", False
+    ):
         existing_outputs = [
             p
             for p in (artifact.get("primary_outputs") or [])
-            if Path(str(p)).with_name(
-                Path(str(p)).stem + f".{target_language}" + Path(str(p)).suffix
-            ).exists()
+            if Path(str(p))
+            .with_name(Path(str(p)).stem + f".{target_language}" + Path(str(p)).suffix)
+            .exists()
         ]
         if existing_outputs:
             return ProcessResult(
@@ -447,13 +469,16 @@ def run_stage2(artifact_path: Path, args: argparse.Namespace) -> ProcessResult:
                 output_paths=[
                     str(
                         Path(str(p)).with_name(
-                            Path(str(p)).stem + f".{target_language}" + Path(str(p)).suffix
+                            Path(str(p)).stem
+                            + f".{target_language}"
+                            + Path(str(p)).suffix
                         )
                     )
                     for p in (artifact.get("primary_outputs") or [])
                 ],
                 segments=len(artifact["segments"]),
                 artifact_path=str(artifact_path),
+                artifact_metadata=artifact_metadata,
             )
 
     try:
@@ -503,6 +528,7 @@ def run_stage2(artifact_path: Path, args: argparse.Namespace) -> ProcessResult:
         artifact["stage_status"]["translation_failed"] = True
         artifact["stage_status"]["translation_error"] = str(exc)
         write_stage_artifact(artifact, output_dir, source_path)
+        artifact_metadata = build_stage_artifact_metadata(artifact_path, artifact)
         print(f"[ERROR] Translation/postprocess failed: {exc}", file=sys.stderr)
         return ProcessResult(
             success=False,
@@ -517,6 +543,7 @@ def run_stage2(artifact_path: Path, args: argparse.Namespace) -> ProcessResult:
             output_paths=list(artifact["primary_outputs"]),
             segments=len(artifact["segments"]),
             artifact_path=str(artifact_path),
+            artifact_metadata=artifact_metadata,
         )
 
     artifact["stage_status"]["translation_pending"] = False
@@ -524,6 +551,7 @@ def run_stage2(artifact_path: Path, args: argparse.Namespace) -> ProcessResult:
     artifact["stage_status"]["translation_failed"] = False
     artifact["stage_status"]["translation_error"] = None
     write_stage_artifact(artifact, output_dir, source_path)
+    artifact_metadata = build_stage_artifact_metadata(artifact_path, artifact)
 
     return ProcessResult(
         success=True,
@@ -536,6 +564,7 @@ def run_stage2(artifact_path: Path, args: argparse.Namespace) -> ProcessResult:
         output_paths=[str(path) for path in translated_written],
         segments=len(artifact["segments"]),
         artifact_path=str(artifact_path),
+        artifact_metadata=artifact_metadata,
     )
 
 
@@ -563,6 +592,8 @@ def _finalize_process_result(
             error=stage2_result.error,
             stage=stage2_result.stage,
             artifact_path=stage1_result.artifact_path,
+            artifact_metadata=stage2_result.artifact_metadata
+            or stage1_result.artifact_metadata,
         )
 
     elapsed = stage1_result.elapsed_sec or 0.0
@@ -592,6 +623,11 @@ def _finalize_process_result(
         output_paths=output_paths,
         segments=stage1_result.segments,
         artifact_path=stage1_result.artifact_path,
+        artifact_metadata=(
+            stage2_result.artifact_metadata
+            if stage2_result is not None
+            else stage1_result.artifact_metadata
+        ),
     )
 
 
@@ -650,6 +686,7 @@ def run_parallel(
                 output_paths=result.output_paths or [],
                 segments=result.segments,
                 artifact_path=result.artifact_path,
+                artifact_metadata=result.artifact_metadata,
                 folder_hash=folder_snapshot["folder_hash"],
                 folder_path=folder_snapshot["folder_path"],
                 folder_total_files=folder_snapshot["total_files"],

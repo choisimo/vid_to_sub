@@ -13,7 +13,6 @@ from pathlib import Path
 from typing import Any, Sequence
 
 from textual import work
-from textual.widgets import RichLog
 
 from vid_to_sub_app.cli import (
     apply_runtime_path_map_to_manifest,
@@ -271,7 +270,8 @@ class RunMixin:
                 cmd.append("--stage1-only")
             # Keep --translate-to so the artifact records target_lang for stage2.
             translate_to = (
-                config.translate_to if config is not None
+                config.translate_to
+                if config is not None
                 else (self._val("inp-translate-to") or None)
             )
             if translate_to:
@@ -538,9 +538,13 @@ class RunMixin:
             config.translate_enabled if config is not None else self._sw("sw-translate")
         )
         translate_to_flag = (
-            config.translate_to if config is not None else (self._val("inp-translate-to") or None)
+            config.translate_to
+            if config is not None
+            else (self._val("inp-translate-to") or None)
         )
-        remote_stage = "stage1" if translate_enabled_flag and translate_to_flag else "full"
+        remote_stage = (
+            "stage1" if translate_enabled_flag and translate_to_flag else "full"
+        )
 
         capacities = ["local", local_capacity]
         capacities = [("local", local_capacity)]
@@ -723,6 +727,9 @@ class RunMixin:
                 )
             except (TypeError, ValueError):
                 segments = None
+            artifact_metadata = event.get("artifact_metadata")
+            if not isinstance(artifact_metadata, dict):
+                artifact_metadata = None
 
             if job and job.job_id is not None:
                 _db.finish_job(
@@ -734,6 +741,7 @@ class RunMixin:
                     video_dur=video_dur,
                     segments=segments,
                     artifact_path=event.get("artifact_path") or None,
+                    artifact_metadata=artifact_metadata,
                 )
             elif status != "done":
                 job_id = _db.create_job(
@@ -857,19 +865,23 @@ class RunMixin:
                 skip_next = True
                 continue
             clean.append(tok)
-        clean += ["--translate-from-artifact", artifact_path,
-                  "--translate-to", target_lang]
+        clean += [
+            "--translate-from-artifact",
+            artifact_path,
+            "--translate-to",
+            target_lang,
+        ]
 
-        log = self.query_one("#log", RichLog)
-        log.clear()
-        log.write(f"[bold cyan]Stage-2 translation[/] from artifact {Path(artifact_path).name}")
+        self._clear_runtime_logs()
+        self._log(
+            f"[bold cyan]Stage-2 translation[/] from artifact {Path(artifact_path).name}"
+        )
         self._reset_run_state(preserve_shell=True)
         self._run_last_shell = (
             f"[cyan]Stage-2 translate[/] · artifact={Path(artifact_path).name}"
         )
         self._refresh_live_panels()
         self._active_worker = self._launch_local_worker(clean, config)
-
 
     def _trigger(self, dry_run: bool = False) -> None:
         try:
@@ -878,9 +890,8 @@ class RunMixin:
             self._log(f"[bold red]✕ {exc}[/]")
             return
 
-        log = self.query_one("#log", RichLog)
-        log.clear()
-        log.write(
+        self._clear_runtime_logs()
+        self._log(
             "[bold cyan]Preparing run[/] discovering video files and building execution plan…"
         )
 
@@ -916,22 +927,21 @@ class RunMixin:
         if config.request_id != self._run_request_id:
             return
 
-        log = self.query_one("#log", RichLog)
-        log.clear()
+        self._clear_runtime_logs()
         if config.execution_mode == "distributed" and len(plans) > 1:
-            log.write(
+            self._log(
                 f"[bold cyan]Distributed run[/] {len(videos)} video(s) across {len(plans)} executor(s)"
             )
         elif plans[0].kind == "remote":
-            log.write(
+            self._log(
                 f"[bold cyan]Remote run[/] {len(videos)} video(s) via {plans[0].label}"
             )
         else:
-            log.write(
+            self._log(
                 "[bold cyan]$ " + " ".join(_mask(plans[0].cmd[2:])) + "[/bold cyan]"
             )
         for plan in plans:
-            log.write(
+            self._log(
                 f"[dim]{plan.label}[/] {len(plan.assigned_paths)} file(s) · capacity={plan.capacity}"
             )
 
