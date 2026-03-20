@@ -1,0 +1,7 @@
+Command: python -m unittest tests.test_tui_logs_tab.RuntimeLogFailureToleranceTests
+
+.
+----------------------------------------------------------------------
+Ran 1 test in 0.008s
+
+OK

@@ -1,0 +1,13 @@
+Command: python -m unittest tests.test_tui_logs_tab.LogsTabVisibilityTests
+
+Executing <Task pending name="message pump Screen(id='_default')" coro=<MessagePump._process_messages() running at /home/nodove/.local/lib/python3.14/site-packages/textual/message_pump.py:571> wait_for=<Future pending cb=[Task.task_wakeup()] created at /usr/lib/python3.14/asyncio/base_events.py:459> created at /usr/lib/python3.14/asyncio/tasks.py:395> took 0.217 seconds
+.Executing <Task pending name="message pump Screen(id='_default')" coro=<MessagePump._process_messages() running at /home/nodove/.local/lib/python3.14/site-packages/textual/message_pump.py:571> wait_for=<Future pending cb=[Task.task_wakeup()] created at /usr/lib/python3.14/asyncio/base_events.py:459> created at /usr/lib/python3.14/asyncio/tasks.py:395> took 0.216 seconds
+/usr/lib/python3.14/traceback.py:295: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x7f23bd156d40>
+  def __init__(self, filename, lineno, name, *, lookup_line=True,
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+.Executing <Task pending name="message pump Screen(id='_default')" coro=<MessagePump._process_messages() running at /home/nodove/.local/lib/python3.14/site-packages/textual/message_pump.py:571> wait_for=<Future pending cb=[Task.task_wakeup()] created at /usr/lib/python3.14/asyncio/base_events.py:459> created at /usr/lib/python3.14/asyncio/tasks.py:395> took 0.184 seconds
+.
+----------------------------------------------------------------------
+Ran 3 tests in 7.781s
+
+OK

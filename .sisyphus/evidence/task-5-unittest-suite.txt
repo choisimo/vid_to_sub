@@ -1,0 +1,7 @@
+Command: python -m unittest tests.test_tui_logs_tab tests.test_tui_helpers
+Result: PASS
+Details:
+- Ran 91 tests in 15.086s
+- Exit status 0
+- Dedicated logs-tab regression coverage and helper tests completed successfully
+- Runtime emitted existing ResourceWarning noise from sqlite/textual internals, but no test failures or tracebacks occurred
