@@ -28,6 +28,51 @@ from ..state import db as _db
 
 
 class SettingsMixin:
+    """Settings-tab mixin — form persistence, SSH connection management, and env sync.
+
+    Requires (must be provided by the host class):
+        - self._ssh_selected_id: int | None
+        - self._remote_resources: list[RemoteResourceProfile]
+        - self._val(wid: str) -> str
+        - self._sel(wid: str, fallback: str) -> str
+        - self._sw(wid: str) -> bool
+        - self.query_one(selector, type) — Textual widget accessor
+        - self.notify(message: str, **kw) — Textual notification
+        # Cross-mixin: called after state-changing operations
+        - self._refresh_remote_state() -> None          # app.py canonical call-site
+        - self._update_agent_config_status() -> None    # AgentMixin
+        - self._update_cmd_preview() -> None            # RunMixin
+        - self._sync_transcribe_overrides_from_settings(...) -> None  # self
+        - self._sync_run_defaults_from_settings(...) -> None          # self
+
+    Provides:
+        - _load_settings_form() -> None
+        - _prefill_transcribe() -> None
+        - _sync_transcribe_overrides_from_settings(prev, new) -> None
+        - _sync_run_defaults_from_settings(prev, new) -> None
+        - _save_settings() -> None
+        - _export_env() -> None
+        - _apply_db_to_env() -> None
+        - _migrate_env_to_db() -> None
+        - _import_env_to_sqlite() -> None
+        - _init_ssh_table() -> None
+        - _refresh_ssh_table() -> None
+        - _ssh_read_form() -> dict[str, str]
+        - _ssh_parse_json_field(value, field_name) -> dict | None
+        - _ssh_set_status(msg: str) -> None
+        - _ssh_clear_form() -> None
+        - _ssh_fill_form_from_row(row: dict) -> None
+        - _ssh_add_connection() -> None
+        - _ssh_update_connection() -> None
+        - _ssh_delete_connection() -> None
+        - _action_stg_reload() -> None
+        - _action_stg_save() -> None
+        - _action_export_env() -> None
+        - _action_import_env() -> None
+        - _action_ssh_add() -> None
+        - _action_ssh_update() -> None
+        - _action_ssh_delete() -> None
+    """
 
     # ── Settings ──────────────────────────────────────────────────────────
 
@@ -191,10 +236,7 @@ class SettingsMixin:
         self._apply_db_to_env()
         self._sync_transcribe_overrides_from_settings(previous_values, data)
         self._sync_run_defaults_from_settings(previous_values, data)
-        self._load_remote_resources()
-        self._run_detection()
-        self._update_wcpp_model_status()
-        self._update_remote_status()
+        self._refresh_remote_state()
         self._update_agent_config_status()
         self._update_cmd_preview()
         try:
@@ -455,8 +497,7 @@ class SettingsMixin:
             env=env,
         )
         self._refresh_ssh_table()
-        self._load_remote_resources()
-        self._update_remote_status()
+        self._refresh_remote_state()
         self._ssh_set_status(f"[green]✓ Added connection: {form['label'] or form['host']}[/]")
 
     def _ssh_update_connection(self) -> None:
@@ -495,8 +536,7 @@ class SettingsMixin:
             env=env,
         )
         self._refresh_ssh_table()
-        self._load_remote_resources()
-        self._update_remote_status()
+        self._refresh_remote_state()
         self._ssh_set_status(f"[green]✓ Updated connection ID {self._ssh_selected_id}[/]")
 
     def _ssh_delete_connection(self) -> None:
@@ -507,6 +547,5 @@ class SettingsMixin:
         self._ssh_selected_id = None
         self._ssh_clear_form()
         self._refresh_ssh_table()
-        self._load_remote_resources()
-        self._update_remote_status()
+        self._refresh_remote_state()
         self._ssh_set_status("[green]✓ Connection deleted.[/]")

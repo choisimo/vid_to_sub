@@ -28,6 +28,53 @@ from ..state import db as _db
 
 
 class AgentMixin:
+    """Agent-tab mixin — AI plan request, rendering, and application.
+
+    Requires (must be provided by the host class):
+        - self._agent_plan: dict[str, Any] | None
+        - self._detect_results: DetectResult
+        - self._active_worker: Worker | None
+        - self._active_jobs: dict[str, RunJobState]
+        - self._run_started_at: float | None
+        - self._run_total_found: int
+        - self._run_total_queued: int
+        - self._run_completed: int
+        - self._run_failed: int
+        - self._remote_resources: list[RemoteResourceProfile]
+        - self._val(wid: str) -> str
+        - self._sel(wid: str, fallback: str) -> str
+        - self.query_one(selector, type) — Textual widget accessor
+        - self.call_from_thread(fn, *args) — Textual thread-safe callback
+        - self.notify(message: str, **kw) — Textual notification
+        # Cross-mixin: methods from other mixins used here
+        - self._refresh_detection_from_worker() -> DetectResult  # SetupMixin
+        - self._auto_setup_sync(...) -> None                     # SetupMixin
+        - self._build_whisper_cpp_sync() -> bool                 # SetupMixin
+        - self._download_model_sync(model_name: str) -> bool     # SetupMixin
+        - self._install_requirement_target(target: str) -> bool  # SetupMixin
+        - self._load_history_job(job_id: int) -> None            # HistoryMixin
+        - self._rerun_history_job(job_id: int) -> None           # HistoryMixin
+        - self._refresh_history() -> None                       # HistoryMixin
+        - self._selected_history_job() -> dict | None           # HistoryMixin
+
+    Provides:
+        - _effective_agent_config() -> tuple[str, str, str]
+        - _update_agent_config_status() -> None
+        - _set_agent_status(message: str) -> None
+        - _agent_log_write(message: str) -> None
+        - _update_agent_apply_state() -> None
+        - _clear_agent_ui() -> None
+        - _normalize_agent_plan(payload: dict) -> dict
+        - _render_agent_plan(plan: dict) -> None
+        - _agent_context() -> dict[str, Any]
+        - _request_agent_plan() -> None
+        - _fetch_agent_plan(prompt: str) -> None
+        - _apply_agent_plan() -> None
+        - _execute_agent_plan(actions: list[dict]) -> None
+        - _action_agent_plan() -> None
+        - _action_agent_apply() -> None
+        - _action_agent_clear() -> None
+    """
     def _effective_agent_config(self) -> tuple[str, str, str]:
         model = (
             _db.get(ENV_AGENT_MOD)

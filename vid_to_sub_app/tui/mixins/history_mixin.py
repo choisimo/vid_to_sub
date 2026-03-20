@@ -12,6 +12,31 @@ from ..state import db as _db
 
 
 class HistoryMixin:
+    """History-tab mixin.
+
+    Requires (must be provided by the host class):
+        - self._active_jobs: dict[str, RunJobState]
+        - self._selected_paths: list[str]
+        - self._hist_key: str | None
+        - self._trigger(dry_run: bool) -> None
+        - self._log(text: str) -> None
+        - self._val(wid: str) -> str
+        - self._refresh_sel_paths() -> None
+        - self._refresh_recent_paths() -> None
+        - self._refresh_live_panels() -> None
+
+    Provides:
+        - _init_history_table() -> None
+        - _refresh_history() -> None
+        - _show_hist_detail(key: str | None) -> None
+        - _load_history_job(job_id: int) -> None
+        - _rerun_history_job(job_id: int) -> None
+        - _action_hist_refresh() -> None
+        - _action_hist_load() -> None
+        - _action_hist_rerun() -> None
+        - _action_hist_clear() -> None
+        - _action_hist_delete() -> None
+    """
     # ── History tab ───────────────────────────────────────────────────────
 
     def _init_history_table(self) -> None:

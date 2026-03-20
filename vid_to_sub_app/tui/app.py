@@ -108,6 +108,7 @@ from .helpers import (
 )
 from .state import db as _db
 from .styles import _CSS
+from .button_actions import ALL_ACTIONS, ButtonId, ActionSpec
 from .mixins import (
     AgentMixin,
     BrowseMixin,
@@ -201,7 +202,7 @@ class VidToSubApp(
                                     id="tree-root",
                                     placeholder="Root path…",
                                 )
-                                yield Button("Go", id="btn-tree-go")
+                                yield Button("Go", id=ButtonId.TREE_GO)
                             yield DirectoryTree(str(Path.home()), id="dir-tree")
 
                         # Right: paths management
@@ -216,12 +217,12 @@ class VidToSubApp(
                             with Horizontal(id="browse-actions"):
                                 yield Button(
                                     "Add Sel",
-                                    id="btn-add-sel",
+                                    id=ButtonId.ADD_SEL,
                                     variant="success",
                                 )
                                 yield Button(
                                     "Clear",
-                                    id="btn-clear-paths",
+                                    id=ButtonId.CLEAR_PATHS,
                                     variant="error",
                                 )
 
@@ -230,7 +231,7 @@ class VidToSubApp(
                                     placeholder="Or type/paste path here…",
                                     id="inp-manual-path",
                                 )
-                                yield Button("Add", id="btn-manual-add", variant="default")
+                                yield Button("Add", id=ButtonId.MANUAL_ADD, variant="default")
 
                             yield Static("Quick Search", classes="stitle")
                             with Horizontal(id="search-row"):
@@ -238,8 +239,8 @@ class VidToSubApp(
                                     placeholder="Find directories or video files under root…",
                                     id="inp-path-search",
                                 )
-                                yield Button("Find", id="btn-search-paths")
-                                yield Button("Reset", id="btn-clear-search")
+                                yield Button("Find",  id=ButtonId.SEARCH_PATHS)
+                                yield Button("Reset", id=ButtonId.CLEAR_SEARCH)
                             yield Static(
                                 "[dim]Type at least 2 characters. Results stay inside the current root path.[/]",
                                 id="search-status",
@@ -298,18 +299,18 @@ class VidToSubApp(
                             )
 
                         with Horizontal(classes="crow"):
-                            yield Button("Detect", id="btn-redetect", variant="default")
+                            yield Button("Detect", id=ButtonId.REDETECT, variant="default")
 
                         yield Static("Automatic Setup", classes="stitle")
                         with Horizontal(classes="crow"):
                             yield Button(
                                 "Auto",
-                                id="btn-auto-setup",
+                                id=ButtonId.AUTO_SETUP,
                                 variant="primary",
                             )
                             yield Button(
                                 "Full",
-                                id="btn-full-setup",
+                                id=ButtonId.FULL_SETUP,
                                 variant="warning",
                             )
                         yield Static(
@@ -328,7 +329,7 @@ class VidToSubApp(
                         with Horizontal(classes="inst-row"):
                             yield Button(
                                 "Build whisper-cli",
-                                id="btn-build-whisper",
+                                id=ButtonId.BUILD_WHISPER,
                                 variant="warning",
                             )
 
@@ -347,7 +348,7 @@ class VidToSubApp(
                         with Horizontal(classes="inst-row"):
                             yield Button(
                                 "Download",
-                                id="btn-download-model",
+                                id=ButtonId.DOWNLOAD_MODEL,
                                 variant="warning",
                             )
 
@@ -355,17 +356,17 @@ class VidToSubApp(
                         with Horizontal(classes="crow"):
                             yield Button(
                                 "pip fw",
-                                id="btn-pip-fw",
+                                id=ButtonId.PIP_FW,
                                 variant="default",
                             )
                             yield Button(
                                 "pip whisper",
-                                id="btn-pip-whisper",
+                                id=ButtonId.PIP_WHISPER,
                                 variant="default",
                             )
                             yield Button(
                                 "pip wx",
-                                id="btn-pip-wx",
+                                id=ButtonId.PIP_WX,
                                 variant="default",
                             )
 
@@ -573,11 +574,11 @@ class VidToSubApp(
                 with TabPane("4 History", id="tab-history"):
                     with Vertical(id="hist-pane"):
                         with Horizontal(id="hist-actions"):
-                            yield Button("Refresh", id="btn-hist-refresh", variant="default")
-                            yield Button("Load", id="btn-hist-load", variant="primary")
-                            yield Button("Rerun", id="btn-hist-rerun", variant="success")
-                            yield Button("Clear", id="btn-hist-clear", variant="error")
-                            yield Button("Delete", id="btn-hist-delete", variant="warning")
+                            yield Button("Refresh", id=ButtonId.HIST_REFRESH, variant="default")
+                            yield Button("Load",    id=ButtonId.HIST_LOAD,    variant="primary")
+                            yield Button("Rerun",   id=ButtonId.HIST_RERUN,   variant="success")
+                            yield Button("Clear",   id=ButtonId.HIST_CLEAR,   variant="error")
+                            yield Button("Delete",  id=ButtonId.HIST_DELETE,  variant="warning")
                             yield Static("", id="hist-count")
                         yield DataTable(
                             id="hist-table",
@@ -837,16 +838,16 @@ class VidToSubApp(
                             )
                         yield Static("", id="ssh-form-status", markup=True)
                         with Horizontal(id="ssh-form-actions"):
-                            yield Button("Add Connection", id="btn-ssh-add", variant="primary")
-                            yield Button("Update Selected", id="btn-ssh-update", variant="default")
-                            yield Button("Delete Selected", id="btn-ssh-delete", variant="warning")
-                            yield Button("Clear Form", id="btn-ssh-clear", variant="default")
+                            yield Button("Add Connection",  id=ButtonId.SSH_ADD,    variant="primary")
+                            yield Button("Update Selected", id=ButtonId.SSH_UPDATE, variant="default")
+                            yield Button("Delete Selected", id=ButtonId.SSH_DELETE, variant="warning")
+                            yield Button("Clear Form",      id=ButtonId.SSH_CLEAR,  variant="default")
                         yield Static("", id="stg-status", markup=True)
                         with Horizontal(id="stg-actions"):
-                            yield Button("Save", id="btn-stg-save", variant="primary")
-                            yield Button("Reload", id="btn-stg-reload", variant="default")
-                            yield Button("Export .env", id="btn-export-env", variant="default")
-                            yield Button("Import from .env", id="btn-import-env", variant="default")
+                            yield Button("Save",            id=ButtonId.STG_SAVE,   variant="primary")
+                            yield Button("Reload",          id=ButtonId.STG_RELOAD, variant="default")
+                            yield Button("Export .env",     id=ButtonId.EXPORT_ENV, variant="default")
+                            yield Button("Import from .env", id=ButtonId.IMPORT_ENV, variant="default")
 
                 # ── Tab 6: Agent ──────────────────────────────────────
                 with TabPane("6 Agent", id="tab-agent"):
@@ -870,14 +871,14 @@ class VidToSubApp(
                             ),
                         )
                         with Horizontal(id="agent-actions"):
-                            yield Button("Ask", id="btn-agent-plan", variant="primary")
+                            yield Button("Ask", id=ButtonId.AGENT_PLAN, variant="primary")
                             yield Button(
                                 "Apply",
-                                id="btn-agent-apply",
+                                id=ButtonId.AGENT_APPLY,
                                 variant="success",
                                 disabled=True,
                             )
-                            yield Button("Clear", id="btn-agent-clear")
+                            yield Button("Clear", id=ButtonId.AGENT_CLEAR)
                         yield Static(
                             "[dim]No agent plan yet.[/]",
                             id="agent-status",
@@ -896,10 +897,10 @@ class VidToSubApp(
         with Vertical(id="bottom"):
             with Horizontal(id="run-toolbar"):
                 with Horizontal(id="run-btns"):
-                    yield Button("Run", id="btn-run", variant="success")
-                    yield Button("Dry", id="btn-dry-run", variant="warning")
-                    yield Button("Kill", id="btn-kill", variant="error", disabled=True)
-                    yield Button("Cmd ▸", id="btn-toggle-run-shell", variant="default")
+                    yield Button("Run",   id=ButtonId.RUN,              variant="success")
+                    yield Button("Dry",   id=ButtonId.DRY_RUN,          variant="warning")
+                    yield Button("Kill",  id=ButtonId.KILL,             variant="error", disabled=True)
+                    yield Button("Cmd ▸", id=ButtonId.TOGGLE_RUN_SHELL, variant="default")
                 yield Static("", id="run-overview", markup=True)
             with Vertical(id="run-command-panel", classes="collapsed"):
                 yield Static(
@@ -924,6 +925,7 @@ class VidToSubApp(
     # ── Lifecycle ─────────────────────────────────────────────────────────
 
     def on_mount(self) -> None:
+        self._validate_button_handlers()
         self._migrate_env_to_db()
         self._apply_db_to_env()
         self._load_settings_form()
@@ -944,8 +946,7 @@ class VidToSubApp(
         except (NoMatches, Exception):
             pass
         self._update_wcpp_model_status()
-        self._load_remote_resources()
-        self._update_remote_status()
+        self._refresh_remote_state()
         self._refresh_live_panels()
         self._update_agent_config_status()
         self._sync_run_command_panel()
@@ -997,7 +998,7 @@ class VidToSubApp(
 
     def on_select_changed(self, _: Select.Changed) -> None:
         self._update_wcpp_model_status()
-        self._update_remote_status()
+        self._refresh_remote_state()
         self._update_cmd_preview()
 
     def on_checkbox_changed(self, event: Checkbox.Changed) -> None:
@@ -1111,171 +1112,208 @@ class VidToSubApp(
                 self._refresh_history()
         self._refresh_live_panels()
 
-    def on_button_pressed(self, event: Button.Pressed) -> None:  # noqa: C901
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        """Route button events to domain handlers via ALL_ACTIONS dispatch table.
+
+        Dynamic-prefix buttons (selrm-*, radd-*, sgo-*, spv-*, sadd-*) are
+        handled by dedicated prefix methods before the table lookup.
+        """
         bid = event.button.id or ""
 
-        # ── Browse ─────────────────────────────────────────────
-        if bid == "btn-tree-go":
-            try:
-                v = self.query_one("#tree-root", Input).value.strip()
-                self._goto_tree(v)
-            except NoMatches:
-                pass
-        elif bid == "btn-add-sel":
-            if self._tree_selection:
-                self._add_path(str(self._tree_selection))
-        elif bid == "btn-manual-add":
-            try:
-                inp = self.query_one("#inp-manual-path", Input)
-                path = inp.value.strip()
-                if path:
-                    self._add_path(path)
-                    inp.value = ""
-            except NoMatches:
-                pass
-        elif bid == "btn-clear-paths":
-            self._selected_paths.clear()
-            self._refresh_sel_paths()
-            self._update_cmd_preview()
-        elif bid == "btn-search-paths":
-            self._start_path_search()
-        elif bid == "btn-clear-search":
-            try:
-                self.query_one("#inp-path-search", Input).value = ""
-            except NoMatches:
-                pass
-            self._clear_path_search("[dim]Type a keyword to search the current root.[/]")
-        elif bid.startswith("selrm-"):
-            try:
-                idx = int(bid.removeprefix("selrm-"))
-                if 0 <= idx < len(self._selected_paths):
-                    self._selected_paths.pop(idx)
-                    self._refresh_sel_paths()
-                    self._update_cmd_preview()
-            except ValueError:
-                pass
-        elif bid.startswith("radd-"):
-            try:
-                idx = int(bid.removeprefix("radd-"))
-                recent = _db.get_recent_paths(limit=20)
-                if idx < len(recent):
-                    self._add_path(recent[idx]["path"])
-            except (ValueError, IndexError):
-                pass
-        elif bid.startswith("sgo-"):
-            try:
-                idx = int(bid.removeprefix("sgo-"))
-                if 0 <= idx < len(self._search_results):
-                    target = Path(self._search_results[idx])
-                    self._set_search_preview(self._search_results[idx])
-                    self._tree_selection = target
-                    self._goto_tree(str(target if target.is_dir() else target.parent))
-            except ValueError:
-                pass
-        elif bid.startswith("spv-"):
-            try:
-                idx = int(bid.removeprefix("spv-"))
-                if 0 <= idx < len(self._search_results):
-                    self._set_search_preview(self._search_results[idx])
-            except ValueError:
-                pass
-        elif bid.startswith("sadd-"):
-            try:
-                idx = int(bid.removeprefix("sadd-"))
-                if 0 <= idx < len(self._search_results):
-                    self._set_search_preview(self._search_results[idx])
-                    self._tree_selection = Path(self._search_results[idx])
-                    self._add_path(self._search_results[idx])
-            except ValueError:
-                pass
+        # ── Dynamic-prefix buttons (generated at runtime) ──────────────
+        if bid.startswith("selrm-"):
+            self._action_selrm(bid)
+            return
+        if bid.startswith("radd-"):
+            self._action_radd(bid)
+            return
+        if bid.startswith("sgo-"):
+            self._action_sgo(bid)
+            return
+        if bid.startswith("spv-"):
+            self._action_spv(bid)
+            return
+        if bid.startswith("sadd-"):
+            self._action_sadd(bid)
+            return
 
-        # ── Setup ──────────────────────────────────────────────
-        elif bid == "btn-redetect":
-            self._run_detection()
-        elif bid == "btn-auto-setup":
-            self._save_setup_build_fields()
-            self._save_setup_model_fields()
-            model = self._sel("sel-dl-model", DEFAULT_MODEL)
-            self._auto_setup(False, model)
-        elif bid == "btn-full-setup":
-            self._save_setup_build_fields()
-            self._save_setup_model_fields()
-            model = self._sel("sel-dl-model", DEFAULT_MODEL)
-            self._auto_setup(True, model)
-        elif bid == "btn-build-whisper":
-            self._save_setup_build_fields()
-            self._build_whisper_cpp()
-        elif bid == "btn-download-model":
-            self._save_setup_model_fields()
-            model = self._sel("sel-dl-model", "large-v3")
-            self._download_model(model)
-        elif bid == "btn-pip-fw":
-            self._pip_install("faster-whisper")
-        elif bid == "btn-pip-whisper":
-            self._pip_install("whisper")
-        elif bid == "btn-pip-wx":
-            self._pip_install("whisperx")
+        # ── Static buttons via dispatch table ──────────────────────────
+        self._dispatch_button_action(bid)
 
-        # ── Run panel ──────────────────────────────────────────
-        elif bid == "btn-run":
-            self.action_run()
-        elif bid == "btn-dry-run":
-            self.action_dry_run()
-        elif bid == "btn-kill":
-            self.action_kill()
-        elif bid == "btn-toggle-run-shell":
-            self._run_shell_collapsed = not self._run_shell_collapsed
-            self._sync_run_command_panel()
+    def _dispatch_button_action(self, bid_raw: str) -> None:
+        """Look up *bid_raw* in ALL_ACTIONS and invoke the registered handler."""
+        try:
+            bid = ButtonId(bid_raw)
+        except ValueError:
+            self.notify(f"Unknown button id: {bid_raw!r}", severity="warning")
+            return
 
-        # ── History ────────────────────────────────────────────
-        elif bid == "btn-hist-refresh":
-            self._refresh_history()
-            self._refresh_live_panels()
-        elif bid == "btn-hist-load":
-            if self._hist_key:
-                self._load_history_job(int(self._hist_key))
-        elif bid == "btn-hist-rerun":
-            if self._hist_key:
-                self._rerun_history_job(int(self._hist_key))
-        elif bid == "btn-hist-clear":
-            _db.clear_jobs()
+        spec = ALL_ACTIONS.get(bid)
+        if spec is None:
+            self.notify(f"No handler registered for {bid!r}", severity="warning")
+            return
+
+        handler = getattr(self, spec.handler_name)
+        handler()
+
+        if spec.refresh_remote_after:
+            self._refresh_remote_state()
+
+    # ── Browse action helpers ──────────────────────────────────────────
+
+    def _action_tree_go(self) -> None:
+        try:
+            v = self.query_one("#tree-root", Input).value.strip()
+            self._goto_tree(v)
+        except NoMatches:
+            pass
+
+    def _action_add_sel(self) -> None:
+        if self._tree_selection:
+            self._add_path(str(self._tree_selection))
+
+    def _action_manual_add(self) -> None:
+        try:
+            inp = self.query_one("#inp-manual-path", Input)
+            path = inp.value.strip()
+            if path:
+                self._add_path(path)
+                inp.value = ""
+        except NoMatches:
+            pass
+
+    def _action_clear_paths(self) -> None:
+        self._selected_paths.clear()
+        self._refresh_sel_paths()
+        self._update_cmd_preview()
+
+    def _action_clear_search(self) -> None:
+        try:
+            self.query_one("#inp-path-search", Input).value = ""
+        except NoMatches:
+            pass
+        self._clear_path_search("[dim]Type a keyword to search the current root.[/]")
+
+    # ── Browse dynamic-prefix helpers ─────────────────────────────────
+
+    def _action_selrm(self, bid: str) -> None:
+        try:
+            idx = int(bid.removeprefix("selrm-"))
+            if 0 <= idx < len(self._selected_paths):
+                self._selected_paths.pop(idx)
+                self._refresh_sel_paths()
+                self._update_cmd_preview()
+        except ValueError:
+            pass
+
+    def _action_radd(self, bid: str) -> None:
+        try:
+            idx = int(bid.removeprefix("radd-"))
+            recent = _db.get_recent_paths(limit=20)
+            if idx < len(recent):
+                self._add_path(recent[idx]["path"])
+        except (ValueError, IndexError):
+            pass
+
+    def _action_sgo(self, bid: str) -> None:
+        try:
+            idx = int(bid.removeprefix("sgo-"))
+            if 0 <= idx < len(self._search_results):
+                target = Path(self._search_results[idx])
+                self._set_search_preview(self._search_results[idx])
+                self._tree_selection = target
+                self._goto_tree(str(target if target.is_dir() else target.parent))
+        except ValueError:
+            pass
+
+    def _action_spv(self, bid: str) -> None:
+        try:
+            idx = int(bid.removeprefix("spv-"))
+            if 0 <= idx < len(self._search_results):
+                self._set_search_preview(self._search_results[idx])
+        except ValueError:
+            pass
+
+    def _action_sadd(self, bid: str) -> None:
+        try:
+            idx = int(bid.removeprefix("sadd-"))
+            if 0 <= idx < len(self._search_results):
+                self._set_search_preview(self._search_results[idx])
+                self._tree_selection = Path(self._search_results[idx])
+                self._add_path(self._search_results[idx])
+        except ValueError:
+            pass
+
+    # ── Setup action helpers ───────────────────────────────────────────
+
+    def _action_auto_setup(self) -> None:
+        self._save_setup_build_fields()
+        self._save_setup_model_fields()
+        model = self._sel("sel-dl-model", DEFAULT_MODEL)
+        self._auto_setup(False, model)
+
+    def _action_full_setup(self) -> None:
+        self._save_setup_build_fields()
+        self._save_setup_model_fields()
+        model = self._sel("sel-dl-model", DEFAULT_MODEL)
+        self._auto_setup(True, model)
+
+    def _action_build_whisper(self) -> None:
+        self._save_setup_build_fields()
+        self._build_whisper_cpp()
+
+    def _action_download_model(self) -> None:
+        self._save_setup_model_fields()
+        model = self._sel("sel-dl-model", "large-v3")
+        self._download_model(model)
+
+    def _action_pip_fw(self) -> None:      self._pip_install("faster-whisper")
+    def _action_pip_whisper(self) -> None: self._pip_install("whisper")
+    def _action_pip_wx(self) -> None:      self._pip_install("whisperx")
+
+    # ── Run action helpers ─────────────────────────────────────────────
+
+    def _action_toggle_run_shell(self) -> None:
+        self._run_shell_collapsed = not self._run_shell_collapsed
+        self._sync_run_command_panel()
+
+    # ── History action helpers ─────────────────────────────────────────
+
+    def _action_hist_refresh(self) -> None:
+        self._refresh_history()
+        self._refresh_live_panels()
+
+    def _action_hist_load(self) -> None:
+        if self._hist_key:
+            self._load_history_job(int(self._hist_key))
+
+    def _action_hist_rerun(self) -> None:
+        if self._hist_key:
+            self._rerun_history_job(int(self._hist_key))
+
+    def _action_hist_clear(self) -> None:
+        _db.clear_jobs()
+        self._hist_key = None
+        self._refresh_history()
+        self._refresh_live_panels()
+
+    def _action_hist_delete(self) -> None:
+        if self._hist_key:
+            _db.delete_job(int(self._hist_key))
             self._hist_key = None
             self._refresh_history()
             self._refresh_live_panels()
-        elif bid == "btn-hist-delete":
-            if self._hist_key:
-                _db.delete_job(int(self._hist_key))
-                self._hist_key = None
-                self._refresh_history()
-                self._refresh_live_panels()
 
-        # ── Settings ───────────────────────────────────────────
-        elif bid == "btn-stg-save":
-            self._save_settings()
-        elif bid == "btn-stg-reload":
-            self._load_settings_form()
-            self._load_remote_resources()
-            self._update_remote_status()
-            self._update_agent_config_status()
-        elif bid == "btn-export-env":
-            self._export_env()
-        elif bid == "btn-import-env":
-            self._import_env_to_sqlite()
-        # ── SSH Connections ─────────────────────────────────────
-        elif bid == "btn-ssh-add":
-            self._ssh_add_connection()
-        elif bid == "btn-ssh-update":
-            self._ssh_update_connection()
-        elif bid == "btn-ssh-delete":
-            self._ssh_delete_connection()
-        elif bid == "btn-ssh-clear":
-            self._ssh_clear_form()
-        elif bid == "btn-agent-plan":
-            self._request_agent_plan()
-        elif bid == "btn-agent-apply":
-            self._apply_agent_plan()
-        elif bid == "btn-agent-clear":
-            self._clear_agent_ui()
+    # ── Settings action helpers ────────────────────────────────────────
+
+    def _action_stg_reload(self) -> None:
+        """Reload settings form + agent config status.
+
+        Remote state refresh is handled automatically by the dispatcher
+        (``refresh_remote_after=True`` in SETTINGS_ACTIONS).
+        """
+        self._load_settings_form()
+        self._update_agent_config_status()
 
     # ── Actions ───────────────────────────────────────────────────────────
 
@@ -1482,6 +1520,37 @@ class VidToSubApp(
             self.query_one("#remote-status", Static).update(msg)
         except NoMatches:
             pass
+
+    def _validate_button_handlers(self) -> None:
+
+        """Startup guard: assert every ActionSpec.handler_name resolves to a method.
+
+        Raises RuntimeError at mount-time (not at button-press time) so mis-wired
+        entries are caught immediately during development rather than silently at
+        runtime when the user clicks a button.
+        """
+        missing = [
+            (bid, spec.handler_name)
+            for bid, spec in ALL_ACTIONS.items()
+            if not hasattr(self, spec.handler_name)
+        ]
+        if missing:
+            lines = ", ".join(f"{bid!r} -> {name!r}" for bid, name in missing)
+            raise RuntimeError(
+                f"_validate_button_handlers: {len(missing)} handler(s) missing: {lines}"
+            )
+
+    def _refresh_remote_state(self) -> None:
+        """Reload remote resources then sync the Transcribe-tab status label.
+
+        This is the single authoritative call-site for updating any state that
+        depends on SSH connections or remote-resource profiles.  Always call
+        *this* instead of calling ``_load_remote_resources()`` and
+        ``_update_remote_status()`` in sequence.
+        """
+        self._load_remote_resources()
+        self._update_remote_status()
+
     # ── Widget accessors ──────────────────────────────────────────────────
 
     def _val(self, wid: str) -> str:
