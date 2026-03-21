@@ -308,6 +308,70 @@ def detect_cuda_total_memory_gb() -> float | None:
     return max(values) if values else None
 
 
+def detect_cuda_free_memory_gb() -> float | None:
+    """Return the free (available) VRAM in GiB for the best GPU.
+
+    Prefers torch.cuda.mem_get_info() which returns (free, total) for the
+    currently selected device.  Falls back to nvidia-smi --query-gpu=memory.free
+    for environments without torch.  Returns None when no CUDA device is found.
+
+    This is the preferred signal for model selection because it reflects
+    current runtime pressure — unlike total VRAM it accounts for other
+    processes already occupying GPU memory.
+    """
+    try:
+        import torch
+    except ImportError:
+        torch = None  # type: ignore[assignment]
+
+    if torch is not None:
+        try:
+            if torch.cuda.is_available():
+                device_count = max(1, int(torch.cuda.device_count()))
+                free_values: list[float] = []
+                for index in range(device_count):
+                    try:
+                        free_bytes, _total_bytes = torch.cuda.mem_get_info(index)
+                        free_values.append(float(free_bytes) / (1024 ** 3))
+                    except Exception:
+                        pass
+                if free_values:
+                    return max(free_values)
+        except Exception:
+            pass
+
+    try:
+        result = subprocess.run(
+            [
+                "nvidia-smi",
+                "--query-gpu=memory.free",
+                "--format=csv,noheader,nounits",
+            ],
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=2.0,
+        )
+    except (FileNotFoundError, OSError, subprocess.TimeoutExpired):
+        return None
+
+    if result.returncode != 0:
+        return None
+
+    free_vals: list[float] = []
+    for raw_line in result.stdout.splitlines():
+        stripped = raw_line.strip()
+        if not stripped:
+            continue
+        try:
+            mib = float(stripped)
+        except ValueError:
+            continue
+        free_vals.append(mib / 1024.0)
+    return max(free_vals) if free_vals else None
+
+
 def faster_whisper_model_candidates(
     model_name: str,
     *,
@@ -342,7 +406,11 @@ def resolve_runtime_model(
     if backend != "faster-whisper" or resolved_device != "cuda":
         return preferred_model
 
-    available_vram_gb = detect_cuda_total_memory_gb()
+    # Prefer free VRAM (reflects current GPU load) over total VRAM.
+    # Fall back to total when free is unavailable (e.g. no torch, nvidia-smi absent).
+    available_vram_gb = detect_cuda_free_memory_gb()
+    if available_vram_gb is None:
+        available_vram_gb = detect_cuda_total_memory_gb()
     candidates = faster_whisper_model_candidates(
         preferred_model,
         available_vram_gb=available_vram_gb,
