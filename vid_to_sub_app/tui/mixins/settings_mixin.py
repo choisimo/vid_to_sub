@@ -2,12 +2,15 @@ from __future__ import annotations
 
 import json
 import os
-from typing import Mapping
+from collections.abc import Mapping
+from pathlib import Path
+from typing import Any, cast
 
+from textual.app import App
 from textual.css.query import NoMatches
-from textual.widgets import DataTable, Input, Select, Static, TextArea
+from textual.widgets import DataTable, Input, Select, Static, Switch, TextArea
 
-from vid_to_sub_app.shared.env import load_project_env
+from vid_to_sub_app.db import TUI_DEFAULT_TRANSLATE_ENABLED_KEY
 
 from ..helpers import (
     ENV_AGENT_KEY,
@@ -22,12 +25,225 @@ from ..helpers import (
     ENV_TRANS_URL,
     ENV_WCPP_BIN,
     ENV_WCPP_MODEL,
+    _mask,
     parse_remote_resources,
+    summarize_remote_resources,
+    summarize_ggml_models,
 )
+from ..models import RemoteResourceProfile, ssh_connection_from_row
 from ..state import db as _db
 
 
+_MISSING = object()
+
+
 class SettingsMixin:
+    _ssh_selected_id: int | None = None
+    _remote_resources: list[RemoteResourceProfile] = []
+    _run_last_shell = ""
+
+    def _query_one(
+        self,
+        selector: str,
+        expect_type: type[Any] | None = None,
+        default: Any = _MISSING,
+    ) -> Any:
+        try:
+            app = cast(Any, self)
+            if expect_type is None:
+                return App.query_one(app, selector)
+            return App.query_one(app, selector, expect_type)
+        except NoMatches:
+            if default is not _MISSING:
+                return default
+            raise
+
+    def query_one(self, *args: object, **kwargs: object) -> Any:
+        selector = str(args[0]) if args else str(kwargs["selector"])
+        expect_type = cast(type[Any] | None, None)
+        if len(args) > 1:
+            expect_type = cast(type[Any] | None, args[1])
+        elif "expect_type" in kwargs:
+            expect_type = cast(type[Any] | None, kwargs["expect_type"])
+        return self._query_one(selector, expect_type=expect_type)
+
+    def _sel(self, widget_id: str, default: str = "") -> str:
+        try:
+            value = self.query_one(f"#{widget_id}", Select).value
+            return str(value) if value is not Select.BLANK else default
+        except NoMatches:
+            return default
+
+    def _val(self, widget_id: str) -> str:
+        try:
+            return self.query_one(f"#{widget_id}", Input).value.strip()
+        except NoMatches:
+            return ""
+
+    def _load_remote_resources(self) -> None:
+        profiles: list[RemoteResourceProfile] = []
+
+        for row in _db.get_ssh_connections(enabled_only=True):
+            conn = ssh_connection_from_row(row)
+            profiles.append(conn.to_remote_resource_profile())
+
+        raw = _db.get("tui.remote_resources")
+        if raw and raw.strip() not in ("", "[]"):
+            try:
+                legacy = parse_remote_resources(raw)
+                existing_names = {profile.name for profile in profiles}
+                for profile in legacy:
+                    if profile.name not in existing_names:
+                        profiles.append(profile)
+            except ValueError as exc:
+                try:
+                    self.query_one("#stg-status", Static).update(
+                        f"[yellow]Legacy remote JSON warning: {exc}[/]"
+                    )
+                except NoMatches:
+                    pass
+
+        self._remote_resources = profiles
+
+    def _run_detection(self) -> Any:
+        refresh_detection = getattr(self, "_refresh_detection_from_worker", None)
+        if callable(refresh_detection):
+            return refresh_detection()
+        return None
+
+    def _update_wcpp_model_status(self) -> None:
+        detected_models = getattr(self, "_detected_ggml_models", {})
+        if not isinstance(detected_models, dict):
+            detected_models = {}
+
+        backend = self._sel("sel-backend", "whisper-cpp")
+        manual = self._val("inp-wcpp-model")
+        selected_model = self._sel("sel-model", "large-v3")
+        auto_path = str(detected_models.get(selected_model, ""))
+
+        if backend != "whisper-cpp":
+            status = (
+                "[dim]GGML auto-detect is used only with the whisper-cpp backend.[/]"
+            )
+        elif manual:
+            status = f"[yellow]Manual override[/] {manual}"
+        elif auto_path:
+            filename = Path(auto_path).name
+            status = f"[green]Auto[/] {filename} -> {auto_path}"
+        elif detected_models:
+            available = summarize_ggml_models(detected_models)
+            status = f"[yellow]No ggml-{selected_model}.bin detected.[/] {available}"
+        else:
+            status = (
+                f"[yellow]No GGML model detected for {selected_model}.[/] "
+                "Use Setup -> Download Model or set a manual override."
+            )
+
+        try:
+            self.query_one("#wcpp-model-status", Static).update(status)
+        except NoMatches:
+            pass
+
+    def _update_remote_status(self) -> None:
+        try:
+            mode = self._sel(
+                "sel-execution-mode", _db.get("tui.execution_mode") or "local"
+            )
+            if mode == "distributed" and self._remote_resources:
+                msg = (
+                    f"[cyan]Distributed:[/] "
+                    f"{summarize_remote_resources(self._remote_resources)}"
+                )
+            elif mode == "distributed":
+                msg = (
+                    "[yellow]Distributed mode selected but no remote resources "
+                    "configured.[/]"
+                )
+            else:
+                msg = "[dim]Local execution.[/]"
+            self.query_one("#remote-status", Static).update(msg)
+        except NoMatches:
+            pass
+
+    def _update_agent_config_status(self) -> None:
+        resolve_config = getattr(self, "_effective_agent_config", None)
+        if callable(resolve_config):
+            resolved = resolve_config()
+            if isinstance(resolved, tuple) and len(resolved) == 3:
+                model = str(resolved[0])
+                base_url = str(resolved[1])
+                api_key = str(resolved[2])
+            else:
+                model = ""
+                base_url = ""
+                api_key = ""
+        else:
+            model = (
+                _db.get(ENV_AGENT_MOD)
+                or _db.get(ENV_TRANS_MOD)
+                or os.environ.get(ENV_AGENT_MOD, "")
+                or os.environ.get(ENV_TRANS_MOD, "")
+            )
+            base_url = (
+                _db.get(ENV_AGENT_URL)
+                or _db.get(ENV_TRANS_URL)
+                or os.environ.get(ENV_AGENT_URL, "")
+                or os.environ.get(ENV_TRANS_URL, "")
+            )
+            api_key = (
+                _db.get(ENV_AGENT_KEY)
+                or _db.get(ENV_TRANS_KEY)
+                or os.environ.get(ENV_AGENT_KEY, "")
+                or os.environ.get(ENV_TRANS_KEY, "")
+            )
+
+        status = (
+            f"[dim]Effective agent model:[/] {model or '(missing)'}   "
+            f"[dim]base URL:[/] {base_url or '(missing)'}   "
+            f"[dim]API key:[/] {'set' if api_key else 'missing'}"
+        )
+        try:
+            self.query_one("#agent-config", Static).update(status)
+        except NoMatches:
+            pass
+
+    def _update_cmd_preview(self) -> None:
+        try:
+            active_worker = getattr(self, "_active_worker", None)
+            if active_worker is not None and getattr(
+                active_worker, "is_running", False
+            ):
+                return
+
+            build_cmd = getattr(self, "_build_cmd", None)
+            if not callable(build_cmd):
+                return
+
+            mode = self._sel(
+                "sel-execution-mode", _db.get("tui.execution_mode") or "local"
+            )
+            cmd = build_cmd()
+            if not isinstance(cmd, list):
+                return
+            display = " ".join(_mask(cmd[2:]))
+            if mode == "distributed" and self._remote_resources:
+                self._run_last_shell = (
+                    f"[dim]Distributed[/] [cyan]local + {len(self._remote_resources)} remote[/] · "
+                    f"{display}"
+                )
+            else:
+                self._run_last_shell = f"[dim]$[/dim] [cyan]vid_to_sub[/cyan] {display}"
+
+            refresh_live_panels = getattr(self, "_refresh_live_panels", None)
+            if callable(refresh_live_panels):
+                refresh_live_panels()
+        except ValueError as exc:
+            self._run_last_shell = f"[dim]{exc}[/]"
+            refresh_live_panels = getattr(self, "_refresh_live_panels", None)
+            if callable(refresh_live_panels):
+                refresh_live_panels()
+        except Exception:
+            pass
 
     # ── Settings ──────────────────────────────────────────────────────────
 
@@ -56,6 +272,12 @@ class SettingsMixin:
                 self.query_one(f"#{wid}", Input).value = _db.get(key)
             except NoMatches:
                 pass
+        try:
+            self.query_one("#sw-stg-translate-enabled", Switch).value = bool(
+                _db.get_setting(TUI_DEFAULT_TRANSLATE_ENABLED_KEY, True)
+            )
+        except NoMatches:
+            pass
         try:
             self.query_one("#stg-remote-resources", TextArea).text = _db.get(
                 "tui.remote_resources", "[]"
@@ -95,6 +317,12 @@ class SettingsMixin:
                     self.query_one(f"#{wid}", Input).value = val
             except NoMatches:
                 pass
+        try:
+            self.query_one("#sw-translate", Switch).value = bool(
+                _db.get_setting(TUI_DEFAULT_TRANSLATE_ENABLED_KEY, True)
+            )
+        except NoMatches:
+            pass
 
     def _sync_transcribe_overrides_from_settings(
         self,
@@ -144,6 +372,17 @@ class SettingsMixin:
                 continue
 
             widget.value = (updated_values.get(key) or "").strip()
+        try:
+            switch = self.query_one("#sw-translate", Switch)
+        except NoMatches:
+            switch = None
+        if switch is not None and (
+            updated_values.get(TUI_DEFAULT_TRANSLATE_ENABLED_KEY)
+            != previous_values.get(TUI_DEFAULT_TRANSLATE_ENABLED_KEY)
+        ):
+            switch.value = bool(
+                _db.get_setting(TUI_DEFAULT_TRANSLATE_ENABLED_KEY, True)
+            )
 
     def _save_settings(self) -> None:
         pairs = [
@@ -172,14 +411,22 @@ class SettingsMixin:
             except NoMatches:
                 pass
         try:
-            data["tui.remote_resources"] = self.query_one(
-                "#stg-remote-resources", TextArea
-            ).text.strip() or "[]"
+            data[TUI_DEFAULT_TRANSLATE_ENABLED_KEY] = (
+                "1"
+                if self.query_one("#sw-stg-translate-enabled", Switch).value
+                else "0"
+            )
+        except NoMatches:
+            pass
+        try:
+            data["tui.remote_resources"] = (
+                self.query_one("#stg-remote-resources", TextArea).text.strip() or "[]"
+            )
         except NoMatches:
             pass
         data["tui.execution_mode"] = self._sel("sel-execution-mode", "local")
         try:
-            parse_remote_resources(data.get("tui.remote_resources", "[]"))
+            _ = parse_remote_resources(data.get("tui.remote_resources", "[]"))
         except ValueError as exc:
             try:
                 self.query_one("#stg-status", Static).update(f"[red]✗ {exc}[/]")
@@ -187,6 +434,9 @@ class SettingsMixin:
                 pass
             return
         previous_values = {key: _db.get(key) for _, key in pairs}
+        previous_values[TUI_DEFAULT_TRANSLATE_ENABLED_KEY] = _db.get(
+            TUI_DEFAULT_TRANSLATE_ENABLED_KEY
+        )
         _db.set_many(data)
         self._apply_db_to_env()
         self._sync_transcribe_overrides_from_settings(previous_values, data)
@@ -248,6 +498,7 @@ class SettingsMixin:
         was set by shell or a previous .env load.
         """
         from vid_to_sub_app.shared.env import load_env_from_sqlite
+
         load_env_from_sqlite(_db.get_all, override=True)
 
     def _migrate_env_to_db(self) -> None:
@@ -258,12 +509,14 @@ class SettingsMixin:
         and .env is no longer automatically consulted.
         """
         from vid_to_sub_app.shared.env import import_env_file_to_sqlite
+
         import_env_file_to_sqlite(
             ENV_FILE,
             _db.set_many,
             _db.get_all,
             overwrite=False,
         )
+
     def _import_env_to_sqlite(self) -> None:
         """Import .env file into SQLite (overwrite=False: only fills blank keys).
 
@@ -271,6 +524,7 @@ class SettingsMixin:
         source of truth and .env is no longer consulted automatically.
         """
         from vid_to_sub_app.shared.env import import_env_file_to_sqlite
+
         if not ENV_FILE.exists():
             try:
                 self.query_one("#stg-status", Static).update(
@@ -304,7 +558,9 @@ class SettingsMixin:
         """Initialize the SSH connections DataTable columns."""
         try:
             table = self.query_one("#ssh-conn-table", DataTable)
-            table.add_columns("ID", "Label", "Host", "User", "Port", "Workdir", "Slots", "Enabled")
+            table.add_columns(
+                "ID", "Label", "Host", "User", "Port", "Workdir", "Slots", "Enabled"
+            )
         except (NoMatches, Exception):
             pass
 
@@ -328,7 +584,11 @@ class SettingsMixin:
                 "✔" if row.get("enabled", True) else "✘",
                 key=str(row.get("id", "")),
             )
-        hint = f"[dim]{len(connections)} connection(s)[/]" if connections else "[dim]No SSH connections configured[/]"
+        hint = (
+            f"[dim]{len(connections)} connection(s)[/]"
+            if connections
+            else "[dim]No SSH connections configured[/]"
+        )
         try:
             self.query_one("#ssh-conn-hint", Static).update(hint)
         except NoMatches:
@@ -350,7 +610,9 @@ class SettingsMixin:
             "env_json": self._val("ssh-env-json"),
         }
 
-    def _ssh_parse_json_field(self, value: str, field_name: str) -> dict[str, str] | None:
+    def _ssh_parse_json_field(
+        self, value: str, field_name: str
+    ) -> dict[str, str] | None:
         """Parse a JSON dict field from the SSH form. Returns None on error."""
         stripped = value.strip()
         if not stripped:
@@ -392,10 +654,17 @@ class SettingsMixin:
                 pass
         self._ssh_set_status("")
 
-    def _ssh_fill_form_from_row(self, row: dict) -> None:
+    def _ssh_fill_form_from_row(self, row: dict[str, object]) -> None:
         """Fill SSH form fields from a DB row dict."""
         import json as _json
-        self._ssh_selected_id = row.get("id")
+
+        raw_selected_id = row.get("id")
+        selected_id: int | None
+        if isinstance(raw_selected_id, int):
+            selected_id = raw_selected_id
+        else:
+            selected_id = None
+        self._ssh_selected_id = selected_id
         for wid, key, default in [
             ("ssh-label", "label", ""),
             ("ssh-host", "host", ""),
@@ -457,7 +726,9 @@ class SettingsMixin:
         self._refresh_ssh_table()
         self._load_remote_resources()
         self._update_remote_status()
-        self._ssh_set_status(f"[green]✓ Added connection: {form['label'] or form['host']}[/]")
+        self._ssh_set_status(
+            f"[green]✓ Added connection: {form['label'] or form['host']}[/]"
+        )
 
     def _ssh_update_connection(self) -> None:
         """Update the selected SSH connection with current form values."""
@@ -497,7 +768,9 @@ class SettingsMixin:
         self._refresh_ssh_table()
         self._load_remote_resources()
         self._update_remote_status()
-        self._ssh_set_status(f"[green]✓ Updated connection ID {self._ssh_selected_id}[/]")
+        self._ssh_set_status(
+            f"[green]✓ Updated connection ID {self._ssh_selected_id}[/]"
+        )
 
     def _ssh_delete_connection(self) -> None:
         if self._ssh_selected_id is None:

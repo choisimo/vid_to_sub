@@ -16,7 +16,12 @@ import sqlite3
 import threading
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any, cast
+
+if TYPE_CHECKING:
+    from vid_to_sub_app.cli.stage_artifact import StageArtifactMetadata
+else:
+    StageArtifactMetadata = dict[str, Any]
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
 DB_PATH = ROOT_DIR / "vid_to_sub.db"
@@ -44,7 +49,9 @@ CREATE TABLE IF NOT EXISTS jobs (
     error        TEXT,
     wall_sec     REAL,
     video_dur    REAL,
-    segments     INTEGER
+    segments     INTEGER,
+    artifact_path TEXT,
+    artifact_metadata TEXT
 );
 
 CREATE TABLE IF NOT EXISTS recent_paths (
@@ -105,6 +112,8 @@ ENV_KEYS = (
     "VID_TO_SUB_AGENT_MODEL",
 )
 
+TUI_DEFAULT_TRANSLATE_ENABLED_KEY = "tui.default_translate_enabled"
+
 _DEFAULT_SETTINGS: dict[str, str] = {
     # Environment variable settings
     "VID_TO_SUB_WHISPER_CPP_BIN": "",
@@ -128,6 +137,7 @@ _DEFAULT_SETTINGS: dict[str, str] = {
     "tui.default_device": "cpu",
     "tui.default_language": "",
     "tui.default_output_dir": "",
+    TUI_DEFAULT_TRANSLATE_ENABLED_KEY: "1",
     "tui.default_translate_to": "ko",
     "tui.default_formats": '["srt"]',
     "tui.execution_mode": "local",
@@ -157,7 +167,59 @@ class Database:
 
     def _init_schema(self) -> None:
         self._conn().executescript(_SCHEMA)
-        self._conn().commit()
+        # Backward-safe column additions for existing databases
+        for stmt in (
+            "ALTER TABLE jobs ADD COLUMN artifact_path TEXT",
+            "ALTER TABLE jobs ADD COLUMN artifact_metadata TEXT",
+        ):
+            try:
+                self._conn().execute(stmt)
+                self._conn().commit()
+            except Exception:
+                pass  # column already exists
+
+    def _normalize_artifact_metadata(
+        self,
+        raw_metadata: Any,
+        artifact_path: str | None,
+    ) -> StageArtifactMetadata | None:
+        metadata: StageArtifactMetadata | None = None
+        if isinstance(raw_metadata, str) and raw_metadata.strip():
+            try:
+                decoded = json.loads(raw_metadata)
+            except json.JSONDecodeError:
+                decoded = None
+            if isinstance(decoded, dict):
+                metadata = cast(
+                    StageArtifactMetadata,
+                    cast(
+                        object,
+                        {
+                            str(key): value
+                            for key, value in decoded.items()
+                            if isinstance(key, str)
+                        },
+                    ),
+                )
+        elif isinstance(raw_metadata, dict):
+            metadata = cast(
+                StageArtifactMetadata,
+                cast(
+                    object,
+                    {
+                        str(key): value
+                        for key, value in raw_metadata.items()
+                        if isinstance(key, str)
+                    },
+                ),
+            )
+
+        resolved_path = str(artifact_path or "").strip()
+        if metadata is None:
+            return {"path": resolved_path} if resolved_path else None
+        if resolved_path and not str(metadata.get("path") or "").strip():
+            metadata["path"] = resolved_path
+        return metadata or None
 
     # ── Settings ──────────────────────────────────────────────────────────
 
@@ -169,11 +231,29 @@ class Database:
         )
         return row["value"] if row else default
 
+    def get_setting(self, key: str, default: str | bool = "") -> str | bool:
+        row = (
+            self._conn()
+            .execute("SELECT value FROM settings WHERE key=?", (key,))
+            .fetchone()
+        )
+        if row is None:
+            return default
+        if isinstance(default, bool):
+            return row["value"] == "1"
+        return row["value"]
+
     def set(self, key: str, value: str) -> None:
         self._conn().execute(
             "INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)", (key, value)
         )
         self._conn().commit()
+
+    def set_setting(self, key: str, value: str | bool) -> None:
+        if isinstance(value, bool):
+            self.set(key, "1" if value else "0")
+            return
+        self.set(key, value)
 
     def get_all(self) -> dict[str, str]:
         rows = self._conn().execute("SELECT key,value FROM settings").fetchall()
@@ -224,7 +304,10 @@ class Database:
             ),
         )
         self._conn().commit()
-        return cur.lastrowid  # type: ignore[return-value]
+        job_id = cur.lastrowid
+        if job_id is None:
+            raise RuntimeError("Failed to create job row")
+        return int(job_id)
 
     def finish_job(
         self,
@@ -235,10 +318,13 @@ class Database:
         wall_sec: float | None = None,
         video_dur: float | None = None,
         segments: int | None = None,
+        artifact_path: str | None = None,
+        artifact_metadata: StageArtifactMetadata | dict[str, Any] | None = None,
     ) -> None:
         self._conn().execute(
             """UPDATE jobs
-               SET status=?,output_paths=?,error=?,wall_sec=?,video_dur=?,segments=?
+               SET status=?,output_paths=?,error=?,wall_sec=?,video_dur=?,segments=?,
+                   artifact_path=?,artifact_metadata=?
                WHERE id=?""",
             (
                 status,
@@ -247,6 +333,10 @@ class Database:
                 wall_sec,
                 video_dur,
                 segments,
+                artifact_path,
+                json.dumps(artifact_metadata)
+                if artifact_metadata is not None
+                else None,
                 job_id,
             ),
         )
@@ -258,7 +348,18 @@ class Database:
             .execute("SELECT * FROM jobs ORDER BY created_at DESC LIMIT ?", (limit,))
             .fetchall()
         )
-        return [dict(r) for r in rows]
+        normalized_rows: list[dict[str, Any]] = []
+        for row in rows:
+            item = dict(row)
+            metadata = self._normalize_artifact_metadata(
+                item.get("artifact_metadata"),
+                item.get("artifact_path"),
+            )
+            item["artifact_metadata"] = metadata
+            if not item.get("artifact_path") and metadata is not None:
+                item["artifact_path"] = metadata.get("path")
+            normalized_rows.append(item)
+        return normalized_rows
 
     def delete_job(self, job_id: int) -> None:
         self._conn().execute("DELETE FROM jobs WHERE id=?", (job_id,))
@@ -417,7 +518,10 @@ class Database:
             ),
         )
         self._conn().commit()
-        return cur.lastrowid  # type: ignore[return-value]
+        conn_id = cur.lastrowid
+        if conn_id is None:
+            raise RuntimeError("Failed to create SSH connection row")
+        return int(conn_id)
 
     def update_ssh_connection(
         self,
@@ -451,7 +555,11 @@ class Database:
         _add("user", user, str.strip if user is not None else None)
         _add("port", port, lambda p: max(1, int(p)))
         _add("key_path", key_path, str.strip if key_path is not None else None)
-        _add("remote_workdir", remote_workdir, str.strip if remote_workdir is not None else None)
+        _add(
+            "remote_workdir",
+            remote_workdir,
+            str.strip if remote_workdir is not None else None,
+        )
         _add("python_bin", python_bin, lambda p: p.strip() or "python3")
         _add("script_path", script_path, str.strip if script_path is not None else None)
         _add("slots", slots, lambda s: max(1, int(s)))
@@ -481,16 +589,26 @@ class Database:
         self._conn().execute("DELETE FROM ssh_connections WHERE id=?", (conn_id,))
         self._conn().commit()
 
-    def get_ssh_connections(self, *, enabled_only: bool = False) -> list[dict[str, Any]]:
+    def get_ssh_connections(
+        self, *, enabled_only: bool = False
+    ) -> list[dict[str, Any]]:
         """Return all SSH connection profiles, newest first."""
         if enabled_only:
-            rows = self._conn().execute(
-                "SELECT * FROM ssh_connections WHERE enabled=1 ORDER BY label, id",
-            ).fetchall()
+            rows = (
+                self._conn()
+                .execute(
+                    "SELECT * FROM ssh_connections WHERE enabled=1 ORDER BY label, id",
+                )
+                .fetchall()
+            )
         else:
-            rows = self._conn().execute(
-                "SELECT * FROM ssh_connections ORDER BY label, id",
-            ).fetchall()
+            rows = (
+                self._conn()
+                .execute(
+                    "SELECT * FROM ssh_connections ORDER BY label, id",
+                )
+                .fetchall()
+            )
         result = []
         for r in rows:
             row = dict(r)
@@ -505,9 +623,11 @@ class Database:
         return result
 
     def get_ssh_connection(self, conn_id: int) -> dict[str, Any] | None:
-        row = self._conn().execute(
-            "SELECT * FROM ssh_connections WHERE id=?", (conn_id,)
-        ).fetchone()
+        row = (
+            self._conn()
+            .execute("SELECT * FROM ssh_connections WHERE id=?", (conn_id,))
+            .fetchone()
+        )
         if row is None:
             return None
         result = dict(row)
@@ -518,4 +638,3 @@ class Database:
             except (json.JSONDecodeError, TypeError):
                 result[field] = {}
         return result
-

@@ -34,7 +34,7 @@
 - 별도 모델/API 설정이 가능한 후처리 교정 agent
 - `auto` 모드에서 웹 검색/MCP 도구가 가능하면 참조 교정을 시도하고, 불가능하면 문맥 기반으로 자연스럽게 다듬는 후처리
 - 번역 시 원본 자막의 타임스탬프 경계 유지
-- Browse / Setup / Transcribe / History / Settings / Agent 로 구성된 6탭 TUI
+- Browse / Setup / Transcribe / History / Settings / Agent / Logs 로 구성된 7탭 TUI
 - SQLite 기반 설정 저장 및 실행 이력 관리
 - SSH 리소스 프로필 기반 분산 실행
 
@@ -141,7 +141,7 @@ python tui.py
 - `Ctrl+D` 드라이런
 - `Ctrl+K` 중지
 - `Ctrl+S` 설정 저장
-- `1` 부터 `6`까지 탭 이동
+- `1` 부터 `7`까지 탭 이동
 - `Ctrl+Q` 종료
 
 ## 자주 쓰는 CLI 예시

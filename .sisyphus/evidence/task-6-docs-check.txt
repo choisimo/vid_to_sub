@@ -1,0 +1,7 @@
+Command: python -m unittest tests.test_tui_logs_tab
+Result: PASS
+Details:
+- Ran 13 tests in 14.392s
+- Exit status 0
+- `README.md` and `README.ko.md` were limited to tab-count and shortcut corrections only
+- Existing ResourceWarning noise from sqlite/textual internals still appeared during the mounted TUI tests, but there were no failures or tracebacks
