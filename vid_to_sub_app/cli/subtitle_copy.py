@@ -65,7 +65,15 @@ def bulk_copy_subtitles(
         for src in paths:
             stem = src.stem
             suffix = src.suffix
+```python
             count = used_names.get(src.name, 0)
+            dest_name = src.name if count == 0 else f"{stem} ({count}){suffix}"
+            # Avoid overwriting existing files in the destination folder
+            while (destination_dir / dest_name).exists():
+                count += 1
+                dest_name = f"{stem} ({count}){suffix}"
+            used_names[src.name] = count + 1
+            dest = destination_dir / dest_name
             if count == 0:
                 dest_name = src.name
             else:
