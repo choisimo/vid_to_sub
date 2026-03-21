@@ -153,6 +153,8 @@ def _process_one_inline(
                 translation_base_url=args.translation_base_url,
                 translation_api_key=args.translation_api_key,
                 source_language=info.get("language"),
+                chunk_size=max(1, int(getattr(args, "translation_chunk_size", 100))),
+                translation_mode=getattr(args, "translation_mode", "strict"),
             )
             if getattr(args, "postprocess_translation", False):
                 translated_segments, _ = (
@@ -458,28 +460,28 @@ def run_stage2(artifact_path: Path, args: argparse.Namespace) -> ProcessResult:
             .exists()
         ]
         if existing_outputs:
-            return ProcessResult(
-                success=True,
-                video_path=str(source_path),
-                folder_hash=folder_hash,
-                folder_path=folder_path,
-                worker_id=0,
-                elapsed_sec=round(time.monotonic() - started_at, 3),
-                language=artifact.get("language"),
-                output_paths=[
-                    str(
-                        Path(str(p)).with_name(
-                            Path(str(p)).stem
-                            + f".{target_language}"
-                            + Path(str(p)).suffix
-                        )
-                    )
-                    for p in (artifact.get("primary_outputs") or [])
-                ],
-                segments=len(artifact["segments"]),
-                artifact_path=str(artifact_path),
-                artifact_metadata=artifact_metadata,
-            )
+            # idempotency: ALL expected translated outputs must exist, not just any.
+            expected_translated = [
+                Path(str(p)).with_name(
+                    Path(str(p)).stem + f".{target_language}" + Path(str(p)).suffix
+                )
+                for p in (artifact.get("primary_outputs") or [])
+            ]
+            all_exist = expected_translated and all(ep.exists() for ep in expected_translated)
+            if all_exist:
+                return ProcessResult(
+                    success=True,
+                    video_path=str(source_path),
+                    folder_hash=folder_hash,
+                    folder_path=folder_path,
+                    worker_id=0,
+                    elapsed_sec=round(time.monotonic() - started_at, 3),
+                    language=artifact.get("language"),
+                    output_paths=[str(ep) for ep in expected_translated],
+                    segments=len(artifact["segments"]),
+                    artifact_path=str(artifact_path),
+                    artifact_metadata=artifact_metadata,
+                )
 
     try:
         translated_segments, translation_info = translate_segments_openai_compatible(
@@ -489,6 +491,8 @@ def run_stage2(artifact_path: Path, args: argparse.Namespace) -> ProcessResult:
             translation_base_url=args.translation_base_url,
             translation_api_key=args.translation_api_key,
             source_language=artifact.get("language"),
+            chunk_size=max(1, int(getattr(args, "translation_chunk_size", 100))),
+            translation_mode=getattr(args, "translation_mode", "strict"),
         )
         if args.postprocess_translation:
             translated_segments, postprocess_info = (

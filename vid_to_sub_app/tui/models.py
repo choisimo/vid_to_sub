@@ -232,6 +232,8 @@ class RunConfig:
     translation_model: str | None
     translation_base_url: str | None
     translation_api_key: str | None
+    translation_chunk_size: int
+    translation_mode: str
     postprocess_enabled: bool
     postprocess_mode: str
     postprocess_model: str | None

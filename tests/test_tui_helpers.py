@@ -364,6 +364,8 @@ class TuiHelperTests(unittest.TestCase):
                 translation_model=None,
                 translation_base_url=None,
                 translation_api_key=None,
+                translation_chunk_size=100,
+                translation_mode="strict",
                 postprocess_enabled=False,
                 postprocess_mode="auto",
                 postprocess_model=None,
@@ -406,6 +408,8 @@ class TuiHelperTests(unittest.TestCase):
             translation_model="gpt-4.1-mini",
             translation_base_url="https://example.com/v1",
             translation_api_key="secret",
+            translation_chunk_size=100,
+            translation_mode="strict",
             postprocess_enabled=True,
             postprocess_mode="web_lookup",
             postprocess_model="gpt-4.1",
@@ -484,6 +488,8 @@ class TuiHelperTests(unittest.TestCase):
             translation_model=None,
             translation_base_url="https://translate.example/v1",
             translation_api_key="key",
+            translation_chunk_size=100,
+            translation_mode="strict",
             postprocess_enabled=False,
             postprocess_mode="auto",
             postprocess_model=None,
@@ -2142,6 +2148,205 @@ class TestHistoryTranslateHelpers(unittest.TestCase):
             self.assertNotEqual("video.srt", dest.name)
             self.assertIn(dest.name, existing)
 
+
+class TestSaveSettingsCharacterization(unittest.TestCase):
+    """PR0 characterization tests: freeze _save_settings() seams before PR1 refactor.
+
+    These tests verify:
+    - widget values are collected and persisted via db.set_many
+    - invalid remote JSON aborts _before_ any db write
+    - the full fan-out sequence fires after a valid save
+    """
+
+    def _make_widgets(self, *, remote_json: str = "[]") -> dict:
+        return {
+            "#stg-wcpp-bin": SimpleNamespace(value="/bin/whisper-cli"),
+            "#stg-wcpp-model": SimpleNamespace(value="large-v3"),
+            "#stg-trans-url": SimpleNamespace(value="https://t.example/v1"),
+            "#stg-trans-key": SimpleNamespace(value="tkey"),
+            "#stg-trans-model": SimpleNamespace(value="tmodel"),
+            "#stg-post-url": SimpleNamespace(value=""),
+            "#stg-post-key": SimpleNamespace(value=""),
+            "#stg-post-model": SimpleNamespace(value=""),
+            "#stg-agent-url": SimpleNamespace(value=""),
+            "#stg-agent-key": SimpleNamespace(value=""),
+            "#stg-agent-model": SimpleNamespace(value=""),
+            "#stg-build-dir": SimpleNamespace(value=""),
+            "#stg-install-dir": SimpleNamespace(value=""),
+            "#stg-model-dir": SimpleNamespace(value=""),
+            "#stg-browse-root": SimpleNamespace(value=""),
+            "#stg-default-output-dir": SimpleNamespace(value="/out"),
+            "#stg-default-translate-to": SimpleNamespace(value="ko"),
+            "#sw-stg-translate-enabled": SimpleNamespace(value=True),
+            "#stg-remote-resources": SimpleNamespace(text=remote_json),
+            "#sel-execution-mode": SimpleNamespace(value="local"),
+            "#stg-status": SimpleNamespace(update=lambda _: None),
+            # transcribe-tab widgets (synced after save)
+            "#inp-trans-url": SimpleNamespace(value=""),
+            "#inp-trans-key": SimpleNamespace(value=""),
+            "#inp-trans-model": SimpleNamespace(value=""),
+            "#inp-post-url": SimpleNamespace(value=""),
+            "#inp-post-key": SimpleNamespace(value=""),
+            "#inp-post-model": SimpleNamespace(value=""),
+            "#inp-wcpp-bin": SimpleNamespace(value=""),
+            "#inp-output-dir": SimpleNamespace(value=""),
+            "#inp-translate-to": SimpleNamespace(value=""),
+            "#sw-translate": SimpleNamespace(value=False),
+        }
+
+    def test_save_settings_persists_widget_values_to_db(self) -> None:
+        """_save_settings() must call db.set_many with the values read from the form."""
+        from vid_to_sub_app.tui.mixins import settings_mixin
+
+        app = VidToSubApp()
+        widgets = self._make_widgets()
+
+        def query_one(selector: str, *_args):
+            if selector in widgets:
+                return widgets[selector]
+            raise NoMatches(selector)
+
+        saved: list[dict] = []
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            temp_db = Database(Path(tmpdir) / "state.db")
+
+            original_set_many = temp_db.set_many
+
+            def capturing_set_many(data: dict) -> None:
+                saved.append(dict(data))
+                original_set_many(data)
+
+            temp_db.set_many = capturing_set_many  # type: ignore[method-assign]
+
+            with (
+                patch.object(settings_mixin, "_db", temp_db),
+                patch.object(app, "query_one", side_effect=query_one),
+                patch.object(app, "_apply_db_to_env", return_value=None),
+                patch.object(app, "_sync_transcribe_overrides_from_settings", return_value=None),
+                patch.object(app, "_sync_run_defaults_from_settings", return_value=None),
+                patch.object(app, "_load_remote_resources", return_value=None),
+                patch.object(app, "_run_detection", return_value=None),
+                patch.object(app, "_update_wcpp_model_status", return_value=None),
+                patch.object(app, "_update_remote_status", return_value=None),
+                patch.object(app, "_update_agent_config_status", return_value=None),
+                patch.object(app, "_update_cmd_preview", return_value=None),
+            ):
+                app._save_settings()
+
+        self.assertEqual(1, len(saved), "db.set_many should be called exactly once")
+        payload = saved[0]
+        self.assertIn("tui.default_translate_to", payload)
+        self.assertEqual("ko", payload["tui.default_translate_to"])
+        self.assertIn("tui.default_output_dir", payload)
+        self.assertEqual("/out", payload["tui.default_output_dir"])
+        # translate enabled flag
+        from vid_to_sub_app.db import TUI_DEFAULT_TRANSLATE_ENABLED_KEY
+        self.assertIn(TUI_DEFAULT_TRANSLATE_ENABLED_KEY, payload)
+        self.assertEqual("1", payload[TUI_DEFAULT_TRANSLATE_ENABLED_KEY])
+
+    def test_save_settings_invalid_remote_json_aborts_before_db_write(self) -> None:
+        """_save_settings() must reject invalid remote JSON without touching the DB."""
+        from vid_to_sub_app.tui.mixins import settings_mixin
+
+        app = VidToSubApp()
+        widgets = self._make_widgets(remote_json="not valid json")
+
+        def query_one(selector: str, *_args):
+            if selector in widgets:
+                return widgets[selector]
+            raise NoMatches(selector)
+
+        write_count = 0
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            temp_db = Database(Path(tmpdir) / "state.db")
+
+            original_set_many = temp_db.set_many
+
+            def counting_set_many(data: dict) -> None:
+                nonlocal write_count
+                write_count += 1
+                original_set_many(data)
+
+            temp_db.set_many = counting_set_many  # type: ignore[method-assign]
+
+            with (
+                patch.object(settings_mixin, "_db", temp_db),
+                patch.object(app, "query_one", side_effect=query_one),
+                patch.object(app, "_apply_db_to_env", return_value=None),
+            ):
+                app._save_settings()
+
+        self.assertEqual(0, write_count, "Invalid remote JSON must prevent any db write")
+
+    def test_save_settings_fan_out_order(self) -> None:
+        """After a valid save, _save_settings() must call all six update helpers.
+
+        These calls must fire so that settings UI status widgets refresh correctly
+        after every save. This test locks in the fan-out contract before PR1.
+        """
+        from vid_to_sub_app.tui.mixins import settings_mixin
+
+        app = VidToSubApp()
+        widgets = self._make_widgets()
+
+        def query_one(selector: str, *_args):
+            if selector in widgets:
+                return widgets[selector]
+            raise NoMatches(selector)
+
+        fan_out_calls: list[str] = []
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            temp_db = Database(Path(tmpdir) / "state.db")
+
+            with (
+                patch.object(settings_mixin, "_db", temp_db),
+                patch.object(app, "query_one", side_effect=query_one),
+                patch.object(app, "_apply_db_to_env", return_value=None),
+                patch.object(app, "_sync_transcribe_overrides_from_settings", return_value=None),
+                patch.object(app, "_sync_run_defaults_from_settings", return_value=None),
+                patch.object(
+                    app, "_load_remote_resources",
+                    side_effect=lambda: fan_out_calls.append("_load_remote_resources"),
+                ),
+                patch.object(
+                    app, "_run_detection",
+                    side_effect=lambda: fan_out_calls.append("_run_detection"),
+                ),
+                patch.object(
+                    app, "_update_wcpp_model_status",
+                    side_effect=lambda: fan_out_calls.append("_update_wcpp_model_status"),
+                ),
+                patch.object(
+                    app, "_update_remote_status",
+                    side_effect=lambda: fan_out_calls.append("_update_remote_status"),
+                ),
+                patch.object(
+                    app, "_update_agent_config_status",
+                    side_effect=lambda: fan_out_calls.append("_update_agent_config_status"),
+                ),
+                patch.object(
+                    app, "_update_cmd_preview",
+                    side_effect=lambda: fan_out_calls.append("_update_cmd_preview"),
+                ),
+            ):
+                app._save_settings()
+
+        expected = {
+            "_load_remote_resources",
+            "_run_detection",
+            "_update_wcpp_model_status",
+            "_update_remote_status",
+            "_update_agent_config_status",
+            "_update_cmd_preview",
+        }
+        self.assertEqual(
+            expected,
+            set(fan_out_calls),
+            f"fan-out helpers missing or extra: got {fan_out_calls}",
+        )
 
 if __name__ == "__main__":
     unittest.main()
