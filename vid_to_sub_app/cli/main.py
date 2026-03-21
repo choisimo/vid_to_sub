@@ -14,6 +14,7 @@ from vid_to_sub_app.shared.constants import (
     ENV_TRANSLATION_API_KEY,
     ENV_TRANSLATION_BASE_URL,
     ENV_TRANSLATION_MODEL,
+    TRANSLATION_MODES,
     ENV_WHISPER_CPP_MODEL,
     KNOWN_MODELS,
     SUPPORTED_FORMATS,
@@ -104,6 +105,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--translation-model", default=None, metavar="MODEL", help="Model name for the translation API. Falls back to VID_TO_SUB_TRANSLATION_MODEL env var.")
     parser.add_argument("--translation-base-url", default=None, metavar="URL", help="Base URL for the OpenAI-compatible translation API (e.g. https://host/v1).")
     parser.add_argument("--translation-api-key", default=None, metavar="KEY", help="Bearer token for the translation API. Falls back to VID_TO_SUB_TRANSLATION_API_KEY.")
+    parser.add_argument("--translation-chunk-size", type=int, default=100, metavar="N")
+    parser.add_argument(
+        "--translation-mode",
+        choices=TRANSLATION_MODES,
+        default="strict",
+        metavar="MODE",
+        help="Translation contract mode. 'strict' fails on malformed batches; 'best-effort' retries smaller batches before giving up.",
+    )
     parser.add_argument("--postprocess-translation", action="store_true", default=False, help="Run a second agent pass to correct and polish the translated subtitles.")
     parser.add_argument(
         "--postprocess-mode",
@@ -295,6 +304,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     output_dir = Path(args.output_dir).resolve() if args.output_dir else None
 
     args.workers = max(1, int(args.workers))
+    args.translation_chunk_size = max(1, int(args.translation_chunk_size))
     if args.backend_threads is None:
         args.backend_threads = resolve_runtime_backend_threads(
             args.backend,
