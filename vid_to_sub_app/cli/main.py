@@ -266,8 +266,15 @@ def main(argv: Optional[list[str]] = None) -> int:
         )
 
     if args.stage1_only and args.translate_to:
-        print("[WARN] --stage1-only ignores --translate-to.", file=sys.stderr)
-        args.translate_to = None
+        # Keep args.translate_to so run_stage1() records target_lang in the artifact.
+        # Stage1-only never executes translation — the artifact carries the intent
+        # forward so a later --translate-from-artifact run can proceed without
+        # the user needing to re-specify --translate-to.
+        print(
+            "[INFO] --stage1-only: translation will not run now; "
+            "target_lang recorded in artifact for later stage-2 replay.",
+            file=sys.stderr,
+        )
 
     if args.translate_from_artifact and not args.translate_to:
         try:

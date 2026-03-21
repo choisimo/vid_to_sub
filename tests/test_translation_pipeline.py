@@ -2146,3 +2146,281 @@ class TestLegacyInlineRollback(unittest.TestCase):
             self.assertIsNone(
                 result.artifact_path, "Legacy inline result must have no artifact_path"
             )
+
+
+class TestParallelLoopEventParity(unittest.TestCase):
+    """PR0 characterization tests: freeze job_finished/folder_finished event payloads.
+
+    Both _run_stage1_parallel (main.py) and run_parallel (runner.py) emit the same
+    event types. This test locks in the set of keys emitted by each loop so that
+    PR6 (CLI orchestration centralization) cannot silently drop fields that the TUI
+    consumes.
+    """
+
+    _REQUIRED_JOB_FINISHED_KEYS = frozenset(
+        {
+            "video_path",
+            "worker_id",
+            "status",
+            "stage",
+            "error",
+            "elapsed_sec",
+            "language",
+            "video_duration",
+            "output_paths",
+            "segments",
+            "artifact_path",
+            "artifact_metadata",
+            "folder_hash",
+            "folder_path",
+            "folder_total_files",
+            "folder_completed_files",
+            "folder_status",
+            "folder_completed",
+        }
+    )
+
+    _REQUIRED_FOLDER_FINISHED_KEYS = frozenset(
+        {
+            "folder_hash",
+            "folder_path",
+            "total_files",
+            "folder_total_files",
+            "folder_completed_files",
+            "folder_status",
+            "folder_completed",
+        }
+    )
+
+    def _capture_events(
+        self,
+        run_fn,  # _run_stage1_parallel or run_parallel
+        args: argparse.Namespace,
+        manifest: dict,
+    ) -> tuple[list[dict], list[dict]]:
+        """Run run_fn and collect emitted events, returning (job_events, folder_events)."""
+        from vid_to_sub_app.shared.constants import EVENT_PREFIX
+        import sys
+
+        job_events: list[dict] = []
+        folder_events: list[dict] = []
+
+        def capture_stdout(line: str) -> None:
+            line = line.strip()
+            if not line.startswith(EVENT_PREFIX):
+                return
+            try:
+                payload = json.loads(line[len(EVENT_PREFIX):])
+            except json.JSONDecodeError:
+                return
+            if payload.get("event") == "job_finished":
+                job_events.append(payload)
+            elif payload.get("event") == "folder_finished":
+                folder_events.append(payload)
+
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            run_fn(manifest, args, frozenset({"srt"}), None)
+
+        for line in buf.getvalue().splitlines():
+            capture_stdout(line)
+
+        return job_events, folder_events
+
+    def _make_args(self, tmpdir: Path) -> argparse.Namespace:
+        from vid_to_sub_app.cli.main import build_parser
+
+        parser = build_parser()
+        args = parser.parse_args(
+            [
+                str(tmpdir),
+                "--stage1-only",
+                "--translate-to", "ko",
+                "--workers", "1",
+                "--backend-threads", "2",
+            ]
+        )
+        return args
+
+    def _make_manifest_and_video(self, tmpdir: Path) -> tuple[dict, Path]:
+        """Create one fake video and a corresponding run manifest."""
+        video = tmpdir / "clip.mp4"
+        video.write_bytes(b"fake")
+        manifest = {
+            "version": 1,
+            "entries": [
+                {
+                    "video_path": str(video),
+                    "folder_path": str(tmpdir),
+                    "folder_hash": "abc123",
+                }
+            ],
+        }
+        return manifest, video
+
+    def _run_stage1_parallel_via_import(self, manifest, args, formats, output_dir):
+        from vid_to_sub_app.cli.main import _run_stage1_parallel
+        return _run_stage1_parallel(manifest, args, formats, output_dir)
+
+    def _run_parallel_via_import(self, manifest, args, formats, output_dir):
+        from vid_to_sub_app.cli.runner import run_parallel
+        return run_parallel(manifest, args, formats, output_dir)
+
+    def _fake_run_stage1(self, task, args, formats, output_dir, backend_threads, worker_id):
+        """Minimal stub: returns a successful ProcessResult without actual transcription."""
+        fake_srt = Path(str(task["folder_path"])) / "clip.srt"
+        fake_srt.write_text("1\n00:00:00,000 --> 00:00:01,000\nHi", encoding="utf-8")
+        return ProcessResult(
+            success=True,
+            video_path=str(task["video_path"]),
+            folder_hash=str(task["folder_hash"]),
+            folder_path=str(task["folder_path"]),
+            worker_id=worker_id,
+            stage="stage1",
+            output_paths=[str(fake_srt)],
+        )
+
+    def _fake_process_one(self, task, args, formats, output_dir, backend_threads, worker_id):
+        """Minimal stub: returns a successful ProcessResult without actual transcription."""
+        fake_srt = Path(str(task["folder_path"])) / "clip.srt"
+        fake_srt.write_text("1\n00:00:00,000 --> 00:00:01,000\nHi", encoding="utf-8")
+        return ProcessResult(
+            success=True,
+            video_path=str(task["video_path"]),
+            folder_hash=str(task["folder_hash"]),
+            folder_path=str(task["folder_path"]),
+            worker_id=worker_id,
+            stage="full",
+            output_paths=[str(fake_srt)],
+        )
+
+    def test_run_stage1_parallel_emits_required_job_finished_keys(self) -> None:
+        """_run_stage1_parallel must emit job_finished events with all required fields.
+
+        Locks in the event contract before PR6 consolidates the two worker loops.
+        """
+        from vid_to_sub_app.cli import manifest as manifest_mod
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            td = Path(tmpdir)
+            args = self._make_args(td)
+            manifest, _ = self._make_manifest_and_video(td)
+
+            with (
+                patch("vid_to_sub_app.cli.main.run_stage1", side_effect=self._fake_run_stage1),
+                patch("vid_to_sub_app.cli.manifest.persist_folder_manifest_state"),
+            ):
+                job_events, folder_events = self._capture_events(
+                    self._run_stage1_parallel_via_import, args, manifest
+                )
+
+        self.assertEqual(1, len(job_events), "expected exactly one job_finished event")
+        job = job_events[0]
+        missing = self._REQUIRED_JOB_FINISHED_KEYS - set(job.keys())
+        self.assertEqual(
+            set(), missing,
+            f"job_finished event missing required keys: {missing}",
+        )
+
+        # folder_finished should also fire when the single folder completes
+        self.assertGreaterEqual(len(folder_events), 1, "expected at least one folder_finished event")
+        folder = folder_events[0]
+        missing_f = self._REQUIRED_FOLDER_FINISHED_KEYS - set(folder.keys())
+        self.assertEqual(
+            set(), missing_f,
+            f"folder_finished event missing required keys: {missing_f}",
+        )
+
+    def test_run_parallel_emits_required_job_finished_keys(self) -> None:
+        """run_parallel must emit job_finished events with all required fields.
+
+        The set of emitted keys must be compatible with what _run_stage1_parallel
+        emits, since both are consumed by the TUI progress machinery.
+        """
+        from vid_to_sub_app.cli import manifest as manifest_mod
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            td = Path(tmpdir)
+            args = self._make_args(td)
+            # run_parallel takes a full run, not stage1-only, so remove stage1-only
+            args.stage1_only = False
+            manifest, _ = self._make_manifest_and_video(td)
+
+            with (
+                patch("vid_to_sub_app.cli.runner.process_one", side_effect=self._fake_process_one),
+                patch("vid_to_sub_app.cli.manifest.persist_folder_manifest_state"),
+            ):
+                job_events, folder_events = self._capture_events(
+                    self._run_parallel_via_import, args, manifest
+                )
+
+        self.assertEqual(1, len(job_events), "expected exactly one job_finished event")
+        job = job_events[0]
+        missing = self._REQUIRED_JOB_FINISHED_KEYS - set(job.keys())
+        self.assertEqual(
+            set(), missing,
+            f"job_finished event missing required keys: {missing}",
+        )
+
+        self.assertGreaterEqual(len(folder_events), 1, "expected at least one folder_finished event")
+        folder = folder_events[0]
+        missing_f = self._REQUIRED_FOLDER_FINISHED_KEYS - set(folder.keys())
+        self.assertEqual(
+            set(), missing_f,
+            f"folder_finished event missing required keys: {missing_f}",
+        )
+
+    def test_run_stage1_parallel_and_run_parallel_emit_same_job_finished_keys(self) -> None:
+        """Parity contract: both loops must emit an identical set of job_finished keys.
+
+        This is the core guard for PR6: centralizing the worker loop must not silently
+        drop any key that the other loop emits.
+        """
+        from vid_to_sub_app.cli import manifest as manifest_mod
+
+        with tempfile.TemporaryDirectory() as tmpdir1:
+            td1 = Path(tmpdir1)
+            args1 = self._make_args(td1)
+            manifest1, _ = self._make_manifest_and_video(td1)
+
+            with (
+                patch("vid_to_sub_app.cli.main.run_stage1", side_effect=self._fake_run_stage1),
+                patch("vid_to_sub_app.cli.manifest.persist_folder_manifest_state"),
+            ):
+                job_events_s1, _ = self._capture_events(
+                    self._run_stage1_parallel_via_import, args1, manifest1
+                )
+
+        with tempfile.TemporaryDirectory() as tmpdir2:
+            td2 = Path(tmpdir2)
+            args2 = self._make_args(td2)
+            args2.stage1_only = False
+            manifest2, _ = self._make_manifest_and_video(td2)
+
+            with (
+                patch("vid_to_sub_app.cli.runner.process_one", side_effect=self._fake_process_one),
+                patch("vid_to_sub_app.cli.manifest.persist_folder_manifest_state"),
+            ):
+                job_events_par, _ = self._capture_events(
+                    self._run_parallel_via_import, args2, manifest2
+                )
+
+        self.assertTrue(job_events_s1, "_run_stage1_parallel emitted no job_finished events")
+        self.assertTrue(job_events_par, "run_parallel emitted no job_finished events")
+
+        keys_s1 = set(job_events_s1[0].keys())
+        keys_par = set(job_events_par[0].keys())
+
+        only_in_stage1 = keys_s1 - keys_par
+        only_in_parallel = keys_par - keys_s1
+
+        self.assertEqual(
+            set(),
+            only_in_stage1,
+            f"Keys only in _run_stage1_parallel job_finished (not in run_parallel): {only_in_stage1}",
+        )
+        self.assertEqual(
+            set(),
+            only_in_parallel,
+            f"Keys only in run_parallel job_finished (not in _run_stage1_parallel): {only_in_parallel}",
+        )
