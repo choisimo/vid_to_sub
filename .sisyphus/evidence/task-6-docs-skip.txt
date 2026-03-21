@@ -1,6 +1,0 @@
-Verification: grep README files for stale tab-count and shortcut wording
-Result: PASS
-Details:
-- `README.md` previously contained the verified outdated text (`A 6-tab Textual TUI`, `1` to `6` switch tabs) and was updated
-- `README.ko.md` previously contained the verified outdated text (`Browse / Setup / Transcribe / History / Settings / Agent 로 구성된 6탭 TUI`, ``1` 부터 `6`까지 탭 이동`) and was updated
-- Post-edit grep found no remaining matches for the stale 6-tab / `1`-to-`6` wording

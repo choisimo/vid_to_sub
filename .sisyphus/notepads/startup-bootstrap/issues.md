@@ -1,3 +1,0 @@
-- 2026-03-20: TUI startup now relies on the existing `tui.py` bootstrap call that passes only `("base",)` into `bootstrap_runtime()`, which prevents launch-time attempts to install `faster-whisper`, `whisper`, and `whisperx`.
-- Risk note: explicit setup flows in `init_checker.py` still own optional group installation, so regressions would most likely come from future wrapper changes that broaden the startup requirement tuple again.
-- 2026-03-20: A shell-quoting mistake produced one malformed learning entry; left in place to honor append-only note rules and followed with a corrected line.

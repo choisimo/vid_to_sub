@@ -1,2 +1,0 @@
-- 2026-03-20: Kept init_checker.bootstrap_runtime() optional-group behavior unchanged and narrowed the tui.py launcher callsite to base only, minimizing startup blast radius while preserving Setup-based backend installs.
-- 2026-03-20: Kept the startup-bootstrap fix scoped to the TUI wrapper contract: default `tui.main()` must request only the `base` requirement group, while optional backend groups remain available only through explicit bootstrap/setup paths.
