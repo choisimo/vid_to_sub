@@ -1,12 +1,15 @@
 from __future__ import annotations
 
-import json
 import argparse
 import io
+import json
+import os
+import tempfile
 import unittest
-from contextlib import redirect_stderr
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from typing import Any
 from unittest.mock import ANY, patch
 
 from vid_to_sub_app.cli.main import main
@@ -22,14 +25,25 @@ from vid_to_sub_app.cli.stage_artifact import (
     write_stage_artifact,
 )
 from vid_to_sub_app.cli.translation import (
+    TranslationContractError,
+    _build_retry_schedule,
     postprocess_translated_segments_openai_compatible,
     translate_segments_openai_compatible,
 )
+from vid_to_sub_app.shared.constants import EVENT_PREFIX
 
 
 class _FakeHTTPResponse:
-    def __init__(self, payload: dict[str, object]) -> None:
+    def __init__(
+        self,
+        payload: dict[str, Any],
+        *,
+        status: int = 200,
+        headers: dict[str, str] | None = None,
+    ) -> None:
         self._payload = payload
+        self.status = status
+        self.headers = headers or {}
 
     def read(self) -> bytes:
         return json.dumps(self._payload).encode("utf-8")
@@ -41,7 +55,33 @@ class _FakeHTTPResponse:
         return False
 
 
+def _chat_payload(content: str, *, finish_reason: str = "stop") -> dict[str, Any]:
+    return {
+        "id": "resp-123",
+        "choices": [
+            {
+                "message": {"content": content},
+                "finish_reason": finish_reason,
+            }
+        ],
+        "usage": {"completion_tokens": 10, "prompt_tokens": 20, "total_tokens": 30},
+    }
+
+
+def _event_payloads(buffer: io.StringIO) -> list[dict[str, Any]]:
+    payloads: list[dict[str, Any]] = []
+    for line in buffer.getvalue().splitlines():
+        if not line.startswith(EVENT_PREFIX + " "):
+            continue
+        payloads.append(json.loads(line.split(" ", 1)[1]))
+    return payloads
+
+
 class TranslationPipelineTests(unittest.TestCase):
+    def test_retry_schedule_uses_expected_ladder(self) -> None:
+        self.assertEqual([100, 50, 20, 10, 5, 1], _build_retry_schedule(100))
+        self.assertEqual([20, 10, 5, 1], _build_retry_schedule(20))
+
     def test_translate_segments_openai_compatible_preserves_segment_boundaries(
         self,
     ) -> None:
@@ -49,26 +89,35 @@ class TranslationPipelineTests(unittest.TestCase):
             {"start": 0.0, "end": 1.5, "text": "Hello"},
             {"start": 1.5, "end": 3.0, "text": "World"},
         ]
-        captured_payloads: list[dict[str, list[dict[str, str]]]] = []
+        captured_payloads: list[dict[str, Any]] = []
 
         def fake_urlopen(request):
             captured_payloads.append(json.loads(request.data.decode("utf-8")))
             return _FakeHTTPResponse(
-                {"choices": [{"message": {"content": '["안녕", "세상"]'}}]}
+                _chat_payload(
+                    json.dumps(
+                        [
+                            {"segment_number": 1, "text": "안녕"},
+                            {"segment_number": 2, "text": "세상"},
+                        ],
+                        ensure_ascii=False,
+                    )
+                )
             )
 
         with patch(
             "vid_to_sub_app.cli.translation.urllib.request.urlopen",
             side_effect=fake_urlopen,
         ):
-            translated_segments, info = translate_segments_openai_compatible(
-                segments=segments,
-                target_language="ko",
-                translation_model="gpt-4.1-mini",
-                translation_base_url="https://translation.example/v1",
-                translation_api_key="secret",
-                source_language="en",
-            )
+            with redirect_stdout(io.StringIO()):
+                translated_segments, info = translate_segments_openai_compatible(
+                    segments=segments,
+                    target_language="ko",
+                    translation_model="gpt-4.1-mini",
+                    translation_base_url="https://translation.example/v1",
+                    translation_api_key="secret",
+                    source_language="en",
+                )
 
         self.assertEqual(
             [
@@ -78,10 +127,872 @@ class TranslationPipelineTests(unittest.TestCase):
             translated_segments,
         )
         self.assertEqual("gpt-4.1-mini", info["model"])
-        self.assertIn(
-            "first-pass subtitle translation agent",
-            captured_payloads[0]["messages"][0]["content"],
+        self.assertEqual(100, info["chunk_size"])
+        self.assertIn("segment_number", captured_payloads[0]["messages"][0]["content"])
+
+    def test_translate_accepts_legacy_string_array_only_when_counts_match(self) -> None:
+        segments = [
+            {"start": 0.0, "end": 1.0, "text": "Hello"},
+            {"start": 1.0, "end": 2.0, "text": "World"},
+        ]
+
+        def fake_urlopen(request):
+            return _FakeHTTPResponse(_chat_payload('["안녕", "세상"]'))
+
+        with patch(
+            "vid_to_sub_app.cli.translation.urllib.request.urlopen",
+            side_effect=fake_urlopen,
+        ):
+            with redirect_stdout(io.StringIO()):
+                translated_segments, _ = translate_segments_openai_compatible(
+                    segments=segments,
+                    target_language="ko",
+                    translation_model="gpt-4.1-mini",
+                    translation_base_url="https://translation.example/v1",
+                    translation_api_key="secret",
+                    source_language="en",
+                )
+
+        self.assertEqual(
+            ["안녕", "세상"], [segment["text"] for segment in translated_segments]
         )
+
+    def test_translation_retries_after_legacy_string_array_count_mismatch(
+        self,
+    ) -> None:
+        segments = [
+            {"start": 0.0, "end": 1.0, "text": "one"},
+            {"start": 1.0, "end": 2.0, "text": "two"},
+        ]
+        request_segment_numbers: list[list[int]] = []
+        stderr_buffer = io.StringIO()
+
+        def fake_urlopen(request):
+            payload = json.loads(request.data.decode("utf-8"))
+            user_payload = json.loads(payload["messages"][1]["content"])
+            segment_numbers = user_payload["segment_numbers"]
+            request_segment_numbers.append(segment_numbers)
+            if segment_numbers == [1, 2]:
+                return _FakeHTTPResponse(_chat_payload('["only-one"]'))
+            return _FakeHTTPResponse(
+                _chat_payload(
+                    json.dumps([f"ok-{segment_numbers[0]}"], ensure_ascii=False)
+                )
+            )
+
+        with patch(
+            "vid_to_sub_app.cli.translation.urllib.request.urlopen",
+            side_effect=fake_urlopen,
+        ):
+            with redirect_stdout(io.StringIO()), redirect_stderr(stderr_buffer):
+                translated_segments, _ = translate_segments_openai_compatible(
+                    segments=segments,
+                    target_language="ko",
+                    translation_model="gpt-4.1-mini",
+                    translation_base_url="https://translation.example/v1",
+                    translation_api_key="secret",
+                    source_language="en",
+                    chunk_size=2,
+                )
+
+        self.assertEqual([[1, 2], [1], [2]], request_segment_numbers)
+        self.assertEqual(
+            ["ok-1", "ok-2"], [segment["text"] for segment in translated_segments]
+        )
+        contract_event = next(
+            event
+            for event in _event_payloads(stderr_buffer)
+            if event["event"] == "translation_batch_contract_error"
+        )
+        self.assertEqual("legacy_string_array_count_mismatch", contract_event["reason"])
+        self.assertEqual(1, contract_event["parsed_count"])
+        self.assertEqual(["only-one"], contract_event["parsed_sample"])
+        self.assertEqual(1, contract_event["next_retry_size"])
+
+    def test_translate_reorders_object_array_by_segment_number(self) -> None:
+        segments = [
+            {"start": 0.0, "end": 1.0, "text": "one"},
+            {"start": 1.0, "end": 2.0, "text": "two"},
+            {"start": 2.0, "end": 3.0, "text": "three"},
+        ]
+
+        def fake_urlopen(request):
+            return _FakeHTTPResponse(
+                _chat_payload(
+                    json.dumps(
+                        [
+                            {"segment_number": 3, "text": "셋"},
+                            {"segment_number": 1, "text": "하나"},
+                            {"segment_number": 2, "text": "둘"},
+                        ],
+                        ensure_ascii=False,
+                    )
+                )
+            )
+
+        with patch(
+            "vid_to_sub_app.cli.translation.urllib.request.urlopen",
+            side_effect=fake_urlopen,
+        ):
+            with redirect_stdout(io.StringIO()):
+                translated_segments, _ = translate_segments_openai_compatible(
+                    segments=segments,
+                    target_language="ko",
+                    translation_model="gpt-4.1-mini",
+                    translation_base_url="https://translation.example/v1",
+                    translation_api_key="secret",
+                    source_language="en",
+                )
+
+        self.assertEqual(
+            ["하나", "둘", "셋"], [segment["text"] for segment in translated_segments]
+        )
+
+    def test_translate_raises_on_missing_segment_number(self) -> None:
+        segments = [
+            {"start": 0.0, "end": 1.0, "text": "one"},
+            {"start": 1.0, "end": 2.0, "text": "two"},
+        ]
+
+        def fake_urlopen(request):
+            return _FakeHTTPResponse(
+                _chat_payload(
+                    json.dumps(
+                        [{"segment_number": 1, "text": "하나"}], ensure_ascii=False
+                    )
+                )
+            )
+
+        with patch(
+            "vid_to_sub_app.cli.translation.urllib.request.urlopen",
+            side_effect=fake_urlopen,
+        ):
+            with redirect_stdout(io.StringIO()):
+                with self.assertRaises(TranslationContractError) as ctx:
+                    translate_segments_openai_compatible(
+                        segments=segments,
+                        target_language="ko",
+                        translation_model="gpt-4.1-mini",
+                        translation_base_url="https://translation.example/v1",
+                        translation_api_key="secret",
+                        source_language="en",
+                        chunk_size=2,
+                    )
+
+        message = str(ctx.exception)
+        self.assertIn("missing_segment_numbers=[2]", message)
+        self.assertIn("requested_count=2", message)
+        self.assertIn("configured_chunk_size=2", message)
+
+    def test_translate_raises_on_duplicate_segment_number(self) -> None:
+        segments = [{"start": 0.0, "end": 1.0, "text": "one"}]
+
+        def fake_urlopen(request):
+            return _FakeHTTPResponse(
+                _chat_payload(
+                    json.dumps(
+                        [
+                            {"segment_number": 1, "text": "하나"},
+                            {"segment_number": 1, "text": "dup"},
+                        ],
+                        ensure_ascii=False,
+                    )
+                )
+            )
+
+        with patch(
+            "vid_to_sub_app.cli.translation.urllib.request.urlopen",
+            side_effect=fake_urlopen,
+        ):
+            with redirect_stdout(io.StringIO()):
+                with self.assertRaises(TranslationContractError) as ctx:
+                    translate_segments_openai_compatible(
+                        segments=segments,
+                        target_language="ko",
+                        translation_model="gpt-4.1-mini",
+                        translation_base_url="https://translation.example/v1",
+                        translation_api_key="secret",
+                        source_language="en",
+                        chunk_size=1,
+                    )
+
+        self.assertIn("duplicate_segment_numbers=[1]", str(ctx.exception))
+
+    def test_translate_raises_on_unexpected_segment_number(self) -> None:
+        segments = [{"start": 0.0, "end": 1.0, "text": "one"}]
+
+        def fake_urlopen(request):
+            return _FakeHTTPResponse(
+                _chat_payload(
+                    json.dumps(
+                        [{"segment_number": 99, "text": "unexpected"}],
+                        ensure_ascii=False,
+                    )
+                )
+            )
+
+        with patch(
+            "vid_to_sub_app.cli.translation.urllib.request.urlopen",
+            side_effect=fake_urlopen,
+        ):
+            with redirect_stdout(io.StringIO()):
+                with self.assertRaises(TranslationContractError) as ctx:
+                    translate_segments_openai_compatible(
+                        segments=segments,
+                        target_language="ko",
+                        translation_model="gpt-4.1-mini",
+                        translation_base_url="https://translation.example/v1",
+                        translation_api_key="secret",
+                        source_language="en",
+                        chunk_size=1,
+                    )
+
+        self.assertIn("unexpected_segment_numbers=[99]", str(ctx.exception))
+
+    def test_translate_raises_on_non_object_array_item(self) -> None:
+        segments = [
+            {"start": 0.0, "end": 1.0, "text": "one"},
+            {"start": 1.0, "end": 2.0, "text": "two"},
+        ]
+
+        def fake_urlopen(request):
+            return _FakeHTTPResponse(
+                _chat_payload(
+                    json.dumps(
+                        [
+                            {"segment_number": 1, "text": "ok"},
+                            ["not-an-object"],
+                        ],
+                        ensure_ascii=False,
+                    )
+                )
+            )
+
+        with patch(
+            "vid_to_sub_app.cli.translation.urllib.request.urlopen",
+            side_effect=fake_urlopen,
+        ):
+            with redirect_stdout(io.StringIO()):
+                with self.assertRaises(TranslationContractError) as ctx:
+                    translate_segments_openai_compatible(
+                        segments=segments,
+                        target_language="ko",
+                        translation_model="gpt-4.1-mini",
+                        translation_base_url="https://translation.example/v1",
+                        translation_api_key="secret",
+                        source_language="en",
+                        chunk_size=2,
+                    )
+
+        self.assertIn(
+            "model_response_items_must_be_objects_or_strings", str(ctx.exception)
+        )
+
+    def test_translate_raises_on_non_int_segment_number(self) -> None:
+        segments = [{"start": 0.0, "end": 1.0, "text": "one"}]
+
+        def fake_urlopen(request):
+            return _FakeHTTPResponse(
+                _chat_payload(
+                    json.dumps(
+                        [{"segment_number": "1", "text": "bad-id"}],
+                        ensure_ascii=False,
+                    )
+                )
+            )
+
+        with patch(
+            "vid_to_sub_app.cli.translation.urllib.request.urlopen",
+            side_effect=fake_urlopen,
+        ):
+            with redirect_stdout(io.StringIO()):
+                with self.assertRaises(TranslationContractError) as ctx:
+                    translate_segments_openai_compatible(
+                        segments=segments,
+                        target_language="ko",
+                        translation_model="gpt-4.1-mini",
+                        translation_base_url="https://translation.example/v1",
+                        translation_api_key="secret",
+                        source_language="en",
+                        chunk_size=1,
+                    )
+
+        self.assertIn("segment_number_must_be_int", str(ctx.exception))
+
+    def test_translate_raises_on_non_string_text(self) -> None:
+        segments = [{"start": 0.0, "end": 1.0, "text": "one"}]
+
+        def fake_urlopen(request):
+            return _FakeHTTPResponse(
+                _chat_payload(
+                    json.dumps(
+                        [{"segment_number": 1, "text": 42}],
+                        ensure_ascii=False,
+                    )
+                )
+            )
+
+        with patch(
+            "vid_to_sub_app.cli.translation.urllib.request.urlopen",
+            side_effect=fake_urlopen,
+        ):
+            with redirect_stdout(io.StringIO()):
+                with self.assertRaises(TranslationContractError) as ctx:
+                    translate_segments_openai_compatible(
+                        segments=segments,
+                        target_language="ko",
+                        translation_model="gpt-4.1-mini",
+                        translation_base_url="https://translation.example/v1",
+                        translation_api_key="secret",
+                        source_language="en",
+                        chunk_size=1,
+                    )
+
+        self.assertIn("text_must_be_string", str(ctx.exception))
+
+    def test_blank_segments_are_skipped_and_reinserted(self) -> None:
+        segments = [
+            {"start": 0.0, "end": 1.0, "text": "Hello"},
+            {"start": 1.0, "end": 2.0, "text": "   "},
+            {"start": 2.0, "end": 3.0, "text": "World"},
+        ]
+        request_payloads: list[dict[str, Any]] = []
+        stderr_buffer = io.StringIO()
+
+        def fake_urlopen(request):
+            request_payloads.append(json.loads(request.data.decode("utf-8")))
+            return _FakeHTTPResponse(
+                _chat_payload(
+                    json.dumps(
+                        [
+                            {"segment_number": 1, "text": "안녕"},
+                            {"segment_number": 3, "text": "세상"},
+                        ],
+                        ensure_ascii=False,
+                    )
+                )
+            )
+
+        with patch(
+            "vid_to_sub_app.cli.translation.urllib.request.urlopen",
+            side_effect=fake_urlopen,
+        ):
+            with redirect_stdout(io.StringIO()), redirect_stderr(stderr_buffer):
+                translated_segments, info = translate_segments_openai_compatible(
+                    segments=segments,
+                    target_language="ko",
+                    translation_model="gpt-4.1-mini",
+                    translation_base_url="https://translation.example/v1",
+                    translation_api_key="secret",
+                    source_language="en",
+                    chunk_size=10,
+                )
+
+        user_payload = json.loads(request_payloads[0]["messages"][1]["content"])
+        self.assertEqual([1, 3], user_payload["segment_numbers"])
+        self.assertEqual(["Hello", "World"], user_payload["subtitles"])
+        batch_result = next(
+            event
+            for event in _event_payloads(stderr_buffer)
+            if event["event"] == "translation_batch_result"
+        )
+        self.assertEqual(3, batch_result["requested_count"])
+        self.assertEqual(1, batch_result["blank_or_whitespace_count"])
+        self.assertEqual(2, batch_result["effective_sent_count"])
+        self.assertEqual(
+            ["안녕", "   ", "세상"],
+            [segment["text"] for segment in translated_segments],
+        )
+        self.assertEqual(1, info["blank_segment_count"])
+
+    def test_translation_retries_with_smaller_batches(self) -> None:
+        segments = [
+            {"start": 0.0, "end": 1.0, "text": "one"},
+            {"start": 1.0, "end": 2.0, "text": "two"},
+            {"start": 2.0, "end": 3.0, "text": "three"},
+        ]
+        request_segment_numbers: list[list[int]] = []
+
+        def fake_urlopen(request):
+            payload = json.loads(request.data.decode("utf-8"))
+            user_payload = json.loads(payload["messages"][1]["content"])
+            segment_numbers = user_payload["segment_numbers"]
+            request_segment_numbers.append(segment_numbers)
+            if segment_numbers == [1, 2, 3]:
+                return _FakeHTTPResponse(
+                    _chat_payload(
+                        json.dumps(
+                            [
+                                {"segment_number": 1, "text": "하나"},
+                                {"segment_number": 2, "text": "둘"},
+                            ],
+                            ensure_ascii=False,
+                        )
+                    )
+                )
+            return _FakeHTTPResponse(
+                _chat_payload(
+                    json.dumps(
+                        [
+                            {
+                                "segment_number": segment_numbers[0],
+                                "text": f"번역-{segment_numbers[0]}",
+                            }
+                        ],
+                        ensure_ascii=False,
+                    )
+                )
+            )
+
+        with patch(
+            "vid_to_sub_app.cli.translation.urllib.request.urlopen",
+            side_effect=fake_urlopen,
+        ):
+            with redirect_stdout(io.StringIO()):
+                translated_segments, _ = translate_segments_openai_compatible(
+                    segments=segments,
+                    target_language="ko",
+                    translation_model="gpt-4.1-mini",
+                    translation_base_url="https://translation.example/v1",
+                    translation_api_key="secret",
+                    source_language="en",
+                    chunk_size=3,
+                )
+
+        self.assertEqual([[1, 2, 3], [1], [2], [3]], request_segment_numbers)
+        self.assertEqual(
+            ["번역-1", "번역-2", "번역-3"],
+            [segment["text"] for segment in translated_segments],
+        )
+
+    def test_translation_retries_after_json_parse_failure(self) -> None:
+        segments = [
+            {"start": 0.0, "end": 1.0, "text": "one"},
+            {"start": 1.0, "end": 2.0, "text": "two"},
+        ]
+        request_segment_numbers: list[list[int]] = []
+
+        def fake_urlopen(request):
+            payload = json.loads(request.data.decode("utf-8"))
+            user_payload = json.loads(payload["messages"][1]["content"])
+            segment_numbers = user_payload["segment_numbers"]
+            request_segment_numbers.append(segment_numbers)
+            if segment_numbers == [1, 2]:
+                return _FakeHTTPResponse(_chat_payload("not json at all"))
+            return _FakeHTTPResponse(
+                _chat_payload(
+                    json.dumps(
+                        [
+                            {
+                                "segment_number": segment_numbers[0],
+                                "text": f"ok-{segment_numbers[0]}",
+                            }
+                        ],
+                        ensure_ascii=False,
+                    )
+                )
+            )
+
+        with patch(
+            "vid_to_sub_app.cli.translation.urllib.request.urlopen",
+            side_effect=fake_urlopen,
+        ):
+            with redirect_stdout(io.StringIO()):
+                translated_segments, _ = translate_segments_openai_compatible(
+                    segments=segments,
+                    target_language="ko",
+                    translation_model="gpt-4.1-mini",
+                    translation_base_url="https://translation.example/v1",
+                    translation_api_key="secret",
+                    source_language="en",
+                    chunk_size=2,
+                )
+
+        self.assertEqual([[1, 2], [1], [2]], request_segment_numbers)
+        self.assertEqual(
+            ["ok-1", "ok-2"],
+            [segment["text"] for segment in translated_segments],
+        )
+
+    def test_translation_retries_after_finish_reason_length_on_multi_item_batch(
+        self,
+    ) -> None:
+        segments = [
+            {"start": 0.0, "end": 1.0, "text": "one"},
+            {"start": 1.0, "end": 2.0, "text": "two"},
+        ]
+        request_segment_numbers: list[list[int]] = []
+        stderr_buffer = io.StringIO()
+
+        def fake_urlopen(request):
+            payload = json.loads(request.data.decode("utf-8"))
+            user_payload = json.loads(payload["messages"][1]["content"])
+            segment_numbers = user_payload["segment_numbers"]
+            request_segment_numbers.append(segment_numbers)
+            if segment_numbers == [1, 2]:
+                return _FakeHTTPResponse(
+                    _chat_payload(
+                        json.dumps(
+                            [
+                                {"segment_number": 1, "text": "one-ko"},
+                                {"segment_number": 2, "text": "two-ko"},
+                            ],
+                            ensure_ascii=False,
+                        ),
+                        finish_reason="length",
+                    )
+                )
+            return _FakeHTTPResponse(
+                _chat_payload(
+                    json.dumps(
+                        [
+                            {
+                                "segment_number": segment_numbers[0],
+                                "text": f"ok-{segment_numbers[0]}",
+                            }
+                        ],
+                        ensure_ascii=False,
+                    )
+                )
+            )
+
+        with patch(
+            "vid_to_sub_app.cli.translation.urllib.request.urlopen",
+            side_effect=fake_urlopen,
+        ):
+            with redirect_stdout(io.StringIO()), redirect_stderr(stderr_buffer):
+                translated_segments, _ = translate_segments_openai_compatible(
+                    segments=segments,
+                    target_language="ko",
+                    translation_model="gpt-4.1-mini",
+                    translation_base_url="https://translation.example/v1",
+                    translation_api_key="secret",
+                    source_language="en",
+                    chunk_size=2,
+                )
+
+        self.assertEqual([[1, 2], [1], [2]], request_segment_numbers)
+        self.assertEqual(
+            ["ok-1", "ok-2"],
+            [segment["text"] for segment in translated_segments],
+        )
+        contract_event = next(
+            event
+            for event in _event_payloads(stderr_buffer)
+            if event["event"] == "translation_batch_contract_error"
+        )
+        self.assertEqual("length", contract_event["finish_reason"])
+        self.assertEqual(1, contract_event["next_retry_size"])
+
+    def test_best_effort_mode_falls_back_to_source_text_at_size_one(self) -> None:
+        segments = [{"start": 0.0, "end": 1.0, "text": "keep me"}]
+
+        def fake_urlopen(request):
+            return _FakeHTTPResponse(_chat_payload("[]", finish_reason="length"))
+
+        stderr_buffer = io.StringIO()
+        with patch(
+            "vid_to_sub_app.cli.translation.urllib.request.urlopen",
+            side_effect=fake_urlopen,
+        ):
+            with redirect_stdout(io.StringIO()), redirect_stderr(stderr_buffer):
+                translated_segments, _ = translate_segments_openai_compatible(
+                    segments=segments,
+                    target_language="ko",
+                    translation_model="gpt-4.1-mini",
+                    translation_base_url="https://translation.example/v1",
+                    translation_api_key="secret",
+                    source_language="en",
+                    chunk_size=1,
+                    translation_mode="best-effort",
+                )
+
+        self.assertEqual("keep me", translated_segments[0]["text"])
+        self.assertIn("fell back to source text", stderr_buffer.getvalue())
+
+    def test_strict_mode_raises_at_size_one(self) -> None:
+        segments = [{"start": 0.0, "end": 1.0, "text": "fail me"}]
+
+        def fake_urlopen(request):
+            return _FakeHTTPResponse(_chat_payload("[]", finish_reason="length"))
+
+        with patch(
+            "vid_to_sub_app.cli.translation.urllib.request.urlopen",
+            side_effect=fake_urlopen,
+        ):
+            with redirect_stdout(io.StringIO()):
+                with self.assertRaises(TranslationContractError) as ctx:
+                    translate_segments_openai_compatible(
+                        segments=segments,
+                        target_language="ko",
+                        translation_model="gpt-4.1-mini",
+                        translation_base_url="https://translation.example/v1",
+                        translation_api_key="secret",
+                        source_language="en",
+                        chunk_size=1,
+                        translation_mode="strict",
+                    )
+
+        self.assertIn("finish_reason=length", str(ctx.exception))
+
+    def test_batch_logs_emit_without_debug_and_raw_response_requires_exact_one(
+        self,
+    ) -> None:
+        segments = [{"start": 0.0, "end": 1.0, "text": "Hello"}]
+
+        def fake_urlopen(request):
+            return _FakeHTTPResponse(
+                _chat_payload(
+                    json.dumps(
+                        [{"segment_number": 1, "text": "안녕"}], ensure_ascii=False
+                    )
+                )
+            )
+
+        no_debug_stderr = io.StringIO()
+        with (
+            patch.dict(os.environ, {}, clear=False),
+            patch(
+                "vid_to_sub_app.cli.translation.urllib.request.urlopen",
+                side_effect=fake_urlopen,
+            ),
+        ):
+            with redirect_stdout(io.StringIO()), redirect_stderr(no_debug_stderr):
+                translate_segments_openai_compatible(
+                    segments=segments,
+                    target_language="ko",
+                    translation_model="gpt-4.1-mini",
+                    translation_base_url="https://translation.example/v1",
+                    translation_api_key="secret",
+                    source_language="en",
+                    chunk_size=1,
+                )
+
+        no_debug_events = _event_payloads(no_debug_stderr)
+        no_debug_result = next(
+            event
+            for event in no_debug_events
+            if event["event"] == "translation_batch_result"
+        )
+        self.assertIsNone(no_debug_result["raw_response_file"])
+        self.assertEqual(1, no_debug_result["chunk_size"])
+        self.assertEqual(
+            "https://translation.example/v1/chat/completions",
+            no_debug_result["endpoint"],
+        )
+
+        truthy_text_stderr = io.StringIO()
+        with (
+            patch.dict(
+                os.environ, {"VID_TO_SUB_TRANSLATION_DEBUG": "true"}, clear=False
+            ),
+            patch(
+                "vid_to_sub_app.cli.translation.urllib.request.urlopen",
+                side_effect=fake_urlopen,
+            ),
+        ):
+            with redirect_stdout(io.StringIO()), redirect_stderr(truthy_text_stderr):
+                translate_segments_openai_compatible(
+                    segments=segments,
+                    target_language="ko",
+                    translation_model="gpt-4.1-mini",
+                    translation_base_url="https://translation.example/v1",
+                    translation_api_key="secret",
+                    source_language="en",
+                    chunk_size=1,
+                )
+
+        truthy_text_events = _event_payloads(truthy_text_stderr)
+        truthy_text_result = next(
+            event
+            for event in truthy_text_events
+            if event["event"] == "translation_batch_result"
+        )
+        self.assertIsNone(truthy_text_result["raw_response_file"])
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            exact_debug_stderr = io.StringIO()
+            with (
+                patch.dict(
+                    os.environ, {"VID_TO_SUB_TRANSLATION_DEBUG": "1"}, clear=False
+                ),
+                patch(
+                    "vid_to_sub_app.cli.translation.tempfile.gettempdir",
+                    return_value=tmpdir,
+                ),
+                patch(
+                    "vid_to_sub_app.cli.translation.urllib.request.urlopen",
+                    side_effect=fake_urlopen,
+                ),
+            ):
+                with (
+                    redirect_stdout(io.StringIO()),
+                    redirect_stderr(exact_debug_stderr),
+                ):
+                    translate_segments_openai_compatible(
+                        segments=segments,
+                        target_language="ko",
+                        translation_model="gpt-4.1-mini",
+                        translation_base_url="https://translation.example/v1",
+                        translation_api_key="secret",
+                        source_language="en",
+                        chunk_size=1,
+                    )
+
+            exact_debug_events = _event_payloads(exact_debug_stderr)
+            exact_debug_result = next(
+                event
+                for event in exact_debug_events
+                if event["event"] == "translation_batch_result"
+            )
+            raw_path = Path(exact_debug_result["raw_response_file"])
+            self.assertTrue(raw_path.exists())
+
+    def test_batch_logs_include_response_metadata_fields(self) -> None:
+        segments = [{"start": 0.0, "end": 1.0, "text": "Hello"}]
+        stderr_buffer = io.StringIO()
+
+        def fake_urlopen(request):
+            return _FakeHTTPResponse(
+                _chat_payload(
+                    json.dumps(
+                        [{"segment_number": 1, "text": "안녕"}], ensure_ascii=False
+                    )
+                ),
+                status=206,
+                headers={"x-request-id": "req-456"},
+            )
+
+        with patch(
+            "vid_to_sub_app.cli.translation.urllib.request.urlopen",
+            side_effect=fake_urlopen,
+        ):
+            with redirect_stdout(io.StringIO()), redirect_stderr(stderr_buffer):
+                translate_segments_openai_compatible(
+                    segments=segments,
+                    target_language="ko",
+                    translation_model="gpt-4.1-mini",
+                    translation_base_url="https://translation.example/v1",
+                    translation_api_key="secret",
+                    source_language="en",
+                    chunk_size=1,
+                )
+
+        batch_result = next(
+            event
+            for event in _event_payloads(stderr_buffer)
+            if event["event"] == "translation_batch_result"
+        )
+        self.assertEqual(206, batch_result["http_status"])
+        self.assertEqual("req-456", batch_result["request_id"])
+        self.assertEqual("resp-123", batch_result["response_id"])
+        self.assertEqual(
+            {"completion_tokens": 10, "prompt_tokens": 20, "total_tokens": 30},
+            batch_result["usage"],
+        )
+        self.assertEqual(
+            "https://translation.example/v1/chat/completions",
+            batch_result["endpoint"],
+        )
+
+    def test_retry_logs_use_actual_chunk_size_and_unique_batch_ids(self) -> None:
+        segments = [
+            {"start": 0.0, "end": 1.0, "text": "one"},
+            {"start": 1.0, "end": 2.0, "text": "   "},
+            {"start": 2.0, "end": 3.0, "text": "three"},
+        ]
+
+        def fake_urlopen(request):
+            payload = json.loads(request.data.decode("utf-8"))
+            user_payload = json.loads(payload["messages"][1]["content"])
+            segment_numbers = user_payload["segment_numbers"]
+            if segment_numbers == [1, 3]:
+                return _FakeHTTPResponse(
+                    _chat_payload(
+                        json.dumps(
+                            [
+                                {"segment_number": 1, "text": "하나"},
+                            ],
+                            ensure_ascii=False,
+                        )
+                    )
+                )
+            return _FakeHTTPResponse(
+                _chat_payload(
+                    json.dumps(
+                        [
+                            {
+                                "segment_number": segment_numbers[0],
+                                "text": f"ok-{segment_numbers[0]}",
+                            }
+                        ],
+                        ensure_ascii=False,
+                    )
+                )
+            )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            stderr_buffer = io.StringIO()
+            with (
+                patch.dict(
+                    os.environ, {"VID_TO_SUB_TRANSLATION_DEBUG": "1"}, clear=False
+                ),
+                patch(
+                    "vid_to_sub_app.cli.translation.tempfile.gettempdir",
+                    return_value=tmpdir,
+                ),
+                patch(
+                    "vid_to_sub_app.cli.translation.urllib.request.urlopen",
+                    side_effect=fake_urlopen,
+                ),
+            ):
+                with redirect_stdout(io.StringIO()), redirect_stderr(stderr_buffer):
+                    translated_segments, _ = translate_segments_openai_compatible(
+                        segments=segments,
+                        target_language="ko",
+                        translation_model="gpt-4.1-mini",
+                        translation_base_url="https://translation.example/v1",
+                        translation_api_key="secret",
+                        source_language="en",
+                        chunk_size=3,
+                    )
+
+            self.assertEqual(
+                ["ok-1", "   ", "ok-3"],
+                [segment["text"] for segment in translated_segments],
+            )
+            events = _event_payloads(stderr_buffer)
+            contract_event = next(
+                event
+                for event in events
+                if event["event"] == "translation_batch_contract_error"
+            )
+            result_events = [
+                event
+                for event in events
+                if event["event"] == "translation_batch_result"
+            ]
+            self.assertEqual(2, contract_event["chunk_size"])
+            self.assertEqual(3, contract_event["requested_count"])
+            self.assertEqual(1, contract_event["blank_or_whitespace_count"])
+            self.assertEqual(1, contract_event["next_retry_size"])
+            self.assertEqual([1, 1], [event["chunk_size"] for event in result_events])
+            self.assertEqual(
+                [3, 3], [event["requested_count"] for event in result_events]
+            )
+            self.assertEqual(
+                [1, 1],
+                [event["blank_or_whitespace_count"] for event in result_events],
+            )
+            self.assertEqual(
+                len(result_events),
+                len({event["batch_id"] for event in result_events}),
+            )
+            raw_paths = [
+                Path(str(event["raw_response_file"])) for event in result_events
+            ]
+            self.assertEqual(len(raw_paths), len({str(path) for path in raw_paths}))
+            self.assertTrue(all(path.exists() for path in raw_paths))
 
     def test_postprocess_uses_translation_config_as_fallback(self) -> None:
         captured_requests = []
@@ -89,26 +1000,36 @@ class TranslationPipelineTests(unittest.TestCase):
         def fake_urlopen(request):
             captured_requests.append(request)
             return _FakeHTTPResponse(
-                {"choices": [{"message": {"content": '["정제된 가사"]'}}]}
+                _chat_payload(
+                    json.dumps(
+                        [{"segment_number": 1, "text": "정제된 가사"}],
+                        ensure_ascii=False,
+                    )
+                )
             )
 
         with patch(
             "vid_to_sub_app.cli.translation.urllib.request.urlopen",
             side_effect=fake_urlopen,
         ):
-            final_segments, info = postprocess_translated_segments_openai_compatible(
-                source_segments=[{"start": 0.0, "end": 2.0, "text": "青い風"}],
-                translated_segments=[{"start": 0.0, "end": 2.0, "text": "푸른 바람"}],
-                target_language="ko",
-                postprocess_mode="auto",
-                postprocess_model=None,
-                postprocess_base_url=None,
-                postprocess_api_key=None,
-                source_language="ja",
-                translation_model="gpt-4.1-mini",
-                translation_base_url="https://translation.example/v1",
-                translation_api_key="translation-secret",
-            )
+            with redirect_stdout(io.StringIO()):
+                final_segments, info = (
+                    postprocess_translated_segments_openai_compatible(
+                        source_segments=[{"start": 0.0, "end": 2.0, "text": "青い風"}],
+                        translated_segments=[
+                            {"start": 0.0, "end": 2.0, "text": "푸른 바람"}
+                        ],
+                        target_language="ko",
+                        postprocess_mode="auto",
+                        postprocess_model=None,
+                        postprocess_base_url=None,
+                        postprocess_api_key=None,
+                        source_language="ja",
+                        translation_model="gpt-4.1-mini",
+                        translation_base_url="https://translation.example/v1",
+                        translation_api_key="translation-secret",
+                    )
+                )
 
         self.assertEqual(
             [{"start": 0.0, "end": 2.0, "text": "정제된 가사"}],
@@ -124,6 +1045,93 @@ class TranslationPipelineTests(unittest.TestCase):
             "silently fall back to contextual correction",
             payload["messages"][0]["content"],
         )
+
+    def test_translation_fingerprint_distinguishes_worker_identity(self) -> None:
+        segments = [{"start": 0.0, "end": 1.0, "text": "Hello"}]
+
+        def fake_urlopen(request):
+            return _FakeHTTPResponse(
+                _chat_payload(
+                    json.dumps(
+                        [{"segment_number": 1, "text": "안녕"}], ensure_ascii=False
+                    )
+                )
+            )
+
+        first_stdout = io.StringIO()
+        second_stdout = io.StringIO()
+
+        with patch(
+            "vid_to_sub_app.cli.translation.urllib.request.urlopen",
+            side_effect=fake_urlopen,
+        ):
+            with patch(
+                "vid_to_sub_app.cli.translation._git_output",
+                side_effect=["abc1234", "M x", "def5678", None],
+            ):
+                with patch(
+                    "vid_to_sub_app.cli.translation.socket.gethostname",
+                    side_effect=["worker-03", "worker-07"],
+                ):
+                    with patch(
+                        "vid_to_sub_app.cli.translation.sys.argv",
+                        ["vid_to_sub.py", "--manifest-stdin", "--translate-to", "ko"],
+                    ):
+                        with patch(
+                            "vid_to_sub_app.cli.translation.vid_to_sub_app.__file__",
+                            "/srv/app-a/vid_to_sub_app/__init__.py",
+                        ):
+                            with (
+                                redirect_stdout(first_stdout),
+                                redirect_stderr(io.StringIO()),
+                            ):
+                                translate_segments_openai_compatible(
+                                    segments=segments,
+                                    target_language="ko",
+                                    translation_model="gpt-4.1-mini",
+                                    translation_base_url="https://translation.example/v1",
+                                    translation_api_key="secret",
+                                    source_language="en",
+                                    chunk_size=20,
+                                )
+                        with patch(
+                            "vid_to_sub_app.cli.translation.vid_to_sub_app.__file__",
+                            "/srv/app-b/vid_to_sub_app/__init__.py",
+                        ):
+                            with (
+                                redirect_stdout(second_stdout),
+                                redirect_stderr(io.StringIO()),
+                            ):
+                                translate_segments_openai_compatible(
+                                    segments=segments,
+                                    target_language="ko",
+                                    translation_model="gpt-4.1-mini",
+                                    translation_base_url="https://translation.example/v1",
+                                    translation_api_key="secret",
+                                    source_language="en",
+                                    chunk_size=20,
+                                )
+
+        first_line = first_stdout.getvalue().splitlines()[0]
+        second_line = second_stdout.getvalue().splitlines()[0]
+        self.assertIn('"event": "translation_execution_fingerprint"', first_line)
+        self.assertIn('"git_sha": "abc1234"', first_line)
+        self.assertIn(
+            '"package_path": "/srv/app-a/vid_to_sub_app/__init__.py"', first_line
+        )
+        self.assertIn('"hostname": "worker-03"', first_line)
+        self.assertIn('"distributed": true', first_line)
+        self.assertIn('"translation_chunk_size": 20', first_line)
+        self.assertIn(
+            '"endpoint": "https://translation.example/v1/chat/completions"',
+            first_line,
+        )
+        self.assertIn('"git_sha": "def5678"', second_line)
+        self.assertIn(
+            '"package_path": "/srv/app-b/vid_to_sub_app/__init__.py"', second_line
+        )
+        self.assertIn('"hostname": "worker-07"', second_line)
+        self.assertNotEqual(first_line, second_line)
 
     def test_main_rejects_postprocess_without_translation_target(self) -> None:
         with redirect_stderr(io.StringIO()):
@@ -638,6 +1646,362 @@ class TestRunStage2Idempotency(unittest.TestCase):
             self.assertFalse(metadata.get("translation_failed"))
 
 
+    def test_fingerprint_emits_all_required_fields(self) -> None:
+        segments = [{"start": 0.0, "end": 1.0, "text": "Hello"}]
+
+        def fake_urlopen(request):
+            return _FakeHTTPResponse(
+                _chat_payload(
+                    json.dumps([{"segment_number": 1, "text": "안녕"}], ensure_ascii=False)
+                )
+            )
+
+        stdout_buf = io.StringIO()
+        with patch(
+            "vid_to_sub_app.cli.translation.urllib.request.urlopen",
+            side_effect=fake_urlopen,
+        ):
+            with redirect_stdout(stdout_buf), redirect_stderr(io.StringIO()):
+                translate_segments_openai_compatible(
+                    segments=segments,
+                    target_language="ko",
+                    translation_model="gpt-4.1-mini",
+                    translation_base_url="https://translation.example/v1",
+                    translation_api_key="secret",
+                    source_language="en",
+                    chunk_size=10,
+                )
+
+        fp_events = [
+            e
+            for e in _event_payloads(stdout_buf)
+            if e.get("event") == "translation_execution_fingerprint"
+        ]
+        self.assertTrue(fp_events, "no fingerprint event emitted")
+        fp = fp_events[0]
+        for field in (
+            "exec_path",
+            "cwd",
+            "python",
+            "argv",
+            "repo_root",
+            "git_dirty",
+            "endpoint_host",
+            "model",
+            "git_sha",
+            "package_path",
+            "hostname",
+            "translation_chunk_size",
+            "distributed",
+            "endpoint",
+        ):
+            self.assertIn(field, fp, f"fingerprint missing field: {field}")
+        self.assertEqual("gpt-4.1-mini", fp["model"])
+        self.assertEqual(10, fp["translation_chunk_size"])
+        self.assertEqual(
+            "https://translation.example/v1/chat/completions",
+            fp["endpoint"],
+        )
+        self.assertEqual(
+            "translation.example",
+            fp["endpoint_host"],
+        )
+
+    def test_batch_log_emits_all_required_fields(self) -> None:
+        segments = [{"start": 0.0, "end": 1.0, "text": "Hello"}]
+        stderr_buf = io.StringIO()
+
+        def fake_urlopen(request):
+            return _FakeHTTPResponse(
+                _chat_payload(
+                    json.dumps([{"segment_number": 1, "text": "안녕"}], ensure_ascii=False)
+                )
+            )
+
+        with patch(
+            "vid_to_sub_app.cli.translation.urllib.request.urlopen",
+            side_effect=fake_urlopen,
+        ):
+            with redirect_stdout(io.StringIO()), redirect_stderr(stderr_buf):
+                translate_segments_openai_compatible(
+                    segments=segments,
+                    target_language="ko",
+                    translation_model="gpt-4.1-mini",
+                    translation_base_url="https://translation.example/v1",
+                    translation_api_key="secret",
+                    source_language="en",
+                    chunk_size=5,
+                )
+
+        batch_events = [
+            e
+            for e in _event_payloads(stderr_buf)
+            if e.get("event") == "translation_batch_result"
+        ]
+        self.assertTrue(batch_events, "no batch_result event emitted")
+        ev = batch_events[0]
+        for field in (
+            "attempt",
+            "batch_start_idx",
+            "batch_end_idx",
+            "segment_numbers",
+            "endpoint_host",
+            "model",
+            "temperature",
+            "max_output_tokens",
+            "http_status",
+            "response_id",
+            "request_id",
+            "finish_reason",
+            "usage",
+            "raw_response_file",
+            "parsed_count",
+            "parsed_sample",
+            "requested_count",
+            "blank_or_whitespace_count",
+            "effective_sent_count",
+            "chunk_size",
+            "configured_chunk_size",
+        ):
+            self.assertIn(field, ev, f"batch_result missing field: {field}")
+        self.assertEqual(1, ev["attempt"])
+        self.assertEqual(1, ev["batch_start_idx"])
+        self.assertEqual(1, ev["batch_end_idx"])
+        self.assertEqual([1], ev["segment_numbers"])
+        self.assertEqual("translation.example", ev["endpoint_host"])
+        self.assertEqual("gpt-4.1-mini", ev["model"])
+        self.assertEqual(0, ev["temperature"])
+
+    def test_contract_error_includes_full_fingerprint_context(self) -> None:
+        segments = [{"start": 0.0, "end": 1.0, "text": "fail"}]
+
+        def fake_urlopen(request):
+            return _FakeHTTPResponse(_chat_payload("[]", finish_reason="length"))
+
+        with patch(
+            "vid_to_sub_app.cli.translation.urllib.request.urlopen",
+            side_effect=fake_urlopen,
+        ):
+            with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+                with self.assertRaises(TranslationContractError) as ctx:
+                    translate_segments_openai_compatible(
+                        segments=segments,
+                        target_language="ko",
+                        translation_model="gpt-4.1-mini",
+                        translation_base_url="https://translation.example/v1",
+                        translation_api_key="secret",
+                        source_language="en",
+                        chunk_size=1,
+                        translation_mode="strict",
+                    )
+
+        msg = str(ctx.exception)
+        for field_prefix in (
+            "cwd=",
+            "python=",
+            "argv=",
+            "repo_root=",
+            "git_sha=",
+            "git_dirty=",
+            "translation_chunk_size=",
+            "distributed=",
+            "exec_path=",
+            "package_path=",
+            "endpoint_host=",
+            "model=",
+        ):
+            self.assertIn(field_prefix, msg, f"contract error missing: {field_prefix}")
+
+    def test_translate_raises_on_object_item_missing_segment_number_key(self) -> None:
+        segments = [{"start": 0.0, "end": 1.0, "text": "one"}]
+
+        def fake_urlopen(request):
+            return _FakeHTTPResponse(
+                _chat_payload(
+                    json.dumps([{"text": "missing-key"}], ensure_ascii=False)
+                )
+            )
+
+        with patch(
+            "vid_to_sub_app.cli.translation.urllib.request.urlopen",
+            side_effect=fake_urlopen,
+        ):
+            with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+                with self.assertRaises(TranslationContractError) as ctx:
+                    translate_segments_openai_compatible(
+                        segments=segments,
+                        target_language="ko",
+                        translation_model="gpt-4.1-mini",
+                        translation_base_url="https://translation.example/v1",
+                        translation_api_key="secret",
+                        source_language="en",
+                        chunk_size=1,
+                    )
+
+        self.assertIn("segment_number_must_be_int", str(ctx.exception))
+
+    def test_translation_retries_when_100_sent_99_returned(self) -> None:
+        segments = [
+            {"start": float(i), "end": float(i + 1), "text": f"seg-{i + 1}"}
+            for i in range(100)
+        ]
+        request_sizes: list[int] = []
+        stderr_buf = io.StringIO()
+
+        def fake_urlopen(request):
+            payload = json.loads(request.data.decode("utf-8"))
+            user_payload = json.loads(payload["messages"][1]["content"])
+            segment_numbers = user_payload["segment_numbers"]
+            request_sizes.append(len(segment_numbers))
+            if len(segment_numbers) == 100:
+                # Return only 99 — deliberately omit segment 50
+                items = [
+                    {"segment_number": n, "text": f"ok-{n}"}
+                    for n in segment_numbers
+                    if n != 50
+                ]
+                return _FakeHTTPResponse(_chat_payload(json.dumps(items, ensure_ascii=False)))
+            # All smaller batches succeed
+            items = [{"segment_number": n, "text": f"ok-{n}"} for n in segment_numbers]
+            return _FakeHTTPResponse(_chat_payload(json.dumps(items, ensure_ascii=False)))
+
+        with patch(
+            "vid_to_sub_app.cli.translation.urllib.request.urlopen",
+            side_effect=fake_urlopen,
+        ):
+            with redirect_stdout(io.StringIO()), redirect_stderr(stderr_buf):
+                translated_segments, _ = translate_segments_openai_compatible(
+                    segments=segments,
+                    target_language="ko",
+                    translation_model="gpt-4.1-mini",
+                    translation_base_url="https://translation.example/v1",
+                    translation_api_key="secret",
+                    source_language="en",
+                    chunk_size=100,
+                )
+
+        # First request was 100, which triggered a retry at next size
+        self.assertEqual(100, request_sizes[0])
+        self.assertGreater(len(request_sizes), 1)
+        contract_events = [
+            e
+            for e in _event_payloads(stderr_buf)
+            if e["event"] == "translation_batch_contract_error"
+        ]
+        self.assertTrue(contract_events, "no contract error emitted for 100\u219299 mismatch")
+        self.assertEqual("segment_number_contract_mismatch", contract_events[0]["reason"])
+        self.assertNotEqual([], contract_events[0]["parsed_sample"])
+        self.assertEqual(100, len(translated_segments))
+
+    def test_translation_retries_on_multi_item_duplicate_segment_number(self) -> None:
+        segments = [
+            {"start": 0.0, "end": 1.0, "text": "one"},
+            {"start": 1.0, "end": 2.0, "text": "two"},
+        ]
+        request_segment_numbers: list[list[int]] = []
+        stderr_buf = io.StringIO()
+
+        def fake_urlopen(request):
+            payload = json.loads(request.data.decode("utf-8"))
+            user_payload = json.loads(payload["messages"][1]["content"])
+            segment_numbers = user_payload["segment_numbers"]
+            request_segment_numbers.append(segment_numbers)
+            if segment_numbers == [1, 2]:
+                # Return duplicate segment_number 1 — triggers retry
+                return _FakeHTTPResponse(
+                    _chat_payload(
+                        json.dumps(
+                            [
+                                {"segment_number": 1, "text": "dup-one-a"},
+                                {"segment_number": 1, "text": "dup-one-b"},
+                            ],
+                            ensure_ascii=False,
+                        )
+                    )
+                )
+            items = [{"segment_number": n, "text": f"ok-{n}"} for n in segment_numbers]
+            return _FakeHTTPResponse(_chat_payload(json.dumps(items, ensure_ascii=False)))
+
+        with patch(
+            "vid_to_sub_app.cli.translation.urllib.request.urlopen",
+            side_effect=fake_urlopen,
+        ):
+            with redirect_stdout(io.StringIO()), redirect_stderr(stderr_buf):
+                translated_segments, _ = translate_segments_openai_compatible(
+                    segments=segments,
+                    target_language="ko",
+                    translation_model="gpt-4.1-mini",
+                    translation_base_url="https://translation.example/v1",
+                    translation_api_key="secret",
+                    source_language="en",
+                    chunk_size=2,
+                )
+
+        # Initial [1,2] failed with duplicate, retried as [1] and [2]
+        self.assertEqual([[1, 2], [1], [2]], request_segment_numbers)
+        self.assertEqual(["ok-1", "ok-2"], [s["text"] for s in translated_segments])
+        contract_events = [
+            e
+            for e in _event_payloads(stderr_buf)
+            if e["event"] == "translation_batch_contract_error"
+        ]
+        self.assertTrue(contract_events)
+        self.assertEqual("segment_number_contract_mismatch", contract_events[0]["reason"])
+
+    def test_translation_retries_on_multi_item_unexpected_segment_number(self) -> None:
+        segments = [
+            {"start": 0.0, "end": 1.0, "text": "one"},
+            {"start": 1.0, "end": 2.0, "text": "two"},
+        ]
+        request_segment_numbers: list[list[int]] = []
+        stderr_buf = io.StringIO()
+
+        def fake_urlopen(request):
+            payload = json.loads(request.data.decode("utf-8"))
+            user_payload = json.loads(payload["messages"][1]["content"])
+            segment_numbers = user_payload["segment_numbers"]
+            request_segment_numbers.append(segment_numbers)
+            if segment_numbers == [1, 2]:
+                # Return segment 99 which was never requested — triggers retry
+                return _FakeHTTPResponse(
+                    _chat_payload(
+                        json.dumps(
+                            [
+                                {"segment_number": 1, "text": "one-ko"},
+                                {"segment_number": 99, "text": "unexpected"},
+                            ],
+                            ensure_ascii=False,
+                        )
+                    )
+                )
+            items = [{"segment_number": n, "text": f"ok-{n}"} for n in segment_numbers]
+            return _FakeHTTPResponse(_chat_payload(json.dumps(items, ensure_ascii=False)))
+
+        with patch(
+            "vid_to_sub_app.cli.translation.urllib.request.urlopen",
+            side_effect=fake_urlopen,
+        ):
+            with redirect_stdout(io.StringIO()), redirect_stderr(stderr_buf):
+                translated_segments, _ = translate_segments_openai_compatible(
+                    segments=segments,
+                    target_language="ko",
+                    translation_model="gpt-4.1-mini",
+                    translation_base_url="https://translation.example/v1",
+                    translation_api_key="secret",
+                    source_language="en",
+                    chunk_size=2,
+                )
+
+        # Initial [1,2] failed with unexpected 99, retried as [1] and [2]
+        self.assertEqual([[1, 2], [1], [2]], request_segment_numbers)
+        self.assertEqual(["ok-1", "ok-2"], [s["text"] for s in translated_segments])
+        contract_events = [
+            e
+            for e in _event_payloads(stderr_buf)
+            if e["event"] == "translation_batch_contract_error"
+        ]
+        self.assertTrue(contract_events)
+        self.assertEqual("segment_number_contract_mismatch", contract_events[0]["reason"])
 if __name__ == "__main__":
     _ = unittest.main()
 
