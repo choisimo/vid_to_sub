@@ -369,7 +369,7 @@ class HistoryMixin:
             app._log(f"[yellow]Skipped {len(missing_paths)} missing file(s).[/]")
         self._trigger_translate_from_paths(existing_paths, target_lang)
 
-    @work(thread=True, exclusive=False, exit_on_error=False, name="history-translate")
+    @work(thread=True, exclusive=True, exit_on_error=False, name="history-translate")
     def _trigger_translate_from_paths(
         self, subtitle_paths: list[str], target_lang: str
     ) -> None:

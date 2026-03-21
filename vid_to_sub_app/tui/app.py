@@ -166,6 +166,7 @@ class VidToSubApp(
         self._active_worker: Worker[None] | None = None
         self._proc: subprocess.Popen[str] | None = None
         self._procs: dict[str, subprocess.Popen[str]] = {}
+        self._run_row_widgets: dict[str, Static] = {}
         self._hist_key: str | None = None
         self._hist_selected: set[str] = set()
         self._hist_select_mode = False
@@ -1439,6 +1440,25 @@ class VidToSubApp(
         if self._proc and self._proc.poll() is None:
             self._proc.terminate()
             terminated = True
+        # Give processes a brief window to exit after SIGTERM, then SIGKILL stragglers.
+        for proc in list(self._procs.values()):
+            try:
+                proc.wait(timeout=0.5)
+            except subprocess.TimeoutExpired:
+                try:
+                    proc.kill()
+                except OSError:
+                    pass
+        if self._proc and self._proc.poll() is None:
+            try:
+                self._proc.wait(timeout=0.5)
+            except subprocess.TimeoutExpired:
+                try:
+                    self._proc.kill()
+                except OSError:
+                    pass
+        self._procs.clear()
+        self._proc = None
         if terminated:
             self._refresh_live_panels()
         if self._active_worker and self._active_worker.is_running:
@@ -1519,8 +1539,9 @@ class VidToSubApp(
         except NoMatches:
             box = None
         if box is not None and box.is_attached:
-            box.remove_children()
             if self._active_jobs:
+                # Compute the new label for each active job.
+                new_labels: dict[str, str] = {}
                 for job in sorted(
                     self._active_jobs.values(), key=lambda item: item.started_at
                 ):
@@ -1557,21 +1578,52 @@ class VidToSubApp(
                             + _progress_bar_markup_ratio(progress_ratio, width=20)
                             + f"  {progress_meta}"
                         )
-                    box.mount(Static(label, classes="run-active-row", markup=True))
-            elif running:
-                box.mount(
-                    Static(
-                        "[dim]Preparing executors or waiting for the first file to start…[/]",
-                        markup=True,
-                    )
-                )
+                    new_labels[job.video_path] = label
+
+                # Remove widgets for jobs that have ended.
+                stale_keys = set(self._run_row_widgets) - set(new_labels)
+                for key in stale_keys:
+                    widget = self._run_row_widgets.pop(key)
+                    try:
+                        widget.remove()
+                    except Exception:
+                        pass
+                # Clear the sentinel status widget if present.
+                if "__status__" in self._run_row_widgets:
+                    widget = self._run_row_widgets.pop("__status__")
+                    try:
+                        widget.remove()
+                    except Exception:
+                        pass
+
+                # Update existing or mount new widgets.
+                for key, label in new_labels.items():
+                    if key in self._run_row_widgets:
+                        self._run_row_widgets[key].update(label)
+                    else:
+                        w = Static(label, classes="run-active-row", markup=True)
+                        self._run_row_widgets[key] = w
+                        box.mount(w)
             else:
-                box.mount(
-                    Static(
-                        "[dim]Current jobs will appear here when a run starts.[/]",
-                        markup=True,
-                    )
+                # No active jobs — show a single status widget.
+                status_text = (
+                    "[dim]Preparing executors or waiting for the first file to start…[/]"
+                    if running
+                    else "[dim]Current jobs will appear here when a run starts.[/]"
                 )
+                if "__status__" in self._run_row_widgets:
+                    self._run_row_widgets["__status__"].update(status_text)
+                else:
+                    # Remove any stale job widgets first.
+                    for key, widget in list(self._run_row_widgets.items()):
+                        try:
+                            widget.remove()
+                        except Exception:
+                            pass
+                    self._run_row_widgets.clear()
+                    w = Static(status_text, markup=True)
+                    self._run_row_widgets["__status__"] = w
+                    box.mount(w)
 
         selected = self._selected_history_job()
         live_lines = [
