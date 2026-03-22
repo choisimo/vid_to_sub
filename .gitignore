@@ -1,2 +1,16 @@
 # Created by venv; see https://docs.python.org/3/library/venv.html
-*
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+lib/
+lib64/
+include/
+bin/
+pyvenv.cfg
+*.db-shm
+*.db-wal
+.ruff_cache/
+.pytest_cache/
+.sisyphus/
+.env
