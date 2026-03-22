@@ -62,7 +62,44 @@ SCRIPT_PATH = ROOT_DIR / "vid_to_sub.py"
 
 
 class RunMixin:
-    # ── Command builder ───────────────────────────────────────────────────
+    """Run / transcription pipeline mixin.
+
+    Requires (must be provided by the host class):
+        - self._selected_paths: list[str]
+        - self._remote_resources: list[RemoteResourceProfile]
+        - self._active_jobs: dict[str, RunJobState]
+        - self._active_worker: Worker | None
+        - self._run_request_id: int
+        - self._run_started_at: float | None
+        - self._run_total_found: int
+        - self._run_total_queued: int
+        - self._run_completed: int
+        - self._run_failed: int
+        - self._run_last_shell: str
+        - self._run_shell_collapsed: bool
+        - self._detected_ggml_models: dict[str, str]
+        - self._val(wid: str) -> str
+        - self._sel(wid: str, fallback: str) -> str
+        - self._chk(wid: str) -> bool
+        - self._sw(wid: str) -> bool
+        - self._refresh_live_panels() -> None
+        - self._resolved_wcpp_model_path() -> str
+        - self._log(text: str) -> None
+        - self.notify(message: str, **kw) — Textual notification
+
+    Provides:
+        - _build_cli_args(...) -> list[str]
+        - _build_cmd(dry_run: bool) -> list[str]
+        - _update_cmd_preview() -> None
+        - _selected_formats() -> frozenset[str]
+        - _snapshot_run_config(dry_run: bool) -> RunConfig
+        - _discover_videos_for_run(...) -> list[Path]
+        - _trigger(dry_run: bool) -> None
+        - _build_run_env() -> dict[str, str]
+        - _refresh_live_panels() -> None
+        - _action_toggle_run_shell() -> None
+    """
+    # ── Command builder ───────────────────────────────────────────────────────────────────────
 
     def _build_cli_args(
         self,

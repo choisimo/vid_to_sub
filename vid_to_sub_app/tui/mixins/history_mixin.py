@@ -57,7 +57,7 @@ def _history_app(instance: object) -> _HistoryApp:
 
 
 class HistoryMixin:
-    # -- History tab -----------------------------------------------------------
+    """History-tab mixin."""
 
     def _update_history_count(self, total_jobs: int | None = None) -> None:
         app = _history_app(self)

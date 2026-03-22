@@ -38,6 +38,8 @@ _MISSING = object()
 
 
 class SettingsMixin:
+    """Settings-tab mixin."""
+
     _ssh_selected_id: int | None = None
     _remote_resources: list[RemoteResourceProfile] = []
     _run_last_shell = ""
@@ -724,8 +726,7 @@ class SettingsMixin:
             env=env,
         )
         self._refresh_ssh_table()
-        self._load_remote_resources()
-        self._update_remote_status()
+        self._refresh_remote_state()
         self._ssh_set_status(
             f"[green]✓ Added connection: {form['label'] or form['host']}[/]"
         )
@@ -766,8 +767,7 @@ class SettingsMixin:
             env=env,
         )
         self._refresh_ssh_table()
-        self._load_remote_resources()
-        self._update_remote_status()
+        self._refresh_remote_state()
         self._ssh_set_status(
             f"[green]✓ Updated connection ID {self._ssh_selected_id}[/]"
         )
@@ -780,6 +780,5 @@ class SettingsMixin:
         self._ssh_selected_id = None
         self._ssh_clear_form()
         self._refresh_ssh_table()
-        self._load_remote_resources()
-        self._update_remote_status()
+        self._refresh_remote_state()
         self._ssh_set_status("[green]✓ Connection deleted.[/]")
