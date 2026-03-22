@@ -49,6 +49,9 @@ class _HistoryApp(Protocol):
     def _refresh_recent_paths(self) -> None: ...
     def _refresh_sel_paths(self) -> None: ...
     def _trigger(self, dry_run: bool) -> None: ...
+    def _trigger_translate_from_artifact(
+        self, artifact_path: str, target_lang_override: str | None = None
+    ) -> None: ...
     def _val(self, wid: str) -> str: ...
 
 
@@ -377,11 +380,32 @@ class HistoryMixin:
             app._log("[red]No target language is configured for this job.[/]")
             return
 
+        artifact_metadata = job.get("artifact_metadata")
+        if not isinstance(artifact_metadata, dict):
+            artifact_metadata = {}
+        stage_artifact_path = (
+            str(job.get("artifact_path") or artifact_metadata.get("path") or "").strip()
+            or None
+        )
+        if stage_artifact_path and Path(stage_artifact_path).exists():
+            app._log(
+                f"[bold cyan]History translate[/] using artifact {Path(stage_artifact_path).name}"
+            )
+            app._trigger_translate_from_artifact(
+                stage_artifact_path,
+                target_lang_override=target_lang,
+            )
+            return
+
         if missing_paths:
             app._log(f"[yellow]Skipped {len(missing_paths)} missing file(s).[/]")
         if skipped_non_srt:
             app._log(
                 f"[yellow]Skipped {skipped_non_srt} non-SRT subtitle file(s).[/]"
+            )
+        if stage_artifact_path:
+            app._log(
+                "[yellow]Stage artifact is not available on disk; falling back to direct SRT translation.[/]"
             )
         self._trigger_translate_from_paths(srt_paths, target_lang)
 
@@ -390,9 +414,9 @@ class HistoryMixin:
         self, subtitle_paths: list[str], target_lang: str
     ) -> None:
         app = _history_app(self)
-        translation_base_url = _db.get(ENV_TRANS_URL) or None
-        translation_api_key = _db.get(ENV_TRANS_KEY) or None
-        translation_model = _db.get(ENV_TRANS_MOD) or None
+        translation_base_url = app._val("inp-trans-url") or _db.get(ENV_TRANS_URL) or None
+        translation_api_key = app._val("inp-trans-key") or _db.get(ENV_TRANS_KEY) or None
+        translation_model = app._val("inp-trans-model") or _db.get(ENV_TRANS_MOD) or None
         translated_count = 0
 
         for subtitle_path in subtitle_paths:
