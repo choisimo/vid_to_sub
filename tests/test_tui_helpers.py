@@ -33,11 +33,17 @@ from vid_to_sub_app.cli.stage_artifact import (
 )
 from vid_to_sub_app.cli.transcription import (
     resolve_device_fw,
+    transcribe,
     transcribe_faster_whisper,
     transcribe_openai_whisper,
 )
 from vid_to_sub_app.cli.translation import translate_segments_openai_compatible
-from vid_to_sub_app.db import TUI_DEFAULT_TRANSLATE_ENABLED_KEY
+from vid_to_sub_app.db import (
+    TUI_DEFAULT_CONTENT_TYPE_KEY,
+    TUI_DEFAULT_FORCE_TRANSLATE_KEY,
+    TUI_DEFAULT_TRANSLATE_ENABLED_KEY,
+)
+from vid_to_sub_app.tui.models import ExecutorPlan
 from vid_to_sub_app.shared.env import (
     faster_whisper_model_candidates,
     resolve_runtime_backend_and_device,
@@ -355,12 +361,14 @@ class TuiHelperTests(unittest.TestCase):
                 model="large-v3",
                 device="cpu",
                 language=None,
+                content_type="auto",
                 compute_type=None,
                 beam_size="5",
                 local_workers=2,
                 whisper_cpp_model_path=None,
                 translate_enabled=False,
                 translate_to=None,
+                force_translate=False,
                 translation_model=None,
                 translation_base_url=None,
                 translation_api_key=None,
@@ -399,12 +407,14 @@ class TuiHelperTests(unittest.TestCase):
             model="turbo",
             device="cpu",
             language="en",
+            content_type="speech",
             compute_type="int8",
             beam_size="7",
             local_workers=3,
             whisper_cpp_model_path=None,
             translate_enabled=True,
             translate_to="ko",
+            force_translate=True,
             translation_model="gpt-4.1-mini",
             translation_base_url="https://example.com/v1",
             translation_api_key="secret",
@@ -438,7 +448,10 @@ class TuiHelperTests(unittest.TestCase):
         self.assertIn("--stage1-only", plans[0].cmd)
         self.assertIn("--workers", plans[0].cmd)
         self.assertIn("--backend-threads", plans[0].cmd)
+        self.assertIn("--content-type", plans[0].cmd)
+        self.assertIn("speech", plans[0].cmd)
         self.assertIn("--translate-to", plans[0].cmd)
+        self.assertIn("--force-translate", plans[0].cmd)
         self.assertIn("--postprocess-translation", plans[0].cmd)
         self.assertIn("--postprocess-mode", plans[0].cmd)
         self.assertIn("--postprocess-model", plans[0].cmd)
@@ -456,8 +469,7 @@ class TuiHelperTests(unittest.TestCase):
     def test_build_executor_plans_distributed_with_translation_uses_stage1_for_remote(
         self,
     ) -> None:
-        """Translation-enabled distributed runs split into stage1 across all executors.
-        """
+        """Translation-enabled distributed runs split into stage1 across all executors."""
         from vid_to_sub_app.tui.models import RemoteResourceProfile
 
         app = VidToSubApp()
@@ -480,12 +492,14 @@ class TuiHelperTests(unittest.TestCase):
             model="large-v3",
             device="cpu",
             language=None,
+            content_type="auto",
             compute_type=None,
             beam_size="5",
             local_workers=1,
             whisper_cpp_model_path=None,
             translate_enabled=True,
             translate_to="ko",
+            force_translate=False,
             translation_model=None,
             translation_base_url="https://translate.example/v1",
             translation_api_key="key",
@@ -589,7 +603,9 @@ class TuiHelperTests(unittest.TestCase):
         widgets = {
             "#inp-output-dir": SimpleNamespace(value="/old/output"),
             "#inp-translate-to": SimpleNamespace(value="ja"),
+            "#sel-content-type": SimpleNamespace(value="auto"),
             "#sw-translate": SimpleNamespace(value=False),
+            "#sw-force-translate": SimpleNamespace(value=False),
         }
 
         def query_one(selector: str, *_args):
@@ -597,25 +613,38 @@ class TuiHelperTests(unittest.TestCase):
                 return widgets[selector]
             raise NoMatches(selector)
 
-        with patch.object(app, "query_one", side_effect=query_one):
-            app._sync_run_defaults_from_settings(
-                previous_values={
-                    "tui.default_output_dir": "/old/output",
-                    "tui.default_translate_to": "ko",
-                    "tui.default_translate_enabled": "1",
-                    ENV_TRANS_URL: "",
-                },
-                updated_values={
-                    "tui.default_output_dir": "/new/output",
-                    "tui.default_translate_to": "en",
-                    "tui.default_translate_enabled": "1",
-                    ENV_TRANS_URL: "",
-                },
-            )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            temp_db = Database(Path(tmpdir) / "state.db")
+            temp_db.set_many({TUI_DEFAULT_FORCE_TRANSLATE_KEY: "1"})
+
+            with (
+                patch.object(settings_mixin, "_db", temp_db),
+                patch.object(app, "query_one", side_effect=query_one),
+            ):
+                app._sync_run_defaults_from_settings(
+                    previous_values={
+                        "tui.default_output_dir": "/old/output",
+                        "tui.default_translate_to": "ko",
+                        "tui.default_translate_enabled": "1",
+                        TUI_DEFAULT_CONTENT_TYPE_KEY: "auto",
+                        TUI_DEFAULT_FORCE_TRANSLATE_KEY: "0",
+                        ENV_TRANS_URL: "",
+                    },
+                    updated_values={
+                        "tui.default_output_dir": "/new/output",
+                        "tui.default_translate_to": "en",
+                        "tui.default_translate_enabled": "1",
+                        TUI_DEFAULT_CONTENT_TYPE_KEY: "music",
+                        TUI_DEFAULT_FORCE_TRANSLATE_KEY: "1",
+                        ENV_TRANS_URL: "",
+                    },
+                )
 
         self.assertEqual("/new/output", widgets["#inp-output-dir"].value)
         self.assertEqual("ja", widgets["#inp-translate-to"].value)
+        self.assertEqual("music", widgets["#sel-content-type"].value)
         self.assertFalse(widgets["#sw-translate"].value)
+        self.assertTrue(widgets["#sw-force-translate"].value)
 
 
 class TestTranslationCapabilityGuard(unittest.TestCase):
@@ -732,13 +761,47 @@ class TestTranslationDefaultSetting(unittest.TestCase):
 
         self.assertTrue(widgets["#sw-stg-translate-enabled"].value)
 
+    def test_loading_settings_restores_content_type_and_force_translate_defaults(
+        self,
+    ) -> None:
+        app = VidToSubApp()
+        widgets = {
+            "#sw-stg-force-translate": SimpleNamespace(value=False),
+            "#stg-default-content-type": SimpleNamespace(value="auto"),
+        }
+
+        def query_one(selector: str, *_args):
+            if selector in widgets:
+                return widgets[selector]
+            raise NoMatches(selector)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            temp_db = Database(Path(tmpdir) / "state.db")
+            temp_db.set_many(
+                {
+                    TUI_DEFAULT_FORCE_TRANSLATE_KEY: "1",
+                    TUI_DEFAULT_CONTENT_TYPE_KEY: "music",
+                }
+            )
+
+            with (
+                patch.object(settings_mixin, "_db", temp_db),
+                patch.object(app, "query_one", side_effect=query_one),
+            ):
+                app._load_settings_form()
+
+        self.assertTrue(widgets["#sw-stg-force-translate"].value)
+        self.assertEqual("music", widgets["#stg-default-content-type"].value)
+
     def test_prefill_transcribe_restores_translate_toggle_from_saved_default(
         self,
     ) -> None:
         app = VidToSubApp()
         widgets = {
             "#inp-translate-to": SimpleNamespace(value=""),
+            "#sel-content-type": SimpleNamespace(value="auto"),
             "#sw-translate": SimpleNamespace(value=True),
+            "#sw-force-translate": SimpleNamespace(value=False),
         }
 
         def query_one(selector: str, *_args):
@@ -752,6 +815,8 @@ class TestTranslationDefaultSetting(unittest.TestCase):
                 {
                     "tui.default_translate_enabled": "1",
                     "tui.default_translate_to": "ko",
+                    TUI_DEFAULT_CONTENT_TYPE_KEY: "music",
+                    TUI_DEFAULT_FORCE_TRANSLATE_KEY: "1",
                     ENV_TRANS_URL: "",
                 }
             )
@@ -764,6 +829,8 @@ class TestTranslationDefaultSetting(unittest.TestCase):
 
         self.assertTrue(widgets["#sw-translate"].value)
         self.assertEqual("ko", widgets["#inp-translate-to"].value)
+        self.assertEqual("music", widgets["#sel-content-type"].value)
+        self.assertTrue(widgets["#sw-force-translate"].value)
 
     def test_prefill_transcribe_reads_sqlite_settings(self) -> None:
         app = VidToSubApp()
@@ -777,7 +844,9 @@ class TestTranslationDefaultSetting(unittest.TestCase):
             "#inp-wcpp-bin": SimpleNamespace(value=""),
             "#inp-output-dir": SimpleNamespace(value=""),
             "#inp-translate-to": SimpleNamespace(value=""),
+            "#sel-content-type": SimpleNamespace(value="auto"),
             "#sw-translate": SimpleNamespace(value=False),
+            "#sw-force-translate": SimpleNamespace(value=False),
         }
 
         def query_one(selector: str, *_args):
@@ -798,6 +867,8 @@ class TestTranslationDefaultSetting(unittest.TestCase):
                     ENV_WHISPER_CPP_BIN: "/sqlite/bin/whisper-cli",
                     "tui.default_output_dir": "/sqlite/output",
                     "tui.default_translate_to": "ko",
+                    TUI_DEFAULT_CONTENT_TYPE_KEY: "speech",
+                    TUI_DEFAULT_FORCE_TRANSLATE_KEY: "1",
                 }
             )
 
@@ -818,7 +889,9 @@ class TestTranslationDefaultSetting(unittest.TestCase):
         self.assertEqual("/sqlite/bin/whisper-cli", widgets["#inp-wcpp-bin"].value)
         self.assertEqual("/sqlite/output", widgets["#inp-output-dir"].value)
         self.assertEqual("ko", widgets["#inp-translate-to"].value)
+        self.assertEqual("speech", widgets["#sel-content-type"].value)
         self.assertTrue(widgets["#sw-translate"].value)
+        self.assertTrue(widgets["#sw-force-translate"].value)
 
     def test_build_run_env_reads_sqlite_settings(self) -> None:
         app = VidToSubApp()
@@ -913,6 +986,116 @@ class TestTranslationDefaultSetting(unittest.TestCase):
         self.assertEqual(1, len(table.rows))
         self.assertIn("42.0%", table.rows[0][5])
         self.assertTrue(count_updates)
+
+    def test_apply_progress_event_logs_failed_job_error_with_stage_and_basename(
+        self,
+    ) -> None:
+        app = VidToSubApp()
+        video_path = "/tmp/folder/video.mp4"
+        app._active_jobs[f"local:{video_path}"] = RunJobState(
+            video_path=video_path,
+            executor="local",
+            job_id=11,
+            started_at=0.0,
+        )
+        app._pending_paths["local"] = {video_path}
+        log_messages: list[str] = []
+
+        with (
+            patch.object(run_mixin, "_db") as db_mock,
+            patch.object(app, "_refresh_history"),
+            patch.object(app, "_refresh_live_panels"),
+            patch.object(app, "_show_hist_detail"),
+            patch.object(app, "_log", side_effect=log_messages.append),
+        ):
+            app._apply_progress_event(
+                "local",
+                {
+                    "event": "job_finished",
+                    "video_path": video_path,
+                    "status": "failed",
+                    "stage": "stage2",
+                    "error": (
+                        "Stage 1 transcript quality is suspicious; refusing Stage 2 "
+                        "translation without --force-translate."
+                    ),
+                },
+            )
+
+        db_mock.finish_job.assert_called_once_with(
+            11,
+            "failed",
+            output_paths=[],
+            error=(
+                "Stage 1 transcript quality is suspicious; refusing Stage 2 "
+                "translation without --force-translate."
+            ),
+            wall_sec=None,
+            video_dur=None,
+            segments=None,
+            artifact_path=None,
+            artifact_metadata=None,
+        )
+        self.assertEqual(
+            [
+                "[bold red]✕ local [stage2] video.mp4: "
+                "Stage 1 transcript quality is suspicious; refusing Stage 2 "
+                "translation without --force-translate.[/]"
+            ],
+            log_messages,
+        )
+        self.assertEqual(1, app._run_failed)
+        self.assertNotIn(f"local:{video_path}", app._active_jobs)
+        self.assertEqual(set(), app._pending_paths["local"])
+
+    def test_finalize_executor_failure_logs_per_video_reason_for_active_job(
+        self,
+    ) -> None:
+        app = VidToSubApp()
+        video_path = "/tmp/folder/video.mp4"
+        app._pending_paths["gpu-box"] = {video_path}
+        app._active_jobs[f"gpu-box:{video_path}"] = RunJobState(
+            video_path=video_path,
+            executor="gpu-box",
+            job_id=17,
+            started_at=0.0,
+        )
+        plan = ExecutorPlan(
+            name="gpu-box",
+            kind="remote",
+            label="gpu-box",
+            cmd=["ssh", "gpu-box"],
+            env=None,
+            assigned_paths=[video_path],
+            capacity=1,
+            manifest={},
+        )
+        log_messages: list[str] = []
+
+        with (
+            patch.object(run_mixin, "_db") as db_mock,
+            patch.object(app, "_refresh_history"),
+            patch.object(app, "_refresh_live_panels"),
+            patch.object(app, "_log", side_effect=log_messages.append),
+        ):
+            app._finalize_executor_failure(plan, 23)
+
+        db_mock.finish_job.assert_called_once_with(
+            17,
+            "failed",
+            error="gpu-box exited with code 23",
+        )
+        db_mock.create_job.assert_not_called()
+        self.assertEqual(
+            [
+                "[bold red]✕ gpu-box [executor] video.mp4: "
+                "gpu-box exited with code 23[/]"
+            ],
+            log_messages,
+        )
+        self.assertEqual(1, app._run_failed)
+        self.assertNotIn(f"gpu-box:{video_path}", app._active_jobs)
+        self.assertNotIn("gpu-box", app._pending_paths)
 
     def test_show_hist_detail_includes_progress_for_active_job(self) -> None:
         app = VidToSubApp()
@@ -1021,9 +1204,12 @@ class TestTranslationDefaultSetting(unittest.TestCase):
                     "device": "cpu",
                     "model": "large-v3",
                     "language": "en",
+                    "language_probability": 0.99,
+                    "duration": 1.0,
                     "target_lang": "ko",
                     "formats": ["srt"],
                     "primary_outputs": ["/tmp/a.srt"],
+                    "quality": {},
                     "segments": [],
                     "stage_status": {
                         "transcription_complete": True,
@@ -1236,6 +1422,7 @@ class TestTranslationDefaultSetting(unittest.TestCase):
                 model_name="base",
                 device="auto",
                 language=None,
+                content_type="auto",
                 beam_size=5,
                 threads=8,
             )
@@ -1272,6 +1459,7 @@ class TestTranslationDefaultSetting(unittest.TestCase):
                 model_name="base",
                 device="cpu",
                 language=None,
+                content_type="auto",
                 beam_size=5,
                 compute_type=None,
                 threads=10,
@@ -1312,6 +1500,7 @@ class TestTranslationDefaultSetting(unittest.TestCase):
                 model_name="large-v3",
                 device="cpu",
                 language=None,
+                content_type="auto",
                 beam_size=5,
                 compute_type=None,
                 threads=4,
@@ -1357,6 +1546,7 @@ class TestTranslationDefaultSetting(unittest.TestCase):
                 model_name="large-v3",
                 device="cpu",
                 language=None,
+                content_type="auto",
                 beam_size=5,
                 compute_type=None,
                 threads=4,
@@ -1366,6 +1556,7 @@ class TestTranslationDefaultSetting(unittest.TestCase):
                 model_name="large-v3",
                 device="cpu",
                 language=None,
+                content_type="auto",
                 beam_size=5,
                 compute_type=None,
                 threads=4,
@@ -1377,9 +1568,7 @@ class TestTranslationDefaultSetting(unittest.TestCase):
         self.assertEqual("hello", second_segments[0]["text"])
         self.assertEqual(
             1,
-            captured_stdout.getvalue().count(
-                "Loading faster-whisper model 'large-v3'"
-            ),
+            captured_stdout.getvalue().count("Loading faster-whisper model 'large-v3'"),
         )
 
     def test_transcribe_faster_whisper_reports_incomplete_cache(self) -> None:
@@ -1408,6 +1597,7 @@ class TestTranslationDefaultSetting(unittest.TestCase):
                         model_name="large-v3",
                         device="cpu",
                         language=None,
+                        content_type="auto",
                         beam_size=5,
                         compute_type=None,
                         threads=4,
@@ -1465,6 +1655,7 @@ class TestTranslationDefaultSetting(unittest.TestCase):
                 model_name="large-v3",
                 device="auto",
                 language=None,
+                content_type="auto",
                 beam_size=5,
                 compute_type=None,
                 threads=4,
@@ -1532,6 +1723,7 @@ class TestTranslationDefaultSetting(unittest.TestCase):
                 model_name="large-v3",
                 device="auto",
                 language=None,
+                content_type="auto",
                 beam_size=5,
                 compute_type=None,
                 threads=4,
@@ -1541,6 +1733,7 @@ class TestTranslationDefaultSetting(unittest.TestCase):
                 model_name="large-v3",
                 device="auto",
                 language=None,
+                content_type="auto",
                 beam_size=5,
                 compute_type=None,
                 threads=4,
@@ -1561,6 +1754,79 @@ class TestTranslationDefaultSetting(unittest.TestCase):
             1,
             captured_stderr.getvalue().count("falling back to CPU int8"),
         )
+
+    def test_transcribe_faster_whisper_music_mode_uses_safe_options(self) -> None:
+        captured: dict[str, object] = {}
+
+        class FakeSegment:
+            start = 0.0
+            end = 1.0
+            text = "hello"
+
+        class FakeInfo:
+            language = "ja"
+            language_probability = 0.99
+            duration = 1.0
+
+        class FakeWhisperModel:
+            def __init__(self, *_args, **_kwargs) -> None:
+                pass
+
+            def transcribe(self, *_args, **kwargs):
+                captured.update(kwargs)
+                return [FakeSegment()], FakeInfo()
+
+        with patch.dict(
+            "sys.modules",
+            {"faster_whisper": SimpleNamespace(WhisperModel=FakeWhisperModel)},
+        ):
+            _segments, info = transcribe_faster_whisper(
+                video=Path("/tmp/song.mp4"),
+                model_name="base",
+                device="cpu",
+                language="ja",
+                content_type="music",
+                beam_size=5,
+                compute_type=None,
+                threads=4,
+            )
+
+        self.assertFalse(captured["condition_on_previous_text"])
+        self.assertTrue(captured["vad_filter"])
+        self.assertEqual("music", info["content_type"])
+
+    def test_transcribe_music_mode_requires_explicit_language(self) -> None:
+        with self.assertRaises(RuntimeError) as ctx:
+            transcribe_openai_whisper(
+                video=Path("/tmp/song.mp4"),
+                model_name="base",
+                device="cpu",
+                language=None,
+                content_type="music",
+                beam_size=5,
+                threads=4,
+            )
+
+        self.assertIn("requires --language", str(ctx.exception))
+
+    def test_transcribe_music_mode_rejects_unsupported_backend(self) -> None:
+        with self.assertRaises(RuntimeError) as ctx:
+            transcribe(
+                video=Path("/tmp/song.mp4"),
+                backend="whisper-cpp",
+                model_name="base",
+                device="cpu",
+                language="ja",
+                content_type="music",
+                beam_size=5,
+                compute_type=None,
+                hf_token=None,
+                diarize=False,
+                threads=4,
+                whisper_cpp_model_path=None,
+            )
+
+        self.assertIn("not supported", str(ctx.exception))
 
     def test_translate_segments_openai_compatible_sends_accept_and_user_agent(
         self,
@@ -2138,6 +2404,62 @@ class TestTranslationDefaultSetting(unittest.TestCase):
         self.assertIsNone(app._proc)
         self.assertIn("\n[bold green]✓ Completed (exit 0)[/]", logs)
 
+    def test_stream_logs_distributed_stage1_handoff_limitation_when_no_local_artifacts(
+        self,
+    ) -> None:
+        app = VidToSubApp()
+        logs: list[str] = []
+
+        class FakeProc:
+            def __init__(self) -> None:
+                self.stdout = io.StringIO("")
+                self.stdin = None
+                self.wait_calls = 0
+
+            def poll(self) -> int | None:
+                return 0
+
+            def wait(self, timeout: float | None = None) -> int:
+                self.wait_calls += 1
+                return 0
+
+            def terminate(self) -> None:
+                raise AssertionError("terminate should not be called")
+
+        proc = FakeProc()
+        plan = SimpleNamespace(
+            label="gpu-box",
+            kind="remote",
+            cmd=["ssh", "gpu-box"],
+            env=None,
+            stdin_payload=None,
+            stage="stage1",
+            assigned_paths=["/tmp/video.mp4"],
+        )
+
+        with (
+            patch("vid_to_sub_app.tui.app.subprocess.Popen", return_value=proc),
+            patch.object(
+                app,
+                "call_from_thread",
+                side_effect=lambda callback, *args: callback(*args),
+            ),
+            patch.object(app, "_log", side_effect=logs.append),
+            patch.object(app, "_apply_progress_event", return_value=None),
+            patch.object(app, "_collect_stage1_artifacts", return_value=[]),
+            patch.object(app, "_schedule_stage2_from_artifacts") as schedule_mock,
+        ):
+            VidToSubApp._stream.__wrapped__(app, [plan])
+
+        schedule_mock.assert_not_called()
+        self.assertIn("\n[bold green]✓ Completed (exit 0)[/]", logs)
+        self.assertIn(
+            "[yellow]Stage handoff: distributed stage-1 completed, but automatic "
+            "stage-2 only scans locally visible .stage1.json artifacts. Copy "
+            "artifacts locally or run --translate-from-artifact manually.[/]",
+            logs,
+        )
+
 
 class TestSubtitleCopyHelper(unittest.TestCase):
     """Unit tests for vid_to_sub_app.cli.subtitle_copy (no textual required)."""
@@ -2307,7 +2629,7 @@ class TestSaveSettingsCharacterization(unittest.TestCase):
     - the full fan-out sequence fires after a valid save
     """
 
-    def _make_widgets(self, *, remote_json: str = "[]") -> dict:
+    def _make_widgets(self, *, remote_json: str = "[]") -> dict[str, SimpleNamespace]:
         return {
             "#stg-wcpp-bin": SimpleNamespace(value="/bin/whisper-cli"),
             "#stg-wcpp-model": SimpleNamespace(value="large-v3"),
@@ -2326,7 +2648,9 @@ class TestSaveSettingsCharacterization(unittest.TestCase):
             "#stg-browse-root": SimpleNamespace(value=""),
             "#stg-default-output-dir": SimpleNamespace(value="/out"),
             "#stg-default-translate-to": SimpleNamespace(value="ko"),
+            "#stg-default-content-type": SimpleNamespace(value="music"),
             "#sw-stg-translate-enabled": SimpleNamespace(value=True),
+            "#sw-stg-force-translate": SimpleNamespace(value=True),
             "#stg-remote-resources": SimpleNamespace(text=remote_json),
             "#sel-execution-mode": SimpleNamespace(value="local"),
             "#stg-status": SimpleNamespace(update=lambda _: None),
@@ -2340,7 +2664,9 @@ class TestSaveSettingsCharacterization(unittest.TestCase):
             "#inp-wcpp-bin": SimpleNamespace(value=""),
             "#inp-output-dir": SimpleNamespace(value=""),
             "#inp-translate-to": SimpleNamespace(value=""),
+            "#sel-content-type": SimpleNamespace(value="auto"),
             "#sw-translate": SimpleNamespace(value=False),
+            "#sw-force-translate": SimpleNamespace(value=False),
         }
 
     def test_save_settings_persists_widget_values_to_db(self) -> None:
@@ -2355,14 +2681,14 @@ class TestSaveSettingsCharacterization(unittest.TestCase):
                 return widgets[selector]
             raise NoMatches(selector)
 
-        saved: list[dict] = []
+        saved: list[dict[str, str]] = []
 
         with tempfile.TemporaryDirectory() as tmpdir:
             temp_db = Database(Path(tmpdir) / "state.db")
 
             original_set_many = temp_db.set_many
 
-            def capturing_set_many(data: dict) -> None:
+            def capturing_set_many(data: dict[str, str]) -> None:
                 saved.append(dict(data))
                 original_set_many(data)
 
@@ -2372,8 +2698,12 @@ class TestSaveSettingsCharacterization(unittest.TestCase):
                 patch.object(settings_mixin, "_db", temp_db),
                 patch.object(app, "query_one", side_effect=query_one),
                 patch.object(app, "_apply_db_to_env", return_value=None),
-                patch.object(app, "_sync_transcribe_overrides_from_settings", return_value=None),
-                patch.object(app, "_sync_run_defaults_from_settings", return_value=None),
+                patch.object(
+                    app, "_sync_transcribe_overrides_from_settings", return_value=None
+                ),
+                patch.object(
+                    app, "_sync_run_defaults_from_settings", return_value=None
+                ),
                 patch.object(app, "_load_remote_resources", return_value=None),
                 patch.object(app, "_run_detection", return_value=None),
                 patch.object(app, "_update_wcpp_model_status", return_value=None),
@@ -2390,9 +2720,10 @@ class TestSaveSettingsCharacterization(unittest.TestCase):
         self.assertIn("tui.default_output_dir", payload)
         self.assertEqual("/out", payload["tui.default_output_dir"])
         # translate enabled flag
-        from vid_to_sub_app.db import TUI_DEFAULT_TRANSLATE_ENABLED_KEY
         self.assertIn(TUI_DEFAULT_TRANSLATE_ENABLED_KEY, payload)
         self.assertEqual("1", payload[TUI_DEFAULT_TRANSLATE_ENABLED_KEY])
+        self.assertEqual("music", payload[TUI_DEFAULT_CONTENT_TYPE_KEY])
+        self.assertEqual("1", payload[TUI_DEFAULT_FORCE_TRANSLATE_KEY])
 
     def test_save_settings_invalid_remote_json_aborts_before_db_write(self) -> None:
         """_save_settings() must reject invalid remote JSON without touching the DB."""
@@ -2413,7 +2744,7 @@ class TestSaveSettingsCharacterization(unittest.TestCase):
 
             original_set_many = temp_db.set_many
 
-            def counting_set_many(data: dict) -> None:
+            def counting_set_many(data: dict[str, str]) -> None:
                 nonlocal write_count
                 write_count += 1
                 original_set_many(data)
@@ -2427,7 +2758,66 @@ class TestSaveSettingsCharacterization(unittest.TestCase):
             ):
                 app._save_settings()
 
-        self.assertEqual(0, write_count, "Invalid remote JSON must prevent any db write")
+        self.assertEqual(
+            0, write_count, "Invalid remote JSON must prevent any db write"
+        )
+
+    def test_remote_status_warns_on_legacy_name_shadow_and_target_alias_drift(
+        self,
+    ) -> None:
+        app = VidToSubApp()
+        legacy_remote_json = json.dumps(
+            [
+                {
+                    "name": "gpu-box",
+                    "ssh_target": "user@gpu-host",
+                    "remote_workdir": "/srv/legacy-shadow",
+                },
+                {
+                    "name": "gpu-alias",
+                    "ssh_target": "user@gpu-host",
+                    "remote_workdir": "/srv/vid_to_sub",
+                },
+            ]
+        )
+        widgets = self._make_widgets(remote_json=legacy_remote_json)
+        widgets["#sel-execution-mode"].value = "distributed"
+        remote_status_updates: list[str] = []
+        widgets["#remote-status"] = SimpleNamespace(
+            update=lambda value: remote_status_updates.append(value)
+        )
+
+        def query_one(selector: str, *_args):
+            if selector in widgets:
+                return widgets[selector]
+            raise NoMatches(selector)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            temp_db = Database(Path(tmpdir) / "state.db")
+            temp_db.set("tui.remote_resources", legacy_remote_json)
+            temp_db.add_ssh_connection(
+                host="gpu-host",
+                label="gpu-box",
+                user="user",
+                remote_workdir="/srv/vid_to_sub",
+            )
+
+            with (
+                patch("vid_to_sub_app.tui.app._db", temp_db),
+                patch.object(app, "query_one", side_effect=query_one),
+            ):
+                app._load_remote_resources()
+                app._update_remote_status()
+
+        self.assertEqual(
+            ["gpu-box", "gpu-alias"], [p.name for p in app._remote_resources]
+        )
+        self.assertTrue(remote_status_updates)
+        status = remote_status_updates[-1]
+        self.assertIn("SSH connections override legacy remote JSON", status)
+        self.assertIn("gpu-box", status)
+        self.assertIn("gpu-alias, gpu-box", status)
+        self.assertIn("Distributed assignment still keys off profile names.", status)
 
     def test_save_settings_fan_out_order(self) -> None:
         """After a valid save, _save_settings() must call all six update helpers.
@@ -2454,30 +2844,44 @@ class TestSaveSettingsCharacterization(unittest.TestCase):
                 patch.object(settings_mixin, "_db", temp_db),
                 patch.object(app, "query_one", side_effect=query_one),
                 patch.object(app, "_apply_db_to_env", return_value=None),
-                patch.object(app, "_sync_transcribe_overrides_from_settings", return_value=None),
-                patch.object(app, "_sync_run_defaults_from_settings", return_value=None),
                 patch.object(
-                    app, "_load_remote_resources",
+                    app, "_sync_transcribe_overrides_from_settings", return_value=None
+                ),
+                patch.object(
+                    app, "_sync_run_defaults_from_settings", return_value=None
+                ),
+                patch.object(
+                    app,
+                    "_load_remote_resources",
                     side_effect=lambda: fan_out_calls.append("_load_remote_resources"),
                 ),
                 patch.object(
-                    app, "_run_detection",
+                    app,
+                    "_run_detection",
                     side_effect=lambda: fan_out_calls.append("_run_detection"),
                 ),
                 patch.object(
-                    app, "_update_wcpp_model_status",
-                    side_effect=lambda: fan_out_calls.append("_update_wcpp_model_status"),
+                    app,
+                    "_update_wcpp_model_status",
+                    side_effect=lambda: fan_out_calls.append(
+                        "_update_wcpp_model_status"
+                    ),
                 ),
                 patch.object(
-                    app, "_update_remote_status",
+                    app,
+                    "_update_remote_status",
                     side_effect=lambda: fan_out_calls.append("_update_remote_status"),
                 ),
                 patch.object(
-                    app, "_update_agent_config_status",
-                    side_effect=lambda: fan_out_calls.append("_update_agent_config_status"),
+                    app,
+                    "_update_agent_config_status",
+                    side_effect=lambda: fan_out_calls.append(
+                        "_update_agent_config_status"
+                    ),
                 ),
                 patch.object(
-                    app, "_update_cmd_preview",
+                    app,
+                    "_update_cmd_preview",
                     side_effect=lambda: fan_out_calls.append("_update_cmd_preview"),
                 ),
             ):
@@ -2496,6 +2900,7 @@ class TestSaveSettingsCharacterization(unittest.TestCase):
             set(fan_out_calls),
             f"fan-out helpers missing or extra: got {fan_out_calls}",
         )
+
 
 if __name__ == "__main__":
     unittest.main()
