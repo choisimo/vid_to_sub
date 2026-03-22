@@ -39,6 +39,7 @@ from textual.widgets import (
 )
 from textual.worker import Worker, WorkerState
 
+from vid_to_sub_app.db import TUI_DEFAULT_TRANSLATE_ENABLED_KEY
 from vid_to_sub_app.cli import (
     apply_runtime_path_map_to_manifest,
     build_run_manifest,
@@ -129,7 +130,7 @@ class VidToSubApp(
     HistoryMixin,
     SettingsMixin,
     AgentMixin,
-    App,
+    App[None],
 ):
     """vid_to_sub TUI v2 — DirectoryTree + SQLite + auto-install."""
 
@@ -148,6 +149,7 @@ class VidToSubApp(
         Binding("4", "tab('tab-history')", show=False),
         Binding("5", "tab('tab-settings')", show=False),
         Binding("6", "tab('tab-agent')", show=False),
+        Binding("7", "tab('tab-logs')", show=False),
     ]
 
     def __init__(self) -> None:
@@ -162,10 +164,13 @@ class VidToSubApp(
         self._remote_resources: list[RemoteResourceProfile] = []
         self._ssh_selected_id: int | None = None  # selected SSH connection id
         self._agent_plan: dict[str, Any] | None = None
-        self._active_worker: Worker | None = None
-        self._proc: subprocess.Popen | None = None
+        self._active_worker: Worker[None] | None = None
+        self._proc: subprocess.Popen[str] | None = None
         self._procs: dict[str, subprocess.Popen[str]] = {}
+        self._run_row_widgets: dict[str, Static] = {}
         self._hist_key: str | None = None
+        self._hist_selected: set[str] = set()
+        self._hist_select_mode = False
         self._active_jobs: dict[str, RunJobState] = {}
         self._pending_paths: dict[str, set[str]] = {}
         self._run_started_at: float | None = None
@@ -231,7 +236,11 @@ class VidToSubApp(
                                     placeholder="Or type/paste path here…",
                                     id="inp-manual-path",
                                 )
-                                yield Button("Add", id=ButtonId.MANUAL_ADD, variant="default")
+                                yield Button(
+                                    "Add",
+                                    id=ButtonId.MANUAL_ADD,
+                                    variant="default",
+                                )
 
                             yield Static("Quick Search", classes="stitle")
                             with Horizontal(id="search-row"):
@@ -574,11 +583,46 @@ class VidToSubApp(
                 with TabPane("4 History", id="tab-history"):
                     with Vertical(id="hist-pane"):
                         with Horizontal(id="hist-actions"):
-                            yield Button("Refresh", id=ButtonId.HIST_REFRESH, variant="default")
-                            yield Button("Load",    id=ButtonId.HIST_LOAD,    variant="primary")
-                            yield Button("Rerun",   id=ButtonId.HIST_RERUN,   variant="success")
-                            yield Button("Clear",   id=ButtonId.HIST_CLEAR,   variant="error")
-                            yield Button("Delete",  id=ButtonId.HIST_DELETE,  variant="warning")
+                            yield Button(
+                                "Refresh",
+                                id=ButtonId.HIST_REFRESH,
+                                variant="default",
+                            )
+                            yield Button(
+                                "Load",
+                                id=ButtonId.HIST_LOAD,
+                                variant="primary",
+                            )
+                            yield Button(
+                                "Rerun",
+                                id=ButtonId.HIST_RERUN,
+                                variant="success",
+                            )
+                            yield Button(
+                                "Translate",
+                                id=ButtonId.HIST_TRANSLATE,
+                                variant="primary",
+                            )
+                            yield Button(
+                                "Select",
+                                id=ButtonId.HIST_SELECT_MODE,
+                                variant="default",
+                            )
+                            yield Button(
+                                "Copy Selected",
+                                id=ButtonId.HIST_COPY,
+                                variant="default",
+                            )
+                            yield Button(
+                                "Clear",
+                                id=ButtonId.HIST_CLEAR,
+                                variant="error",
+                            )
+                            yield Button(
+                                "Delete",
+                                id=ButtonId.HIST_DELETE,
+                                variant="warning",
+                            )
                             yield Static("", id="hist-count")
                         yield DataTable(
                             id="hist-table",
@@ -717,6 +761,9 @@ class VidToSubApp(
                                 classes="fwidget",
                                 placeholder="ko",
                             )
+                        with Horizontal(classes="crow"):
+                            yield Label("Translation enabled by default")
+                            yield Switch(id="sw-stg-translate-enabled", value=True)
 
                         yield Static("Remote Resources", classes="stitle")
                         yield Static(
@@ -729,8 +776,8 @@ class VidToSubApp(
                             soft_wrap=False,
                             language="json",
                             placeholder=(
-                                '[\n'
-                                '  {\n'
+                                "[\n"
+                                "  {\n"
                                 '    "name": "gpu-box",\n'
                                 '    "ssh_target": "user@gpu-host",\n'
                                 '    "remote_workdir": "/home/user/vid_to_sub",\n'
@@ -838,16 +885,48 @@ class VidToSubApp(
                             )
                         yield Static("", id="ssh-form-status", markup=True)
                         with Horizontal(id="ssh-form-actions"):
-                            yield Button("Add Connection",  id=ButtonId.SSH_ADD,    variant="primary")
-                            yield Button("Update Selected", id=ButtonId.SSH_UPDATE, variant="default")
-                            yield Button("Delete Selected", id=ButtonId.SSH_DELETE, variant="warning")
-                            yield Button("Clear Form",      id=ButtonId.SSH_CLEAR,  variant="default")
+                            yield Button(
+                                "Add Connection",
+                                id=ButtonId.SSH_ADD,
+                                variant="primary",
+                            )
+                            yield Button(
+                                "Update Selected",
+                                id=ButtonId.SSH_UPDATE,
+                                variant="default",
+                            )
+                            yield Button(
+                                "Delete Selected",
+                                id=ButtonId.SSH_DELETE,
+                                variant="warning",
+                            )
+                            yield Button(
+                                "Clear Form",
+                                id=ButtonId.SSH_CLEAR,
+                                variant="default",
+                            )
                         yield Static("", id="stg-status", markup=True)
                         with Horizontal(id="stg-actions"):
-                            yield Button("Save",            id=ButtonId.STG_SAVE,   variant="primary")
-                            yield Button("Reload",          id=ButtonId.STG_RELOAD, variant="default")
-                            yield Button("Export .env",     id=ButtonId.EXPORT_ENV, variant="default")
-                            yield Button("Import from .env", id=ButtonId.IMPORT_ENV, variant="default")
+                            yield Button(
+                                "Save",
+                                id=ButtonId.STG_SAVE,
+                                variant="primary",
+                            )
+                            yield Button(
+                                "Reload",
+                                id=ButtonId.STG_RELOAD,
+                                variant="default",
+                            )
+                            yield Button(
+                                "Export .env",
+                                id=ButtonId.EXPORT_ENV,
+                                variant="default",
+                            )
+                            yield Button(
+                                "Import from .env",
+                                id=ButtonId.IMPORT_ENV,
+                                variant="default",
+                            )
 
                 # ── Tab 6: Agent ──────────────────────────────────────
                 with TabPane("6 Agent", id="tab-agent"):
@@ -893,6 +972,18 @@ class VidToSubApp(
                             max_lines=4000,
                         )
 
+                # -- Tab 7: Logs ------------------------------------------------
+                with TabPane("7 Logs", id="tab-logs"):
+                    log_full = RichLog(
+                        id="log-full",
+                        highlight=True,
+                        markup=True,
+                        auto_scroll=True,
+                        wrap=True,
+                        max_lines=5000,
+                    )
+                    yield log_full
+
         # ── Bottom panel (always visible) ─────────────────────────────────
         with Vertical(id="bottom"):
             with Horizontal(id="run-toolbar"):
@@ -910,7 +1001,10 @@ class VidToSubApp(
                 )
             yield Static(_progress_bar_markup(0, 0), id="run-progress", markup=True)
             with Vertical(id="run-active-box"):
-                yield Static("[dim]Current jobs will appear here when a run starts.[/]", markup=True)
+                yield Static(
+                    "[dim]Current jobs will appear here when a run starts.[/]",
+                    markup=True,
+                )
             yield RichLog(
                 id="log",
                 highlight=True,
@@ -930,6 +1024,7 @@ class VidToSubApp(
         self._apply_db_to_env()
         self._load_settings_form()
         self._prefill_transcribe()
+        self._sync_translation_switch_state()
         self._load_setup_inputs()
         self._init_history_table()
         self._refresh_history()
@@ -950,7 +1045,33 @@ class VidToSubApp(
         self._refresh_live_panels()
         self._update_agent_config_status()
         self._sync_run_command_panel()
+        self._sync_bottom_visibility()
         self.set_interval(1.0, self._refresh_live_panels)
+
+    def _sync_translation_switch_state(self) -> None:
+        try:
+            translate_enabled = self.query_one("#sw-translate", Switch).value
+        except NoMatches:
+            return
+
+        try:
+            trans_fields = self.query_one("#trans-fields")
+            if translate_enabled:
+                trans_fields.remove_class("hidden")
+            else:
+                trans_fields.add_class("hidden")
+        except NoMatches:
+            pass
+
+        try:
+            post_switch_enabled = self.query_one("#sw-postprocess", Switch).value
+            post_fields = self.query_one("#post-fields")
+            if translate_enabled and post_switch_enabled:
+                post_fields.remove_class("hidden")
+            else:
+                post_fields.add_class("hidden")
+        except NoMatches:
+            pass
 
     def _sync_run_command_panel(self) -> None:
         try:
@@ -965,6 +1086,37 @@ class VidToSubApp(
         else:
             panel.remove_class("collapsed")
             toggle.label = "Cmd ▾"
+
+    def _is_logs_tab(self, active_tab: str | None) -> bool:
+        return active_tab == "tab-logs"
+
+    def _sync_bottom_visibility(self, active_tab: str | None = None) -> None:
+        try:
+            bottom = self.query_one("#bottom")
+        except NoMatches:
+            return
+
+        if active_tab is None:
+            try:
+                active_tab = self.query_one("TabbedContent", TabbedContent).active
+            except NoMatches:
+                active_tab = None
+
+        if self._is_logs_tab(active_tab):
+            bottom.add_class("hidden-on-logs")
+        else:
+            bottom.remove_class("hidden-on-logs")
+
+    def _clear_runtime_logs(self) -> None:
+        try:
+            self.query_one("#log", RichLog).clear()
+        except NoMatches:
+            pass
+
+        try:
+            self.query_one("#log-full", RichLog).clear()
+        except NoMatches:
+            pass
 
     # ── Event handlers ────────────────────────────────────────────────────
 
@@ -1022,6 +1174,7 @@ class VidToSubApp(
 
     def on_switch_changed(self, event: Switch.Changed) -> None:
         if event.switch.id == "sw-translate":
+            _db.set_setting(TUI_DEFAULT_TRANSLATE_ENABLED_KEY, event.value)
             try:
                 flds = self.query_one("#trans-fields")
                 if event.value:
@@ -1064,6 +1217,8 @@ class VidToSubApp(
         if event.data_table.id == "hist-table":
             key = event.row_key
             self._hist_key = str(key.value) if key else None
+            if self._hist_select_mode and self._hist_key:
+                self._toggle_history_selection(self._hist_key)
             self._show_hist_detail(self._hist_key)
             self._refresh_live_panels()
         elif event.data_table.id == "ssh-conn-table":
@@ -1111,6 +1266,12 @@ class VidToSubApp(
             if event.worker.name == "_stream":
                 self._refresh_history()
         self._refresh_live_panels()
+
+    def on_tabbed_content_tab_activated(
+        self, event: TabbedContent.TabActivated
+    ) -> None:
+        pane = getattr(event, "pane", None)
+        self._sync_bottom_visibility(getattr(pane, "id", None))
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         """Route button events to domain handlers via ALL_ACTIONS dispatch table.
@@ -1291,9 +1452,21 @@ class VidToSubApp(
         if self._hist_key:
             self._rerun_history_job(int(self._hist_key))
 
+    def _action_hist_translate(self) -> None:
+        if self._hist_key:
+            self._translate_history_job(int(self._hist_key))
+
+    def _action_hist_select_mode(self) -> None:
+        self._toggle_history_select_mode()
+
+    def _action_hist_copy(self) -> None:
+        dest_dir = Path(self._val("inp-output-dir") or str(Path.home()))
+        self._copy_selected_subtitles(dest_dir)
+
     def _action_hist_clear(self) -> None:
         _db.clear_jobs()
         self._hist_key = None
+        self._reset_history_selection()
         self._refresh_history()
         self._refresh_live_panels()
 
@@ -1301,6 +1474,7 @@ class VidToSubApp(
         if self._hist_key:
             _db.delete_job(int(self._hist_key))
             self._hist_key = None
+            self._reset_history_selection()
             self._refresh_history()
             self._refresh_live_panels()
 
@@ -1333,6 +1507,25 @@ class VidToSubApp(
         if self._proc and self._proc.poll() is None:
             self._proc.terminate()
             terminated = True
+        # Give processes a brief window to exit after SIGTERM, then SIGKILL stragglers.
+        for proc in list(self._procs.values()):
+            try:
+                proc.wait(timeout=0.5)
+            except subprocess.TimeoutExpired:
+                try:
+                    proc.kill()
+                except OSError:
+                    pass
+        if self._proc and self._proc.poll() is None:
+            try:
+                self._proc.wait(timeout=0.5)
+            except subprocess.TimeoutExpired:
+                try:
+                    self._proc.kill()
+                except OSError:
+                    pass
+        self._procs.clear()
+        self._proc = None
         if terminated:
             self._refresh_live_panels()
         if self._active_worker and self._active_worker.is_running:
@@ -1344,9 +1537,10 @@ class VidToSubApp(
 
     def action_tab(self, tab: str) -> None:
         try:
-            self.query_one(TabbedContent).active = tab
+            self.query_one("TabbedContent", TabbedContent).active = tab
         except NoMatches:
             pass
+        self._sync_bottom_visibility(tab)
 
     async def action_quit_app(self) -> None:
         self.action_kill()
@@ -1377,12 +1571,16 @@ class VidToSubApp(
     def _selected_history_job(self) -> dict[str, Any] | None:
         if not self._hist_key:
             return None
-        return next((job for job in _db.get_jobs() if str(job["id"]) == self._hist_key), None)
+        return next(
+            (job for job in _db.get_jobs() if str(job["id"]) == self._hist_key), None
+        )
 
     def _refresh_live_panels(self) -> None:
         running = bool(self._active_worker and self._active_worker.is_running)
         elapsed = (
-            time.monotonic() - self._run_started_at if self._run_started_at is not None else None
+            time.monotonic() - self._run_started_at
+            if self._run_started_at is not None
+            else None
         )
         processed = self._run_completed + self._run_failed
         remaining = max(0, self._run_total_queued - processed)
@@ -1408,9 +1606,12 @@ class VidToSubApp(
         except NoMatches:
             box = None
         if box is not None and box.is_attached:
-            box.remove_children()
             if self._active_jobs:
-                for job in sorted(self._active_jobs.values(), key=lambda item: item.started_at):
+                # Compute the new label for each active job.
+                new_labels: dict[str, str] = {}
+                for job in sorted(
+                    self._active_jobs.values(), key=lambda item: item.started_at
+                ):
                     run_for = max(0.0, time.monotonic() - job.started_at)
                     label = (
                         f"[cyan]{job.executor}[/] "
@@ -1444,21 +1645,52 @@ class VidToSubApp(
                             + _progress_bar_markup_ratio(progress_ratio, width=20)
                             + f"  {progress_meta}"
                         )
-                    box.mount(Static(label, classes="run-active-row", markup=True))
-            elif running:
-                box.mount(
-                    Static(
-                        "[dim]Preparing executors or waiting for the first file to start…[/]",
-                        markup=True,
-                    )
-                )
+                    new_labels[job.video_path] = label
+
+                # Remove widgets for jobs that have ended.
+                stale_keys = set(self._run_row_widgets) - set(new_labels)
+                for key in stale_keys:
+                    widget = self._run_row_widgets.pop(key)
+                    try:
+                        widget.remove()
+                    except Exception:
+                        pass
+                # Clear the sentinel status widget if present.
+                if "__status__" in self._run_row_widgets:
+                    widget = self._run_row_widgets.pop("__status__")
+                    try:
+                        widget.remove()
+                    except Exception:
+                        pass
+
+                # Update existing or mount new widgets.
+                for key, label in new_labels.items():
+                    if key in self._run_row_widgets:
+                        self._run_row_widgets[key].update(label)
+                    else:
+                        w = Static(label, classes="run-active-row", markup=True)
+                        self._run_row_widgets[key] = w
+                        box.mount(w)
             else:
-                box.mount(
-                    Static(
-                        "[dim]Current jobs will appear here when a run starts.[/]",
-                        markup=True,
-                    )
+                # No active jobs — show a single status widget.
+                status_text = (
+                    "[dim]Preparing executors or waiting for the first file to start…[/]"
+                    if running
+                    else "[dim]Current jobs will appear here when a run starts.[/]"
                 )
+                if "__status__" in self._run_row_widgets:
+                    self._run_row_widgets["__status__"].update(status_text)
+                else:
+                    # Remove any stale job widgets first.
+                    for key, widget in list(self._run_row_widgets.items()):
+                        try:
+                            widget.remove()
+                        except Exception:
+                            pass
+                    self._run_row_widgets.clear()
+                    w = Static(status_text, markup=True)
+                    self._run_row_widgets["__status__"] = w
+                    box.mount(w)
 
         selected = self._selected_history_job()
         live_lines = [
@@ -1501,7 +1733,9 @@ class VidToSubApp(
                         profiles.append(lp)
             except ValueError as exc:
                 try:
-                    self.query_one("#stg-status", Static).update(f"[yellow]Legacy remote JSON warning: {exc}[/]")
+                    self.query_one("#stg-status", Static).update(
+                        f"[yellow]Legacy remote JSON warning: {exc}[/]"
+                    )
                 except NoMatches:
                     pass
         self._remote_resources = profiles
@@ -1509,8 +1743,11 @@ class VidToSubApp(
     def _update_remote_status(self) -> None:
         """Refresh the remote-status label in the Transcribe tab."""
         from .helpers import summarize_remote_resources
+
         try:
-            mode = self._sel("sel-execution-mode", _db.get("tui.execution_mode") or "local")
+            mode = self._sel(
+                "sel-execution-mode", _db.get("tui.execution_mode") or "local"
+            )
             if mode == "distributed" and self._remote_resources:
                 msg = f"[cyan]Distributed:[/] {summarize_remote_resources(self._remote_resources)}"
             elif mode == "distributed":
@@ -1522,7 +1759,6 @@ class VidToSubApp(
             pass
 
     def _validate_button_handlers(self) -> None:
-
         """Startup guard: assert every ActionSpec.handler_name resolves to a method.
 
         Raises RuntimeError at mount-time (not at button-press time) so mis-wired
@@ -1553,18 +1789,18 @@ class VidToSubApp(
 
     # ── Widget accessors ──────────────────────────────────────────────────
 
-    def _val(self, wid: str) -> str:
+    def _val(self, widget_id: str) -> str:
         try:
-            return self.query_one(f"#{wid}", Input).value.strip()
+            return self.query_one(f"#{widget_id}", Input).value.strip()
         except NoMatches:
             return ""
 
-    def _sel(self, wid: str, fallback: str = "") -> str:
+    def _sel(self, widget_id: str, default: str = "") -> str:
         try:
-            v = self.query_one(f"#{wid}", Select).value
-            return str(v) if v is not Select.BLANK else fallback
+            v = self.query_one(f"#{widget_id}", Select).value
+            return str(v) if v is not Select.BLANK else default
         except NoMatches:
-            return fallback
+            return default
 
     def _chk(self, wid: str) -> bool:
         try:
@@ -1581,6 +1817,11 @@ class VidToSubApp(
     def _log(self, text: str) -> None:
         try:
             self.query_one("#log", RichLog).write(text)
+        except NoMatches:
+            pass
+
+        try:
+            self.query_one("#log-full", RichLog).write(text)
         except NoMatches:
             pass
 

@@ -339,6 +339,9 @@ DirectoryTree { height: 1fr; }
     padding: 0 1;
     layout: vertical;
 }
+#bottom.hidden-on-logs {
+    display: none;
+}
 #run-toolbar { height: auto; min-height: 1; margin-top: 0; align: left middle; }
 #run-overview {
     width: 1fr;
@@ -385,6 +388,7 @@ DirectoryTree { height: 1fr; }
 #run-btns { height: auto; min-height: 1; margin-bottom: 0; align: left middle; }
 #run-btns Button { margin-right: 1; }
 #btn-toggle-run-shell { min-width: 8; }
+#log-full { height: 1fr; }
 #log { height: 1fr; min-height: 4; background: $surface-darken-1; }
 """
 
@@ -392,4 +396,3 @@ DirectoryTree { height: 1fr; }
 # ---------------------------------------------------------------------------
 # Application
 # ---------------------------------------------------------------------------
-

@@ -10,6 +10,7 @@ from typing import Any, Sequence
 from vid_to_sub_app.db import Database
 
 from .discovery import hash_video_folder
+from .stage_artifact import StageArtifactMetadata
 
 _folder_state_db = Database()
 
@@ -21,7 +22,9 @@ def build_run_manifest(
     skipped: int = 0,
 ) -> dict[str, Any]:
     folders: dict[str, dict[str, Any]] = {}
-    for raw_video in sorted(str(Path(video).expanduser().resolve()) for video in videos):
+    for raw_video in sorted(
+        str(Path(video).expanduser().resolve()) for video in videos
+    ):
         video_path = Path(raw_video)
         folder_path = str(video_path.parent)
         folder_hash = hash_video_folder(folder_path)
@@ -228,6 +231,8 @@ class ProcessResult:
     elapsed_sec: float | None = None
     error: str | None = None
     stage: str | None = None
+    artifact_path: str | None = None
+    artifact_metadata: StageArtifactMetadata | None = None
 
 
 class FolderAwareScheduler:

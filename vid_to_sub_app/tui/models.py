@@ -172,6 +172,11 @@ class ExecutorPlan:
     capacity: int
     manifest: dict[str, Any]
     stdin_payload: str | None = None
+    # Stage annotation: "full" | "stage1" | "stage2"
+    # "full"   — transcription + inline translation (default, all existing plans)
+    # "stage1" — transcription only; writes .stage1.json artifacts
+    # "stage2" — translation only from pre-existing .stage1.json artifacts
+    stage: str = "full"
 
 
 # ---------------------------------------------------------------------------
@@ -227,6 +232,8 @@ class RunConfig:
     translation_model: str | None
     translation_base_url: str | None
     translation_api_key: str | None
+    translation_chunk_size: int
+    translation_mode: str
     postprocess_enabled: bool
     postprocess_mode: str
     postprocess_model: str | None

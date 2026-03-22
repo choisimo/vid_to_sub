@@ -32,7 +32,7 @@ The Transcribe tab controls backend, model, device, execution mode, output forma
 - Output formats: `srt`, `vtt`, `txt`, `tsv`, `json`, or `all`.
 - Optional translation with an OpenAI-compatible chat-completions API while preserving the original subtitle timing boundaries.
 - Optional post-editing agent pass with separate model/API settings and an `auto` mode that prefers web lookup when available, then falls back to contextual polishing.
-- A 6-tab Textual TUI: Browse, Setup, Transcribe, History, Settings, and Agent.
+- A 7-tab Textual TUI: Browse, Setup, Transcribe, History, Settings, Agent, and Logs.
 - SQLite-backed saved settings and job history.
 - Optional distributed execution through SSH resource profiles.
 
@@ -143,7 +143,7 @@ Useful TUI shortcuts:
 - `Ctrl+D` dry run
 - `Ctrl+K` kill
 - `Ctrl+S` save settings
-- `1` to `6` switch tabs
+- `1` to `7` switch tabs
 - `Ctrl+Q` quit
 
 ## Common CLI Examples
@@ -193,6 +193,26 @@ List built-in model identifiers:
 python vid_to_sub.py --list-models
 ```
 
+Run transcription only and save a stage artifact for later translation:
+
+```bash
+python vid_to_sub.py /path/to/videos --stage1-only --translate-to ko
+```
+
+This writes `movie.srt` and a sidecar `movie.stage1.json` next to each source file.
+When a translation API becomes available, replay stage 2 on the artifact without
+re-transcribing:
+
+```bash
+python vid_to_sub.py --translate-from-artifact /path/to/movie.stage1.json
+```
+
+To force re-translation even when the artifact already records a completed
+translation pass:
+
+```bash
+python vid_to_sub.py --translate-from-artifact /path/to/movie.stage1.json --overwrite-translation
+```
 ## Environment Variables
 
 ### `whisper.cpp`

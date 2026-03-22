@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import io
 import json
 import os
@@ -11,6 +12,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from db import Database
+from textual.css.query import NoMatches
 from vid_to_sub import (
     ENV_WHISPER_CPP_BIN,
     ENV_WHISPER_CPP_MODEL,
@@ -24,12 +26,18 @@ from vid_to_sub import (
     parse_whisper_cpp_progress_seconds,
     transcribe_whisper_cpp,
 )
+from vid_to_sub_app.cli import translation_capable
+from vid_to_sub_app.cli.stage_artifact import (
+    build_stage_artifact_metadata,
+    write_stage_artifact,
+)
 from vid_to_sub_app.cli.transcription import (
     resolve_device_fw,
     transcribe_faster_whisper,
     transcribe_openai_whisper,
 )
 from vid_to_sub_app.cli.translation import translate_segments_openai_compatible
+from vid_to_sub_app.db import TUI_DEFAULT_TRANSLATE_ENABLED_KEY
 from vid_to_sub_app.shared.env import (
     faster_whisper_model_candidates,
     resolve_runtime_backend_and_device,
@@ -61,6 +69,7 @@ from tui import (
     group_paths_by_video_folder,
     summarize_ggml_models,
 )
+from vid_to_sub_app.tui.mixins import run_mixin, settings_mixin
 
 
 class TuiHelperTests(unittest.TestCase):
@@ -239,10 +248,14 @@ class TuiHelperTests(unittest.TestCase):
                 [entry["video_path"] for entry in manifest["entries"]],
             )
             self.assertEqual(2, len(manifest["folders"]))
-            self.assertEqual(hash_video_folder(alpha), manifest["folders"][0]["folder_hash"])
+            self.assertEqual(
+                hash_video_folder(alpha), manifest["folders"][0]["folder_hash"]
+            )
             self.assertEqual(2, manifest["folders"][0]["total_files"])
 
-    def test_partition_folder_groups_by_capacity_keeps_folder_videos_together(self) -> None:
+    def test_partition_folder_groups_by_capacity_keeps_folder_videos_together(
+        self,
+    ) -> None:
         groups = [
             {
                 "folder_hash": "a",
@@ -268,13 +281,15 @@ class TuiHelperTests(unittest.TestCase):
             combined,
         )
         self.assertTrue(
-            assignments["local"] in (
+            assignments["local"]
+            in (
                 ["/tmp/a/1.mp4", "/tmp/a/2.mp4"],
                 ["/tmp/b/1.mp4"],
             )
         )
         self.assertTrue(
-            assignments["gpu"] in (
+            assignments["gpu"]
+            in (
                 ["/tmp/a/1.mp4", "/tmp/a/2.mp4"],
                 ["/tmp/b/1.mp4"],
             )
@@ -307,7 +322,9 @@ class TuiHelperTests(unittest.TestCase):
         self.assertEqual("job_finished", event["event"])
         self.assertEqual("/tmp/a.mp4", event["video_path"])
 
-    def test_parse_whisper_cpp_progress_seconds_reads_segment_end_timestamp(self) -> None:
+    def test_parse_whisper_cpp_progress_seconds_reads_segment_end_timestamp(
+        self,
+    ) -> None:
         seconds = parse_whisper_cpp_progress_seconds(
             "[00:00:03.000 --> 00:00:11.250]   hello world"
         )
@@ -347,6 +364,8 @@ class TuiHelperTests(unittest.TestCase):
                 translation_model=None,
                 translation_base_url=None,
                 translation_api_key=None,
+                translation_chunk_size=100,
+                translation_mode="strict",
                 postprocess_enabled=False,
                 postprocess_mode="auto",
                 postprocess_model=None,
@@ -389,6 +408,8 @@ class TuiHelperTests(unittest.TestCase):
             translation_model="gpt-4.1-mini",
             translation_base_url="https://example.com/v1",
             translation_api_key="secret",
+            translation_chunk_size=100,
+            translation_mode="strict",
             postprocess_enabled=True,
             postprocess_mode="web_lookup",
             postprocess_model="gpt-4.1",
@@ -429,6 +450,88 @@ class TuiHelperTests(unittest.TestCase):
         self.assertNotIn("/tmp/input.mp4", plans[0].cmd)
         self.assertIsNotNone(plans[0].stdin_payload)
         self.assertIn("/tmp/input.mp4", plans[0].stdin_payload or "")
+
+    def test_build_executor_plans_distributed_with_translation_uses_stage1_for_remote(
+        self,
+    ) -> None:
+        """U4: In distributed mode with translation enabled, remote plans get stage='stage1'
+        and the local plan keeps stage='full'.
+        """
+        from vid_to_sub_app.tui.models import RemoteResourceProfile
+
+        app = VidToSubApp()
+        profile = RemoteResourceProfile(
+            name="gpu-box",
+            ssh_target="user@gpu-host",
+            remote_workdir="/srv/vid_to_sub",
+            slots=2,
+        )
+        config = RunConfig(
+            request_id=8,
+            selected_paths=["/tmp/input.mp4"],
+            output_dir=None,
+            formats=frozenset({"srt"}),
+            no_recurse=False,
+            skip_existing=False,
+            dry_run=False,
+            verbose=False,
+            backend="faster-whisper",
+            model="large-v3",
+            device="cpu",
+            language=None,
+            compute_type=None,
+            beam_size="5",
+            local_workers=1,
+            whisper_cpp_model_path=None,
+            translate_enabled=True,
+            translate_to="ko",
+            translation_model=None,
+            translation_base_url="https://translate.example/v1",
+            translation_api_key="key",
+            translation_chunk_size=100,
+            translation_mode="strict",
+            postprocess_enabled=False,
+            postprocess_mode="auto",
+            postprocess_model=None,
+            postprocess_base_url=None,
+            postprocess_api_key=None,
+            diarize=False,
+            hf_token=None,
+            execution_mode="distributed",
+            remote_resources=[profile],
+            run_env={},
+        )
+
+        plans = app._build_executor_plans(
+            ["/tmp/a/movie1.mp4", "/tmp/b/movie2.mp4"],
+            dry_run=False,
+            config=config,
+        )
+
+        remote_plans = [p for p in plans if p.kind == "remote"]
+        local_plans = [p for p in plans if p.kind == "local"]
+
+        # At least one remote plan must be stage1 only
+        for rp in remote_plans:
+            self.assertEqual(
+                "stage1",
+                rp.stage,
+                f"Remote plan '{rp.name}' should be stage1 but got '{rp.stage}'",
+            )
+            remote_cmd = " ".join(rp.cmd)
+            self.assertIn(
+                "--stage1-only",
+                remote_cmd,
+                "Remote plan command must include --stage1-only",
+            )
+
+        # Local plans (if any) run the full pass
+        for lp in local_plans:
+            self.assertEqual(
+                "full",
+                lp.stage,
+                f"Local plan should be stage='full' but got '{lp.stage}'",
+            )
 
     def test_sync_transcribe_overrides_updates_inherited_values_only(self) -> None:
         app = VidToSubApp()
@@ -480,25 +583,181 @@ class TuiHelperTests(unittest.TestCase):
         widgets = {
             "#inp-output-dir": SimpleNamespace(value="/old/output"),
             "#inp-translate-to": SimpleNamespace(value="ja"),
+            "#sw-translate": SimpleNamespace(value=False),
         }
 
         def query_one(selector: str, *_args):
-            return widgets[selector]
+            if selector in widgets:
+                return widgets[selector]
+            raise NoMatches(selector)
 
         with patch.object(app, "query_one", side_effect=query_one):
             app._sync_run_defaults_from_settings(
                 previous_values={
                     "tui.default_output_dir": "/old/output",
                     "tui.default_translate_to": "ko",
+                    "tui.default_translate_enabled": "1",
+                    ENV_TRANS_URL: "",
                 },
                 updated_values={
                     "tui.default_output_dir": "/new/output",
                     "tui.default_translate_to": "en",
+                    "tui.default_translate_enabled": "1",
+                    ENV_TRANS_URL: "",
                 },
             )
 
         self.assertEqual("/new/output", widgets["#inp-output-dir"].value)
         self.assertEqual("ja", widgets["#inp-translate-to"].value)
+        self.assertFalse(widgets["#sw-translate"].value)
+
+
+class TestTranslationCapabilityGuard(unittest.TestCase):
+    def test_capable_when_url_and_target_set(self) -> None:
+        args = argparse.Namespace(
+            translate_to="ko",
+            translation_base_url="https://translate.example/v1",
+        )
+
+        self.assertTrue(translation_capable(args))
+
+    def test_not_capable_when_url_missing(self) -> None:
+        self.assertFalse(
+            translation_capable(
+                argparse.Namespace(translate_to="ko", translation_base_url="")
+            )
+        )
+        self.assertFalse(
+            translation_capable(
+                argparse.Namespace(translate_to="ko", translation_base_url=None)
+            )
+        )
+
+    def test_not_capable_when_target_missing(self) -> None:
+        self.assertFalse(
+            translation_capable(
+                argparse.Namespace(
+                    translate_to=None,
+                    translation_base_url="https://translate.example/v1",
+                )
+            )
+        )
+
+
+class TestTranslationDefaultSetting(unittest.TestCase):
+    def test_default_key_name(self) -> None:
+        self.assertEqual(
+            "tui.default_translate_enabled", TUI_DEFAULT_TRANSLATE_ENABLED_KEY
+        )
+
+    def test_db_roundtrip(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db = Database(Path(tmpdir) / "state.db")
+
+            db.set_setting(TUI_DEFAULT_TRANSLATE_ENABLED_KEY, True)
+            self.assertTrue(db.get_setting(TUI_DEFAULT_TRANSLATE_ENABLED_KEY, False))
+
+            db.set_setting(TUI_DEFAULT_TRANSLATE_ENABLED_KEY, False)
+            self.assertFalse(db.get_setting(TUI_DEFAULT_TRANSLATE_ENABLED_KEY, True))
+
+    def test_get_jobs_backfills_artifact_path_from_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db = Database(Path(tmpdir) / "state.db")
+            artifact_path = Path(tmpdir) / "movie.stage1.json"
+            job_id = db.create_job("/tmp/movie.mp4", "whisper-cpp", "large-v3")
+
+            db.finish_job(
+                job_id,
+                "done",
+                output_paths=["/tmp/movie.srt"],
+                artifact_metadata=build_stage_artifact_metadata(artifact_path),
+            )
+
+            job = db.get_jobs(limit=1)[0]
+
+        metadata = job.get("artifact_metadata")
+        self.assertEqual(str(artifact_path), job.get("artifact_path"))
+        self.assertIsInstance(metadata, dict)
+        assert metadata is not None
+        metadata_dict = metadata
+        self.assertEqual(str(artifact_path), metadata_dict.get("path"))
+
+    def test_get_jobs_keeps_legacy_artifact_path_readable_when_metadata_missing(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db = Database(Path(tmpdir) / "state.db")
+            artifact_path = str(Path(tmpdir) / "legacy.stage1.json")
+            job_id = db.create_job("/tmp/movie.mp4", "whisper-cpp", "large-v3")
+
+            db.finish_job(job_id, "done", artifact_path=artifact_path)
+
+            job = db.get_jobs(limit=1)[0]
+
+        metadata = job.get("artifact_metadata")
+        self.assertEqual(artifact_path, job.get("artifact_path"))
+        self.assertIsInstance(metadata, dict)
+        assert metadata is not None
+        metadata_dict = metadata
+        self.assertEqual(artifact_path, metadata_dict.get("path"))
+
+    def test_loading_settings_restores_toggle_correctly(self) -> None:
+        app = VidToSubApp()
+        widgets = {"#sw-stg-translate-enabled": SimpleNamespace(value=False)}
+
+        def query_one(selector: str, *_args):
+            if selector in widgets:
+                return widgets[selector]
+            raise NoMatches(selector)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            temp_db = Database(Path(tmpdir) / "state.db")
+            temp_db.set_many({"tui.default_translate_enabled": "0"})
+
+            with (
+                patch.object(settings_mixin, "_db", temp_db),
+                patch.object(app, "query_one", side_effect=query_one),
+            ):
+                app._load_settings_form()
+                self.assertFalse(widgets["#sw-stg-translate-enabled"].value)
+
+                temp_db.set_many({"tui.default_translate_enabled": "1"})
+                app._load_settings_form()
+
+        self.assertTrue(widgets["#sw-stg-translate-enabled"].value)
+
+    def test_prefill_transcribe_restores_translate_toggle_from_saved_default(
+        self,
+    ) -> None:
+        app = VidToSubApp()
+        widgets = {
+            "#inp-translate-to": SimpleNamespace(value=""),
+            "#sw-translate": SimpleNamespace(value=True),
+        }
+
+        def query_one(selector: str, *_args):
+            if selector in widgets:
+                return widgets[selector]
+            raise NoMatches(selector)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            temp_db = Database(Path(tmpdir) / "state.db")
+            temp_db.set_many(
+                {
+                    "tui.default_translate_enabled": "1",
+                    "tui.default_translate_to": "ko",
+                    ENV_TRANS_URL: "",
+                }
+            )
+
+            with (
+                patch.object(settings_mixin, "_db", temp_db),
+                patch.object(app, "query_one", side_effect=query_one),
+            ):
+                app._prefill_transcribe()
+
+        self.assertTrue(widgets["#sw-translate"].value)
+        self.assertEqual("ko", widgets["#inp-translate-to"].value)
 
     def test_prefill_transcribe_reads_sqlite_settings(self) -> None:
         app = VidToSubApp()
@@ -512,10 +771,13 @@ class TuiHelperTests(unittest.TestCase):
             "#inp-wcpp-bin": SimpleNamespace(value=""),
             "#inp-output-dir": SimpleNamespace(value=""),
             "#inp-translate-to": SimpleNamespace(value=""),
+            "#sw-translate": SimpleNamespace(value=False),
         }
 
         def query_one(selector: str, *_args):
-            return widgets[selector]
+            if selector in widgets:
+                return widgets[selector]
+            raise NoMatches(selector)
 
         with tempfile.TemporaryDirectory() as tmpdir:
             temp_db = Database(Path(tmpdir) / "state.db")
@@ -533,20 +795,24 @@ class TuiHelperTests(unittest.TestCase):
                 }
             )
 
-            with patch("vid_to_sub_app.tui.app._db", temp_db), patch.object(
-                app, "query_one", side_effect=query_one
+            with (
+                patch.object(settings_mixin, "_db", temp_db),
+                patch.object(app, "query_one", side_effect=query_one),
             ):
                 app._prefill_transcribe()
 
         self.assertEqual("https://sqlite.example/v1", widgets["#inp-trans-url"].value)
         self.assertEqual("sqlite-key", widgets["#inp-trans-key"].value)
         self.assertEqual("sqlite-model", widgets["#inp-trans-model"].value)
-        self.assertEqual("https://sqlite-post.example/v1", widgets["#inp-post-url"].value)
+        self.assertEqual(
+            "https://sqlite-post.example/v1", widgets["#inp-post-url"].value
+        )
         self.assertEqual("sqlite-post-key", widgets["#inp-post-key"].value)
         self.assertEqual("sqlite-post-model", widgets["#inp-post-model"].value)
         self.assertEqual("/sqlite/bin/whisper-cli", widgets["#inp-wcpp-bin"].value)
         self.assertEqual("/sqlite/output", widgets["#inp-output-dir"].value)
         self.assertEqual("ko", widgets["#inp-translate-to"].value)
+        self.assertTrue(widgets["#sw-translate"].value)
 
     def test_build_run_env_reads_sqlite_settings(self) -> None:
         app = VidToSubApp()
@@ -574,12 +840,11 @@ class TuiHelperTests(unittest.TestCase):
                 "inp-post-key": "",
                 "inp-post-model": "",
             }
-            with patch("vid_to_sub_app.tui.app._db", temp_db), patch.object(
-                app, "_val", side_effect=lambda wid: values.get(wid, "")
-            ), patch.object(
-                app, "_sel", return_value="faster-whisper"
-            ), patch.object(
-                app, "_resolved_wcpp_model_path", return_value=None
+            with (
+                patch.object(run_mixin, "_db", temp_db),
+                patch.object(app, "_val", side_effect=lambda wid: values.get(wid, "")),
+                patch.object(app, "_sel", return_value="faster-whisper"),
+                patch.object(app, "_resolved_wcpp_model_path", return_value=None),
             ):
                 env = app._build_run_env()
 
@@ -633,8 +898,9 @@ class TuiHelperTests(unittest.TestCase):
             "wall_sec": None,
         }
 
-        with patch("vid_to_sub_app.tui.app._db.get_jobs", return_value=[job]), patch.object(
-            app, "query_one", side_effect=query_one
+        with (
+            patch("vid_to_sub_app.tui.app._db.get_jobs", return_value=[job]),
+            patch.object(app, "query_one", side_effect=query_one),
         ):
             app._refresh_history()
 
@@ -669,10 +935,15 @@ class TuiHelperTests(unittest.TestCase):
             "output_paths": "[]",
         }
 
-        with patch("vid_to_sub_app.tui.app._db.get_jobs", return_value=[job]), patch.object(
-            app,
-            "query_one",
-            return_value=SimpleNamespace(update=lambda value: updates.append(value)),
+        with (
+            patch("vid_to_sub_app.tui.app._db.get_jobs", return_value=[job]),
+            patch.object(
+                app,
+                "query_one",
+                return_value=SimpleNamespace(
+                    update=lambda value: updates.append(value)
+                ),
+            ),
         ):
             app._show_hist_detail("11")
 
@@ -680,6 +951,114 @@ class TuiHelperTests(unittest.TestCase):
         self.assertIn("Progress:", updates[-1])
         self.assertIn("42.0%", updates[-1])
         self.assertIn("00:00:42 / 00:01:40", updates[-1])
+
+    def test_show_hist_detail_prefers_persisted_artifact_metadata_over_output_scan(
+        self,
+    ) -> None:
+        app = VidToSubApp()
+        updates: list[str] = []
+        preferred_path = "/tmp/preferred.stage1.json"
+        job = {
+            "id": 11,
+            "created_at": "2026-03-18T13:57:49",
+            "video_path": "/tmp/a.mp4",
+            "backend": "whisper-cpp",
+            "model": "large-v3",
+            "status": "done",
+            "language": "auto",
+            "target_lang": "ko",
+            "output_dir": None,
+            "wall_sec": None,
+            "error": None,
+            "artifact_path": preferred_path,
+            "artifact_metadata": {
+                "path": preferred_path,
+                "translation_complete": True,
+            },
+            "output_paths": json.dumps(["/tmp/legacy.stage1.json", "/tmp/a.srt"]),
+        }
+
+        with (
+            patch("vid_to_sub_app.tui.app._db.get_jobs", return_value=[job]),
+            patch(
+                "vid_to_sub_app.tui.mixins.history_mixin.load_stage_artifact",
+                side_effect=AssertionError(
+                    "should not read artifact file when metadata is enough"
+                ),
+            ),
+            patch.object(
+                app,
+                "query_one",
+                return_value=SimpleNamespace(
+                    update=lambda value: updates.append(value)
+                ),
+            ),
+        ):
+            app._show_hist_detail("11")
+
+        self.assertTrue(updates)
+        self.assertIn("Stage artifact: preferred.stage1.json", updates[-1])
+        self.assertIn("Stage status: translate=complete", updates[-1])
+        self.assertIn("Outputs: legacy.stage1.json  a.srt", updates[-1])
+
+    def test_show_hist_detail_falls_back_to_legacy_output_stage_artifact(self) -> None:
+        app = VidToSubApp()
+        updates: list[str] = []
+        with tempfile.TemporaryDirectory() as tmpdir:
+            artifact_path = write_stage_artifact(
+                {
+                    "schema_version": "1",
+                    "source_path": "/tmp/a.mp4",
+                    "output_base": "/tmp/a",
+                    "source_fingerprint": "abc123",
+                    "backend": "whisper-cpp",
+                    "device": "cpu",
+                    "model": "large-v3",
+                    "language": "en",
+                    "target_lang": "ko",
+                    "formats": ["srt"],
+                    "primary_outputs": ["/tmp/a.srt"],
+                    "segments": [],
+                    "stage_status": {
+                        "transcription_complete": True,
+                        "translation_pending": True,
+                    },
+                },
+                output_dir=Path(tmpdir),
+                source_path=Path("/tmp/a.mp4"),
+            )
+            job = {
+                "id": 11,
+                "created_at": "2026-03-18T13:57:49",
+                "video_path": "/tmp/a.mp4",
+                "backend": "whisper-cpp",
+                "model": "large-v3",
+                "status": "done",
+                "language": "auto",
+                "target_lang": "ko",
+                "output_dir": None,
+                "wall_sec": None,
+                "error": None,
+                "artifact_path": None,
+                "artifact_metadata": None,
+                "output_paths": json.dumps([str(artifact_path), "/tmp/a.srt"]),
+            }
+
+            with (
+                patch("vid_to_sub_app.tui.app._db.get_jobs", return_value=[job]),
+                patch.object(
+                    app,
+                    "query_one",
+                    return_value=SimpleNamespace(
+                        update=lambda value: updates.append(value)
+                    ),
+                ),
+            ):
+                app._show_hist_detail("11")
+
+        self.assertTrue(updates)
+        self.assertIn("Stage artifact: a.stage1.json", updates[-1])
+        self.assertIn("Stage status: translate=pending", updates[-1])
 
     def test_sync_run_command_panel_updates_visibility_and_label(self) -> None:
         app = VidToSubApp()
@@ -721,35 +1100,46 @@ class TuiHelperTests(unittest.TestCase):
         self.assertIsNone(args.backend_threads)
         self.assertTrue(args.manifest_stdin)
 
-    def test_resolve_runtime_backend_and_device_prefers_faster_whisper_on_cuda(self) -> None:
-        with patch("vid_to_sub_app.shared.env.detect_best_device", return_value="cuda"), patch(
-            "vid_to_sub_app.shared.env.detect_torch_device", return_value="cuda"
-        ), patch(
-            "vid_to_sub_app.shared.env.module_available",
-            side_effect=lambda name: name == "faster_whisper",
+    def test_resolve_runtime_backend_and_device_prefers_faster_whisper_on_cuda(
+        self,
+    ) -> None:
+        with (
+            patch("vid_to_sub_app.shared.env.detect_best_device", return_value="cuda"),
+            patch("vid_to_sub_app.shared.env.detect_torch_device", return_value="cuda"),
+            patch(
+                "vid_to_sub_app.shared.env.module_available",
+                side_effect=lambda name: name == "faster_whisper",
+            ),
         ):
             resolved = resolve_runtime_backend_and_device()
 
         self.assertEqual(("faster-whisper", "auto"), resolved)
 
-    def test_resolve_runtime_backend_and_device_prefers_mps_backend_when_available(self) -> None:
-        with patch("vid_to_sub_app.shared.env.detect_best_device", return_value="mps"), patch(
-            "vid_to_sub_app.shared.env.detect_torch_device", return_value="mps"
-        ), patch(
-            "vid_to_sub_app.shared.env.module_available",
-            side_effect=lambda name: name == "whisper",
+    def test_resolve_runtime_backend_and_device_prefers_mps_backend_when_available(
+        self,
+    ) -> None:
+        with (
+            patch("vid_to_sub_app.shared.env.detect_best_device", return_value="mps"),
+            patch("vid_to_sub_app.shared.env.detect_torch_device", return_value="mps"),
+            patch(
+                "vid_to_sub_app.shared.env.module_available",
+                side_effect=lambda name: name == "whisper",
+            ),
         ):
             resolved = resolve_runtime_backend_and_device()
 
         self.assertEqual(("whisper", "auto"), resolved)
 
     def test_build_parser_uses_runtime_backend_and_device_defaults(self) -> None:
-        with patch(
-            "vid_to_sub_app.cli.main.resolve_runtime_backend_and_device",
-            return_value=("faster-whisper", "auto"),
-        ), patch(
-            "vid_to_sub_app.cli.main.resolve_runtime_model",
-            return_value="small",
+        with (
+            patch(
+                "vid_to_sub_app.cli.main.resolve_runtime_backend_and_device",
+                return_value=("faster-whisper", "auto"),
+            ),
+            patch(
+                "vid_to_sub_app.cli.main.resolve_runtime_model",
+                return_value="small",
+            ),
         ):
             args = build_parser().parse_args(["--manifest-stdin"])
 
@@ -766,30 +1156,41 @@ class TuiHelperTests(unittest.TestCase):
         self.assertEqual(["small", "base", "tiny"], candidates)
 
     def test_resolve_runtime_model_picks_first_fitting_cuda_candidate(self) -> None:
-        with patch(
-            "vid_to_sub_app.shared.env.resolve_runtime_backend_device",
-            return_value="cuda",
-        ), patch(
-            "vid_to_sub_app.shared.env.detect_cuda_total_memory_gb",
-            return_value=4.5,
+        with (
+            patch(
+                "vid_to_sub_app.shared.env.resolve_runtime_backend_device",
+                return_value="cuda",
+            ),
+            patch(
+                "vid_to_sub_app.shared.env.detect_cuda_total_memory_gb",
+                return_value=4.5,
+            ),
         ):
             resolved = resolve_runtime_model("faster-whisper", "auto", "large-v3")
 
         self.assertEqual("small", resolved)
 
     def test_resolve_device_fw_auto_prefers_cuda(self) -> None:
-        with patch("vid_to_sub_app.cli.transcription.detect_best_device", return_value="cuda"):
+        with patch(
+            "vid_to_sub_app.cli.transcription.detect_best_device", return_value="cuda"
+        ):
             resolved = resolve_device_fw("auto")
 
         self.assertEqual(("cuda", "float16"), resolved)
 
-    def test_resolve_runtime_backend_threads_uses_all_cpu_threads_by_default(self) -> None:
+    def test_resolve_runtime_backend_threads_uses_all_cpu_threads_by_default(
+        self,
+    ) -> None:
         with patch("vid_to_sub_app.shared.env.available_cpu_threads", return_value=12):
-            resolved = resolve_runtime_backend_threads("whisper-cpp", "cpu", worker_count=1)
+            resolved = resolve_runtime_backend_threads(
+                "whisper-cpp", "cpu", worker_count=1
+            )
 
         self.assertEqual(12, resolved)
 
-    def test_resolve_runtime_backend_threads_splits_cpu_threads_across_workers(self) -> None:
+    def test_resolve_runtime_backend_threads_splits_cpu_threads_across_workers(
+        self,
+    ) -> None:
         with patch("vid_to_sub_app.shared.env.available_cpu_threads", return_value=12):
             resolved = resolve_runtime_backend_threads(
                 "faster-whisper",
@@ -813,9 +1214,12 @@ class TuiHelperTests(unittest.TestCase):
             or FakeModel()
         )
 
-        with patch.dict("sys.modules", {"whisper": fake_whisper}), patch(
-            "vid_to_sub_app.cli.transcription.detect_torch_device",
-            return_value="mps",
+        with (
+            patch.dict("sys.modules", {"whisper": fake_whisper}),
+            patch(
+                "vid_to_sub_app.cli.transcription.detect_torch_device",
+                return_value="mps",
+            ),
         ):
             _segments, info = transcribe_openai_whisper(
                 video=Path("/tmp/sample.mp4"),
@@ -849,7 +1253,10 @@ class TuiHelperTests(unittest.TestCase):
             def transcribe(self, *_args, **_kwargs):
                 return [FakeSegment()], FakeInfo()
 
-        with patch.dict("sys.modules", {"faster_whisper": SimpleNamespace(WhisperModel=FakeWhisperModel)}):
+        with patch.dict(
+            "sys.modules",
+            {"faster_whisper": SimpleNamespace(WhisperModel=FakeWhisperModel)},
+        ):
             segments, info = transcribe_faster_whisper(
                 video=Path("/tmp/sample.mp4"),
                 model_name="base",
@@ -883,10 +1290,13 @@ class TuiHelperTests(unittest.TestCase):
                 return [FakeSegment()], FakeInfo()
 
         captured_stdout = io.StringIO()
-        with patch.dict(
-            "sys.modules",
-            {"faster_whisper": SimpleNamespace(WhisperModel=FakeWhisperModel)},
-        ), redirect_stdout(captured_stdout):
+        with (
+            patch.dict(
+                "sys.modules",
+                {"faster_whisper": SimpleNamespace(WhisperModel=FakeWhisperModel)},
+            ),
+            redirect_stdout(captured_stdout),
+        ):
             _segments, _info = transcribe_faster_whisper(
                 video=Path("/tmp/sample.mp4"),
                 model_name="large-v3",
@@ -897,7 +1307,9 @@ class TuiHelperTests(unittest.TestCase):
                 threads=4,
             )
 
-        self.assertIn("Loading faster-whisper model 'large-v3'", captured_stdout.getvalue())
+        self.assertIn(
+            "Loading faster-whisper model 'large-v3'", captured_stdout.getvalue()
+        )
 
     def test_transcribe_faster_whisper_reports_incomplete_cache(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -935,7 +1347,9 @@ class TuiHelperTests(unittest.TestCase):
         self.assertIn(str(cache_root), message)
         self.assertIn(incomplete_blob.name, message)
 
-    def test_transcribe_faster_whisper_auto_falls_back_to_cpu_after_cuda_oom(self) -> None:
+    def test_transcribe_faster_whisper_auto_falls_back_to_cpu_after_cuda_oom(
+        self,
+    ) -> None:
         attempts: list[tuple[str, str]] = []
 
         class FakeSegment:
@@ -959,16 +1373,22 @@ class TuiHelperTests(unittest.TestCase):
 
         captured_stdout = io.StringIO()
         captured_stderr = io.StringIO()
-        with patch.dict(
-            "sys.modules",
-            {"faster_whisper": SimpleNamespace(WhisperModel=FakeWhisperModel)},
-        ), patch(
-            "vid_to_sub_app.cli.transcription.detect_best_device",
-            return_value="cuda",
-        ), patch(
-            "vid_to_sub_app.cli.transcription.detect_cuda_total_memory_gb",
-            return_value=4.5,
-        ), redirect_stdout(captured_stdout), redirect_stderr(captured_stderr):
+        with (
+            patch.dict(
+                "sys.modules",
+                {"faster_whisper": SimpleNamespace(WhisperModel=FakeWhisperModel)},
+            ),
+            patch(
+                "vid_to_sub_app.cli.transcription.detect_best_device",
+                return_value="cuda",
+            ),
+            patch(
+                "vid_to_sub_app.cli.transcription.detect_cuda_total_memory_gb",
+                return_value=4.5,
+            ),
+            redirect_stdout(captured_stdout),
+            redirect_stderr(captured_stderr),
+        ):
             segments, info = transcribe_faster_whisper(
                 video=Path("/tmp/sample.mp4"),
                 model_name="large-v3",
@@ -993,7 +1413,9 @@ class TuiHelperTests(unittest.TestCase):
         self.assertEqual("tiny", info["model"])
         self.assertIn("falling back to CPU int8", captured_stderr.getvalue())
 
-    def test_translate_segments_openai_compatible_sends_accept_and_user_agent(self) -> None:
+    def test_translate_segments_openai_compatible_sends_accept_and_user_agent(
+        self,
+    ) -> None:
         captured_headers: dict[str, str] = {}
 
         class FakeResponse:
@@ -1004,7 +1426,7 @@ class TuiHelperTests(unittest.TestCase):
                 return False
 
             def read(self) -> bytes:
-                payload = {"choices": [{"message": {"content": "[\"안녕하세요\"]"}}]}
+                payload = {"choices": [{"message": {"content": '["안녕하세요"]'}}]}
                 return json.dumps(payload, ensure_ascii=False).encode("utf-8")
 
         def fake_urlopen(request):
@@ -1028,15 +1450,20 @@ class TuiHelperTests(unittest.TestCase):
         self.assertEqual("application/json", captured_headers["Accept"])
         self.assertIn("vid_to_sub/1.0", captured_headers["User-agent"])
 
-    def test_find_whisper_cpp_bin_ignores_empty_override_and_uses_fallback(self) -> None:
+    def test_find_whisper_cpp_bin_ignores_empty_override_and_uses_fallback(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             fallback = Path(tmpdir) / "whisper-cli"
             fallback.write_text("#!/bin/sh\n", encoding="utf-8")
             fallback.chmod(0o755)
 
-            with patch("vid_to_sub_app.shared.env.shutil.which", return_value=None), patch(
-                "vid_to_sub_app.shared.env.WHISPER_CLI_CANDIDATES",
-                (str(fallback),),
+            with (
+                patch("vid_to_sub_app.shared.env.shutil.which", return_value=None),
+                patch(
+                    "vid_to_sub_app.shared.env.WHISPER_CLI_CANDIDATES",
+                    (str(fallback),),
+                ),
             ):
                 found = find_whisper_cpp_bin("")
 
@@ -1048,9 +1475,12 @@ class TuiHelperTests(unittest.TestCase):
             fallback.write_text("#!/bin/sh\n", encoding="utf-8")
             fallback.chmod(0o755)
 
-            with patch("vid_to_sub_app.shared.env.shutil.which", return_value=None), patch(
-                "vid_to_sub_app.shared.env.WHISPER_CLI_CANDIDATES",
-                (str(fallback),),
+            with (
+                patch("vid_to_sub_app.shared.env.shutil.which", return_value=None),
+                patch(
+                    "vid_to_sub_app.shared.env.WHISPER_CLI_CANDIDATES",
+                    (str(fallback),),
+                ),
             ):
                 found = find_whisper_cpp_bin("/done")
 
@@ -1085,7 +1515,9 @@ class TuiHelperTests(unittest.TestCase):
 
         self.assertIsNone(found)
 
-    def test_load_project_env_reads_repo_dotenv_without_overriding_existing_env(self) -> None:
+    def test_load_project_env_reads_repo_dotenv_without_overriding_existing_env(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             env_file = Path(tmpdir) / ".env"
             env_file.write_text(
@@ -1094,22 +1526,30 @@ class TuiHelperTests(unittest.TestCase):
                 encoding="utf-8",
             )
 
-            with patch("vid_to_sub_app.shared.env.ENV_FILE", env_file), patch(
-                "vid_to_sub_app.shared.env.load_dotenv",
-                None,
-            ), patch.dict(
-                os.environ,
-                {ENV_WHISPER_CPP_BIN: "/keep-existing"},
-                clear=False,
+            with (
+                patch("vid_to_sub_app.shared.env.ENV_FILE", env_file),
+                patch(
+                    "vid_to_sub_app.shared.env.load_dotenv",
+                    None,
+                ),
+                patch.dict(
+                    os.environ,
+                    {ENV_WHISPER_CPP_BIN: "/keep-existing"},
+                    clear=False,
+                ),
             ):
                 os.environ.pop(ENV_WHISPER_CPP_MODEL, None)
                 loaded = load_project_env()
 
                 self.assertTrue(loaded)
                 self.assertEqual("/keep-existing", os.environ[ENV_WHISPER_CPP_BIN])
-                self.assertEqual("/from-dotenv-model", os.environ[ENV_WHISPER_CPP_MODEL])
+                self.assertEqual(
+                    "/from-dotenv-model", os.environ[ENV_WHISPER_CPP_MODEL]
+                )
 
-    def test_transcribe_whisper_cpp_uses_fallback_when_env_override_is_empty(self) -> None:
+    def test_transcribe_whisper_cpp_uses_fallback_when_env_override_is_empty(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
             video = root / "clip.mp4"
@@ -1133,18 +1573,24 @@ class TuiHelperTests(unittest.TestCase):
                 )
                 return SimpleNamespace(returncode=0)
 
-            with patch.dict(os.environ, {ENV_WHISPER_CPP_BIN: ""}, clear=False), patch(
-                "vid_to_sub_app.shared.env.shutil.which",
-                return_value=None,
-            ), patch(
-                "vid_to_sub_app.shared.env.WHISPER_CLI_CANDIDATES",
-                (str(fallback),),
-            ), patch(
-                "vid_to_sub_app.cli.transcription.extract_audio_for_whisper_cpp",
-                side_effect=fake_extract,
-            ), patch(
-                "vid_to_sub_app.cli.transcription.subprocess.run",
-                side_effect=fake_run,
+            with (
+                patch.dict(os.environ, {ENV_WHISPER_CPP_BIN: ""}, clear=False),
+                patch(
+                    "vid_to_sub_app.shared.env.shutil.which",
+                    return_value=None,
+                ),
+                patch(
+                    "vid_to_sub_app.shared.env.WHISPER_CLI_CANDIDATES",
+                    (str(fallback),),
+                ),
+                patch(
+                    "vid_to_sub_app.cli.transcription.extract_audio_for_whisper_cpp",
+                    side_effect=fake_extract,
+                ),
+                patch(
+                    "vid_to_sub_app.cli.transcription.subprocess.run",
+                    side_effect=fake_run,
+                ),
             ):
                 segments, info = transcribe_whisper_cpp(
                     video=video,
@@ -1158,7 +1604,9 @@ class TuiHelperTests(unittest.TestCase):
         self.assertEqual("hello", segments[0]["text"])
         self.assertEqual(str(model.resolve()), info["model_path"])
 
-    def test_transcribe_whisper_cpp_falls_back_from_invalid_env_bin_and_model(self) -> None:
+    def test_transcribe_whisper_cpp_falls_back_from_invalid_env_bin_and_model(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
             video = root / "clip.mp4"
@@ -1183,28 +1631,35 @@ class TuiHelperTests(unittest.TestCase):
                 )
                 return SimpleNamespace(returncode=0)
 
-            with patch.dict(
-                os.environ,
-                {
-                    ENV_WHISPER_CPP_BIN: "/done",
-                    ENV_WHISPER_CPP_MODEL: "/done-model",
-                },
-                clear=False,
-            ), patch(
-                "vid_to_sub_app.shared.env.shutil.which",
-                return_value=None,
-            ), patch(
-                "vid_to_sub_app.shared.env.WHISPER_CLI_CANDIDATES",
-                (str(fallback),),
-            ), patch(
-                "vid_to_sub_app.shared.env.MODEL_SEARCH_DIRS",
-                (str(root),),
-            ), patch(
-                "vid_to_sub_app.cli.transcription.extract_audio_for_whisper_cpp",
-                side_effect=fake_extract,
-            ), patch(
-                "vid_to_sub_app.cli.transcription.subprocess.run",
-                side_effect=fake_run,
+            with (
+                patch.dict(
+                    os.environ,
+                    {
+                        ENV_WHISPER_CPP_BIN: "/done",
+                        ENV_WHISPER_CPP_MODEL: "/done-model",
+                    },
+                    clear=False,
+                ),
+                patch(
+                    "vid_to_sub_app.shared.env.shutil.which",
+                    return_value=None,
+                ),
+                patch(
+                    "vid_to_sub_app.shared.env.WHISPER_CLI_CANDIDATES",
+                    (str(fallback),),
+                ),
+                patch(
+                    "vid_to_sub_app.shared.env.MODEL_SEARCH_DIRS",
+                    (str(root),),
+                ),
+                patch(
+                    "vid_to_sub_app.cli.transcription.extract_audio_for_whisper_cpp",
+                    side_effect=fake_extract,
+                ),
+                patch(
+                    "vid_to_sub_app.cli.transcription.subprocess.run",
+                    side_effect=fake_run,
+                ),
             ):
                 segments, info = transcribe_whisper_cpp(
                     video=video,
@@ -1249,15 +1704,20 @@ class TuiHelperTests(unittest.TestCase):
 
             progress: list[float] = []
 
-            with patch("vid_to_sub_app.shared.env.shutil.which", return_value=None), patch(
-                "vid_to_sub_app.shared.env.WHISPER_CLI_CANDIDATES",
-                (str(fallback),),
-            ), patch(
-                "vid_to_sub_app.cli.transcription.extract_audio_for_whisper_cpp",
-                side_effect=fake_extract,
-            ), patch(
-                "vid_to_sub_app.cli.transcription.subprocess.Popen",
-                side_effect=lambda *args, **kwargs: FakePopen(*args, **kwargs),
+            with (
+                patch("vid_to_sub_app.shared.env.shutil.which", return_value=None),
+                patch(
+                    "vid_to_sub_app.shared.env.WHISPER_CLI_CANDIDATES",
+                    (str(fallback),),
+                ),
+                patch(
+                    "vid_to_sub_app.cli.transcription.extract_audio_for_whisper_cpp",
+                    side_effect=fake_extract,
+                ),
+                patch(
+                    "vid_to_sub_app.cli.transcription.subprocess.Popen",
+                    side_effect=lambda *args, **kwargs: FakePopen(*args, **kwargs),
+                ),
             ):
                 with redirect_stdout(io.StringIO()):
                     segments, info = transcribe_whisper_cpp(
@@ -1297,15 +1757,20 @@ class TuiHelperTests(unittest.TestCase):
                 )
                 return SimpleNamespace(returncode=0)
 
-            with patch("vid_to_sub_app.shared.env.shutil.which", return_value=None), patch(
-                "vid_to_sub_app.shared.env.WHISPER_CLI_CANDIDATES",
-                (str(fallback),),
-            ), patch(
-                "vid_to_sub_app.cli.transcription.extract_audio_for_whisper_cpp",
-                side_effect=fake_extract,
-            ), patch(
-                "vid_to_sub_app.cli.transcription.subprocess.run",
-                side_effect=fake_run,
+            with (
+                patch("vid_to_sub_app.shared.env.shutil.which", return_value=None),
+                patch(
+                    "vid_to_sub_app.shared.env.WHISPER_CLI_CANDIDATES",
+                    (str(fallback),),
+                ),
+                patch(
+                    "vid_to_sub_app.cli.transcription.extract_audio_for_whisper_cpp",
+                    side_effect=fake_extract,
+                ),
+                patch(
+                    "vid_to_sub_app.cli.transcription.subprocess.run",
+                    side_effect=fake_run,
+                ),
             ):
                 segments, info = transcribe_whisper_cpp(
                     video=video,
@@ -1394,7 +1859,9 @@ class TuiHelperTests(unittest.TestCase):
         self.assertEqual("full", plan["actions"][0]["mode"])
         self.assertEqual("download_model", plan["actions"][1]["type"])
 
-    def test_agent_plan_normalization_allows_history_actions_for_known_jobs(self) -> None:
+    def test_agent_plan_normalization_allows_history_actions_for_known_jobs(
+        self,
+    ) -> None:
         app = VidToSubApp()
 
         with patch("vid_to_sub_app.tui.app._db.get_jobs", return_value=[{"id": 42}]):
@@ -1449,11 +1916,13 @@ class TuiHelperTests(unittest.TestCase):
         def raise_from_ui(_callback, *_args):
             raise RuntimeError("ui callback failed")
 
-        with patch("vid_to_sub_app.tui.app.subprocess.Popen", return_value=proc), patch.object(
-            app, "call_from_thread", side_effect=raise_from_ui
-        ), patch.object(app, "_log", return_value=None), patch.object(
-            app, "_apply_progress_event", return_value=None
-        ), patch.object(app, "_finalize_executor_failure", return_value=None):
+        with (
+            patch("vid_to_sub_app.tui.app.subprocess.Popen", return_value=proc),
+            patch.object(app, "call_from_thread", side_effect=raise_from_ui),
+            patch.object(app, "_log", return_value=None),
+            patch.object(app, "_apply_progress_event", return_value=None),
+            patch.object(app, "_finalize_executor_failure", return_value=None),
+        ):
             with self.assertRaisesRegex(RuntimeError, "ui callback failed"):
                 VidToSubApp._stream.__wrapped__(app, [plan])
 
@@ -1501,13 +1970,17 @@ class TuiHelperTests(unittest.TestCase):
             stdin_payload=None,
         )
 
-        with patch("vid_to_sub_app.tui.app.subprocess.Popen", return_value=proc), patch.object(
-            app,
-            "call_from_thread",
-            side_effect=lambda callback, *args: callback(*args),
-        ), patch.object(app, "_log", side_effect=logs.append), patch.object(
-            app, "_apply_progress_event", return_value=None
-        ), patch.object(app, "_finalize_executor_failure", return_value=None):
+        with (
+            patch("vid_to_sub_app.tui.app.subprocess.Popen", return_value=proc),
+            patch.object(
+                app,
+                "call_from_thread",
+                side_effect=lambda callback, *args: callback(*args),
+            ),
+            patch.object(app, "_log", side_effect=logs.append),
+            patch.object(app, "_apply_progress_event", return_value=None),
+            patch.object(app, "_finalize_executor_failure", return_value=None),
+        ):
             VidToSubApp._stream.__wrapped__(app, [plan])
 
         self.assertTrue(proc.stdout.closed)
@@ -1516,6 +1989,364 @@ class TuiHelperTests(unittest.TestCase):
         self.assertIsNone(app._proc)
         self.assertIn("\n[bold green]✓ Completed (exit 0)[/]", logs)
 
+
+class TestSubtitleCopyHelper(unittest.TestCase):
+    """Unit tests for vid_to_sub_app.cli.subtitle_copy (no textual required)."""
+
+    def test_subtitle_paths_filters_to_subtitle_extensions(self) -> None:
+        import json
+        import tempfile
+        from vid_to_sub_app.cli.subtitle_copy import subtitle_paths_from_output_paths
+
+        with tempfile.TemporaryDirectory() as tmp:
+            p = Path(tmp)
+            srt = p / "a.srt"
+            vtt = p / "b.vtt"
+            jfile = p / "c.json"
+            for f in (srt, vtt, jfile):
+                f.write_text("x")
+            raw = json.dumps([str(srt), str(vtt), str(jfile)])
+            result = subtitle_paths_from_output_paths(raw)
+            names = {r.name for r in result}
+            self.assertIn("a.srt", names)
+            self.assertIn("b.vtt", names)
+            self.assertNotIn("c.json", names)
+
+    def test_subtitle_paths_handles_malformed_json(self) -> None:
+        from vid_to_sub_app.cli.subtitle_copy import subtitle_paths_from_output_paths
+
+        self.assertEqual([], subtitle_paths_from_output_paths(None))
+        self.assertEqual([], subtitle_paths_from_output_paths(""))
+        self.assertEqual([], subtitle_paths_from_output_paths("not-json"))
+        self.assertEqual([], subtitle_paths_from_output_paths("{}"))  # dict, not list
+
+    def test_bulk_copy_writes_files(self) -> None:
+        import json
+        import tempfile
+        from vid_to_sub_app.cli.subtitle_copy import bulk_copy_subtitles
+
+        with tempfile.TemporaryDirectory() as tmp:
+            src_dir = Path(tmp) / "src"
+            dst_dir = Path(tmp) / "dst"
+            src_dir.mkdir()
+            dst_dir.mkdir()
+            srt = src_dir / "movie.srt"
+            srt.write_text("1\n00:00:00,000 --> 00:00:01,000\nHello")
+            jobs: list[dict[str, object]] = [{"output_paths": json.dumps([str(srt)])}]
+            results = bulk_copy_subtitles(jobs, dst_dir)
+            self.assertEqual(1, len(results))
+            self.assertTrue(results[0]["success"])
+            destination = results[0]["destination"]
+            self.assertIsNotNone(destination)
+            assert destination is not None
+            self.assertTrue(Path(destination).exists())
+
+    def test_bulk_copy_renames_duplicates(self) -> None:
+        import json
+        import tempfile
+        from vid_to_sub_app.cli.subtitle_copy import bulk_copy_subtitles
+
+        with tempfile.TemporaryDirectory() as tmp:
+            src_dir = Path(tmp) / "src"
+            dst_dir = Path(tmp) / "dst"
+            src_dir.mkdir()
+            dst_dir.mkdir()
+            srt_a = src_dir / "movie.srt"
+            srt_b = src_dir / "movie.srt"  # same name — use same file
+            srt_a.write_text("1\n00:00:00,000 --> 00:00:01,000\nA")
+            # Two jobs referencing files with identical names
+            srt2 = src_dir / "other.srt"
+            srt2.write_text("1\n00:00:00,000 --> 00:00:01,000\nB")
+            jobs: list[dict[str, object]] = [
+                {"output_paths": json.dumps([str(srt_a)])},
+                {"output_paths": json.dumps([str(srt_b)])},
+            ]
+            results = bulk_copy_subtitles(jobs, dst_dir)
+            self.assertEqual(2, len(results))
+            dest_names = {
+                Path(r["destination"]).name for r in results if r["destination"]
+            }
+            self.assertIn("movie.srt", dest_names)
+            self.assertIn("movie (1).srt", dest_names)
+
+    def test_bulk_copy_reports_missing_source(self) -> None:
+        import json
+        import tempfile
+        from vid_to_sub_app.cli.subtitle_copy import bulk_copy_subtitles
+
+        with tempfile.TemporaryDirectory() as tmp:
+            dst_dir = Path(tmp) / "dst"
+            missing = Path(tmp) / "nosuchfile.srt"
+            jobs: list[dict[str, object]] = [
+                {"output_paths": json.dumps([str(missing)])}
+            ]
+            results = bulk_copy_subtitles(jobs, dst_dir)
+            self.assertEqual(1, len(results))
+            self.assertFalse(results[0]["success"])
+            self.assertEqual("source file not found", results[0]["error"])
+            self.assertIsNone(results[0]["destination"])
+
+    def test_bulk_copy_empty_output_paths(self) -> None:
+        from vid_to_sub_app.cli.subtitle_copy import bulk_copy_subtitles
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            dst_dir = Path(tmp) / "dst"
+            jobs: list[dict[str, object]] = [
+                {"output_paths": None},
+                {"output_paths": "[]"},
+            ]
+            results = bulk_copy_subtitles(jobs, dst_dir)
+            self.assertEqual(0, len(results))
+
+
+class TestHistoryTranslateHelpers(unittest.TestCase):
+    """Tests for pure-Python helpers used by history translate flow.
+
+    These exercise vid_to_sub_app.tui.helpers.filter_subtitle_paths and
+    resolve_copy_dest, plus the SRT round-trip methods on HistoryMixin,
+    without importing textual.
+    """
+
+    def test_filter_subtitle_paths_keeps_subtitle_extensions(self) -> None:
+        from vid_to_sub_app.tui.helpers import filter_subtitle_paths
+
+        paths = ["/a/movie.srt", "/a/movie.vtt", "/a/movie.json", "/a/movie.tsv"]
+        result = filter_subtitle_paths(paths)
+        self.assertIn("/a/movie.srt", result)
+        self.assertIn("/a/movie.vtt", result)
+        self.assertIn("/a/movie.tsv", result)
+        # .json is not a subtitle extension in filter_subtitle_paths
+
+    def test_filter_subtitle_paths_empty_list(self) -> None:
+        from vid_to_sub_app.tui.helpers import filter_subtitle_paths
+
+        self.assertEqual([], filter_subtitle_paths([]))
+
+    def test_resolve_copy_dest_no_collision(self) -> None:
+        import tempfile
+        from vid_to_sub_app.tui.helpers import resolve_copy_dest
+
+        with tempfile.TemporaryDirectory() as tmp:
+            dest_dir = Path(tmp)
+            src = Path("/some/video.srt")
+            existing: set[str] = set()
+            dest = resolve_copy_dest(src, dest_dir, existing)
+            self.assertEqual("video.srt", dest.name)
+            self.assertIn("video.srt", existing)
+
+    def test_resolve_copy_dest_collision_appends_counter(self) -> None:
+        import tempfile
+        from vid_to_sub_app.tui.helpers import resolve_copy_dest
+
+        with tempfile.TemporaryDirectory() as tmp:
+            dest_dir = Path(tmp)
+            src = Path("/some/video.srt")
+            existing: set[str] = {"video.srt"}
+            dest = resolve_copy_dest(src, dest_dir, existing)
+            # Should produce a non-colliding name
+            self.assertNotEqual("video.srt", dest.name)
+            self.assertIn(dest.name, existing)
+
+
+class TestSaveSettingsCharacterization(unittest.TestCase):
+    """PR0 characterization tests: freeze _save_settings() seams before PR1 refactor.
+
+    These tests verify:
+    - widget values are collected and persisted via db.set_many
+    - invalid remote JSON aborts _before_ any db write
+    - the full fan-out sequence fires after a valid save
+    """
+
+    def _make_widgets(self, *, remote_json: str = "[]") -> dict:
+        return {
+            "#stg-wcpp-bin": SimpleNamespace(value="/bin/whisper-cli"),
+            "#stg-wcpp-model": SimpleNamespace(value="large-v3"),
+            "#stg-trans-url": SimpleNamespace(value="https://t.example/v1"),
+            "#stg-trans-key": SimpleNamespace(value="tkey"),
+            "#stg-trans-model": SimpleNamespace(value="tmodel"),
+            "#stg-post-url": SimpleNamespace(value=""),
+            "#stg-post-key": SimpleNamespace(value=""),
+            "#stg-post-model": SimpleNamespace(value=""),
+            "#stg-agent-url": SimpleNamespace(value=""),
+            "#stg-agent-key": SimpleNamespace(value=""),
+            "#stg-agent-model": SimpleNamespace(value=""),
+            "#stg-build-dir": SimpleNamespace(value=""),
+            "#stg-install-dir": SimpleNamespace(value=""),
+            "#stg-model-dir": SimpleNamespace(value=""),
+            "#stg-browse-root": SimpleNamespace(value=""),
+            "#stg-default-output-dir": SimpleNamespace(value="/out"),
+            "#stg-default-translate-to": SimpleNamespace(value="ko"),
+            "#sw-stg-translate-enabled": SimpleNamespace(value=True),
+            "#stg-remote-resources": SimpleNamespace(text=remote_json),
+            "#sel-execution-mode": SimpleNamespace(value="local"),
+            "#stg-status": SimpleNamespace(update=lambda _: None),
+            # transcribe-tab widgets (synced after save)
+            "#inp-trans-url": SimpleNamespace(value=""),
+            "#inp-trans-key": SimpleNamespace(value=""),
+            "#inp-trans-model": SimpleNamespace(value=""),
+            "#inp-post-url": SimpleNamespace(value=""),
+            "#inp-post-key": SimpleNamespace(value=""),
+            "#inp-post-model": SimpleNamespace(value=""),
+            "#inp-wcpp-bin": SimpleNamespace(value=""),
+            "#inp-output-dir": SimpleNamespace(value=""),
+            "#inp-translate-to": SimpleNamespace(value=""),
+            "#sw-translate": SimpleNamespace(value=False),
+        }
+
+    def test_save_settings_persists_widget_values_to_db(self) -> None:
+        """_save_settings() must call db.set_many with the values read from the form."""
+        from vid_to_sub_app.tui.mixins import settings_mixin
+
+        app = VidToSubApp()
+        widgets = self._make_widgets()
+
+        def query_one(selector: str, *_args):
+            if selector in widgets:
+                return widgets[selector]
+            raise NoMatches(selector)
+
+        saved: list[dict] = []
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            temp_db = Database(Path(tmpdir) / "state.db")
+
+            original_set_many = temp_db.set_many
+
+            def capturing_set_many(data: dict) -> None:
+                saved.append(dict(data))
+                original_set_many(data)
+
+            temp_db.set_many = capturing_set_many  # type: ignore[method-assign]
+
+            with (
+                patch.object(settings_mixin, "_db", temp_db),
+                patch.object(app, "query_one", side_effect=query_one),
+                patch.object(app, "_apply_db_to_env", return_value=None),
+                patch.object(app, "_sync_transcribe_overrides_from_settings", return_value=None),
+                patch.object(app, "_sync_run_defaults_from_settings", return_value=None),
+                patch.object(app, "_load_remote_resources", return_value=None),
+                patch.object(app, "_run_detection", return_value=None),
+                patch.object(app, "_update_wcpp_model_status", return_value=None),
+                patch.object(app, "_update_remote_status", return_value=None),
+                patch.object(app, "_update_agent_config_status", return_value=None),
+                patch.object(app, "_update_cmd_preview", return_value=None),
+            ):
+                app._save_settings()
+
+        self.assertEqual(1, len(saved), "db.set_many should be called exactly once")
+        payload = saved[0]
+        self.assertIn("tui.default_translate_to", payload)
+        self.assertEqual("ko", payload["tui.default_translate_to"])
+        self.assertIn("tui.default_output_dir", payload)
+        self.assertEqual("/out", payload["tui.default_output_dir"])
+        # translate enabled flag
+        from vid_to_sub_app.db import TUI_DEFAULT_TRANSLATE_ENABLED_KEY
+        self.assertIn(TUI_DEFAULT_TRANSLATE_ENABLED_KEY, payload)
+        self.assertEqual("1", payload[TUI_DEFAULT_TRANSLATE_ENABLED_KEY])
+
+    def test_save_settings_invalid_remote_json_aborts_before_db_write(self) -> None:
+        """_save_settings() must reject invalid remote JSON without touching the DB."""
+        from vid_to_sub_app.tui.mixins import settings_mixin
+
+        app = VidToSubApp()
+        widgets = self._make_widgets(remote_json="not valid json")
+
+        def query_one(selector: str, *_args):
+            if selector in widgets:
+                return widgets[selector]
+            raise NoMatches(selector)
+
+        write_count = 0
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            temp_db = Database(Path(tmpdir) / "state.db")
+
+            original_set_many = temp_db.set_many
+
+            def counting_set_many(data: dict) -> None:
+                nonlocal write_count
+                write_count += 1
+                original_set_many(data)
+
+            temp_db.set_many = counting_set_many  # type: ignore[method-assign]
+
+            with (
+                patch.object(settings_mixin, "_db", temp_db),
+                patch.object(app, "query_one", side_effect=query_one),
+                patch.object(app, "_apply_db_to_env", return_value=None),
+            ):
+                app._save_settings()
+
+        self.assertEqual(0, write_count, "Invalid remote JSON must prevent any db write")
+
+    def test_save_settings_fan_out_order(self) -> None:
+        """After a valid save, _save_settings() must call all six update helpers.
+
+        These calls must fire so that settings UI status widgets refresh correctly
+        after every save. This test locks in the fan-out contract before PR1.
+        """
+        from vid_to_sub_app.tui.mixins import settings_mixin
+
+        app = VidToSubApp()
+        widgets = self._make_widgets()
+
+        def query_one(selector: str, *_args):
+            if selector in widgets:
+                return widgets[selector]
+            raise NoMatches(selector)
+
+        fan_out_calls: list[str] = []
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            temp_db = Database(Path(tmpdir) / "state.db")
+
+            with (
+                patch.object(settings_mixin, "_db", temp_db),
+                patch.object(app, "query_one", side_effect=query_one),
+                patch.object(app, "_apply_db_to_env", return_value=None),
+                patch.object(app, "_sync_transcribe_overrides_from_settings", return_value=None),
+                patch.object(app, "_sync_run_defaults_from_settings", return_value=None),
+                patch.object(
+                    app, "_load_remote_resources",
+                    side_effect=lambda: fan_out_calls.append("_load_remote_resources"),
+                ),
+                patch.object(
+                    app, "_run_detection",
+                    side_effect=lambda: fan_out_calls.append("_run_detection"),
+                ),
+                patch.object(
+                    app, "_update_wcpp_model_status",
+                    side_effect=lambda: fan_out_calls.append("_update_wcpp_model_status"),
+                ),
+                patch.object(
+                    app, "_update_remote_status",
+                    side_effect=lambda: fan_out_calls.append("_update_remote_status"),
+                ),
+                patch.object(
+                    app, "_update_agent_config_status",
+                    side_effect=lambda: fan_out_calls.append("_update_agent_config_status"),
+                ),
+                patch.object(
+                    app, "_update_cmd_preview",
+                    side_effect=lambda: fan_out_calls.append("_update_cmd_preview"),
+                ),
+            ):
+                app._save_settings()
+
+        expected = {
+            "_load_remote_resources",
+            "_run_detection",
+            "_update_wcpp_model_status",
+            "_update_remote_status",
+            "_update_agent_config_status",
+            "_update_cmd_preview",
+        }
+        self.assertEqual(
+            expected,
+            set(fan_out_calls),
+            f"fan-out helpers missing or extra: got {fan_out_calls}",
+        )
 
 if __name__ == "__main__":
     unittest.main()

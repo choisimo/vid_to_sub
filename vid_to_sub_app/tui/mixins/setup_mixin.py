@@ -113,6 +113,7 @@ class SetupMixin:
     def _run_cmd(self, cmd: list[str]) -> bool:
         """Run a subprocess, stream to setup-log. Returns True on success. Call from worker."""
         self.call_from_thread(self._setup_log, f"[dim]$ {' '.join(cmd)}[/]")
+        proc: subprocess.Popen[str] | None = None
         try:
             proc = subprocess.Popen(
                 cmd,
@@ -134,6 +135,18 @@ class SetupMixin:
         except FileNotFoundError as e:
             self.call_from_thread(self._setup_log, f"[red]✗ Not found: {e}[/]")
             return False
+        finally:
+            if proc is not None:
+                if proc.stdout is not None:
+                    try:
+                        proc.stdout.close()
+                    except Exception:
+                        pass
+                if proc.poll() is None:
+                    try:
+                        proc.terminate()
+                    except OSError:
+                        pass
 
     def _capture_detection_state(self) -> DetectResult:
         self._detected_ggml_models = discover_ggml_models()
@@ -146,7 +159,7 @@ class SetupMixin:
         self.call_from_thread(self._update_detect_ui, results)
         return results
 
-    @work(thread=True, exclusive=False, exit_on_error=False)
+    @work(thread=True, exclusive=True, exit_on_error=False)
     def _run_detection(self) -> None:
         self._refresh_detection_from_worker()
 
@@ -438,7 +451,7 @@ class SetupMixin:
         self._refresh_detection_from_worker()
         return True
 
-    @work(thread=True, exclusive=False, exit_on_error=False, name="build-whisper")
+    @work(thread=True, exclusive=True, exit_on_error=False, name="build-whisper")
     def _build_whisper_cpp(self) -> None:
         self._build_whisper_cpp_sync()
 
@@ -525,11 +538,11 @@ class SetupMixin:
         self._refresh_detection_from_worker()
         return True
 
-    @work(thread=True, exclusive=False, exit_on_error=False, name="download-model")
+    @work(thread=True, exclusive=True, exit_on_error=False, name="download-model")
     def _download_model(self, model_name: str) -> None:
         self._download_model_sync(model_name)
 
-    @work(thread=True, exclusive=False, exit_on_error=False, name="pip-install")
+    @work(thread=True, exclusive=True, exit_on_error=False, name="pip-install")
     def _pip_install(self, package: str) -> None:
         if package in PIP_REQUIREMENT_FILES:
             self._install_requirement_target(package)
@@ -576,6 +589,6 @@ class SetupMixin:
             log(summary)
             self.call_from_thread(self._set_setup_status, summary)
 
-    @work(thread=True, exclusive=False, exit_on_error=False, name="auto-setup")
+    @work(thread=True, exclusive=True, exit_on_error=False, name="auto-setup")
     def _auto_setup(self, full: bool, model_name: str) -> None:
         self._auto_setup_sync(full, model_name)

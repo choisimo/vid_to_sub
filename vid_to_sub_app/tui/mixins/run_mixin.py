@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import json
 import os
 import queue
@@ -12,14 +13,16 @@ from pathlib import Path
 from typing import Any, Sequence
 
 from textual import work
-from textual.widgets import RichLog
 
 from vid_to_sub_app.cli import (
     apply_runtime_path_map_to_manifest,
     build_run_manifest,
     discover_videos,
 )
-from vid_to_sub_app.cli.runner import primary_output_exists as _primary_output_exists
+from vid_to_sub_app.cli.runner import (
+    primary_output_exists as _primary_output_exists,
+    translation_capable,
+)
 from vid_to_sub_app.shared.constants import ROOT_DIR
 
 from ..helpers import (
@@ -106,6 +109,7 @@ class RunMixin:
         remote_profile: RemoteResourceProfile | None = None,
         config: RunConfig | None = None,
         manifest_stdin: bool = False,
+        stage: str = "full",  # "full" | "stage1" | "stage2" (injected by plan builder)
     ) -> list[str]:
         if not paths and not manifest_stdin:
             raise ValueError("No input paths — use Browse tab to select")
@@ -206,68 +210,85 @@ class RunMixin:
                 if config is not None
                 else (self._val("inp-translate-to") or None)
             )
-            if translate_to:
-                v = translate_to
-                cmd += ["--translate-to", v]
-            translation_model = (
-                config.translation_model
-                if config is not None
-                else (self._val("inp-trans-model") or None)
-            )
-            if translation_model:
-                v = translation_model
-                cmd += ["--translation-model", v]
             translation_base_url = (
                 config.translation_base_url
                 if config is not None
                 else (self._val("inp-trans-url") or None)
             )
-            if translation_base_url:
-                v = translation_base_url
-                cmd += ["--translation-base-url", v]
-            translation_api_key = (
-                config.translation_api_key
-                if config is not None
-                else (self._val("inp-trans-key") or None)
-            )
-            if translation_api_key:
-                v = translation_api_key
-                cmd += ["--translation-api-key", v]
-            postprocess_enabled = (
-                config.postprocess_enabled
-                if config is not None
-                else self._sw("sw-postprocess")
-            )
-            if postprocess_enabled:
-                cmd.append("--postprocess-translation")
-                postprocess_mode = (
-                    config.postprocess_mode
-                    if config is not None
-                    else self._sel("sel-postprocess-mode", "auto")
+            if translation_capable(
+                argparse.Namespace(
+                    translate_to=translate_to,
+                    translation_base_url=translation_base_url,
                 )
-                if postprocess_mode and postprocess_mode != "auto":
-                    cmd += ["--postprocess-mode", postprocess_mode]
-                postprocess_model = (
-                    config.postprocess_model
+            ):
+                cmd += ["--translate-to", translate_to]
+                translation_model = (
+                    config.translation_model
                     if config is not None
-                    else (self._val("inp-post-model") or None)
+                    else (self._val("inp-trans-model") or None)
                 )
-                if postprocess_model:
-                    cmd += ["--postprocess-model", postprocess_model]
-                postprocess_base_url = (
-                    config.postprocess_base_url
+                if translation_model:
+                    cmd += ["--translation-model", translation_model]
+                cmd += ["--translation-base-url", translation_base_url]
+                translation_api_key = (
+                    config.translation_api_key
                     if config is not None
-                    else (self._val("inp-post-url") or None)
+                    else (self._val("inp-trans-key") or None)
                 )
-                if postprocess_base_url:
-                    cmd += ["--postprocess-base-url", postprocess_base_url]
-                postprocess_api_key = (
-                    config.postprocess_api_key
+                if translation_api_key:
+                    cmd += ["--translation-api-key", translation_api_key]
+                # Forward translation batching options
+                translation_chunk_size = (
+                    config.translation_chunk_size
                     if config is not None
-                    else (self._val("inp-post-key") or None)
+                    else max(1, _coerce_positive_int(
+                        self._val("inp-translation-chunk-size") or "100", default=100
+                    ))
                 )
-                if postprocess_api_key:
-                    cmd += ["--postprocess-api-key", postprocess_api_key]
+                if translation_chunk_size != 100:
+                    cmd += ["--translation-chunk-size", str(translation_chunk_size)]
+                translation_mode = (
+                    config.translation_mode
+                    if config is not None
+                    else self._sel("sel-translation-mode", "strict")
+                )
+                if translation_mode and translation_mode != "strict":
+                    cmd += ["--translation-mode", translation_mode]
+                postprocess_enabled = (
+                    config.postprocess_enabled
+                    if config is not None
+                    else self._sw("sw-postprocess")
+                )
+                if postprocess_enabled:
+                    cmd.append("--postprocess-translation")
+                    postprocess_mode = (
+                        config.postprocess_mode
+                        if config is not None
+                        else self._sel("sel-postprocess-mode", "auto")
+                    )
+                    if postprocess_mode and postprocess_mode != "auto":
+                        cmd += ["--postprocess-mode", postprocess_mode]
+                    postprocess_model = (
+                        config.postprocess_model
+                        if config is not None
+                        else (self._val("inp-post-model") or None)
+                    )
+                    if postprocess_model:
+                        cmd += ["--postprocess-model", postprocess_model]
+                    postprocess_base_url = (
+                        config.postprocess_base_url
+                        if config is not None
+                        else (self._val("inp-post-url") or None)
+                    )
+                    if postprocess_base_url:
+                        cmd += ["--postprocess-base-url", postprocess_base_url]
+                    postprocess_api_key = (
+                        config.postprocess_api_key
+                        if config is not None
+                        else (self._val("inp-post-key") or None)
+                    )
+                    if postprocess_api_key:
+                        cmd += ["--postprocess-api-key", postprocess_api_key]
 
         diarize = config.diarize if config is not None else self._sw("sw-diarize")
         if diarize:
@@ -280,6 +301,35 @@ class RunMixin:
         if hf_token:
             v = hf_token
             cmd += ["--hf-token", v]
+
+        # Stage-split injection: override translation behaviour based on plan stage.
+        # "stage1" — suppress translation, add --stage1-only so artifact is written.
+        # "stage2" — do not pass path args; caller is responsible for
+        #           --translate-from-artifact injection.
+        if stage == "stage1":
+            # Remove any --translate-to that was already added above and add
+            # --stage1-only so the process writes .stage1.json artifacts.
+            cleaned: list[str] = []
+            skip_next = False
+            for tok in cmd:
+                if skip_next:
+                    skip_next = False
+                    continue
+                if tok == "--translate-to":
+                    skip_next = True
+                    continue
+                cleaned.append(tok)
+            cmd = cleaned
+            if "--stage1-only" not in cmd:
+                cmd.append("--stage1-only")
+            # Keep --translate-to so the artifact records target_lang for stage2.
+            translate_to = (
+                config.translate_to
+                if config is not None
+                else (self._val("inp-translate-to") or None)
+            )
+            if translate_to:
+                cmd += ["--translate-to", translate_to]
 
         return cmd
 
@@ -356,6 +406,10 @@ class RunMixin:
             postprocess_model=self._val("inp-post-model") or None,
             postprocess_base_url=self._val("inp-post-url") or None,
             postprocess_api_key=self._val("inp-post-key") or None,
+            translation_chunk_size=max(1, _coerce_positive_int(
+                self._val("inp-translation-chunk-size") or "100", default=100
+            )),
+            translation_mode=self._sel("sel-translation-mode", "strict"),
             diarize=self._sw("sw-diarize"),
             hf_token=self._val("inp-hf-token") or None,
             execution_mode=self._sel(
@@ -447,6 +501,7 @@ class RunMixin:
         *,
         dry_run: bool,
         config: RunConfig | None = None,
+        stage: str = "full",
     ) -> list[str]:
         base_env = {
             key: value
@@ -470,6 +525,7 @@ class RunMixin:
             remote_profile=profile,
             config=config,
             manifest_stdin=True,
+            stage=stage,
         )
         env_prefix = " ".join(
             f"{key}={shlex.quote(value)}"
@@ -532,6 +588,23 @@ class RunMixin:
                 )
             ]
 
+        # Determine whether translation is requested — if so, remote executors
+        # run stage1 only (transcription → artifact) and the local executor runs
+        # a full pass that includes translation on its own assigned videos.
+        # This avoids the assumption that remote boxes have translation API access.
+        translate_enabled_flag = (
+            config.translate_enabled if config is not None else self._sw("sw-translate")
+        )
+        translate_to_flag = (
+            config.translate_to
+            if config is not None
+            else (self._val("inp-translate-to") or None)
+        )
+        remote_stage = (
+            "stage1" if translate_enabled_flag and translate_to_flag else "full"
+        )
+
+        capacities = ["local", local_capacity]
         capacities = [("local", local_capacity)]
         capacities.extend((profile.name, profile.slots) for profile in remote_resources)
         assignments = partition_folder_groups_by_capacity(
@@ -563,6 +636,7 @@ class RunMixin:
                     capacity=local_capacity,
                     manifest=local_manifest,
                     stdin_payload=json.dumps(local_manifest, ensure_ascii=False),
+                    stage="full",  # local always runs full pass (incl. translation)
                 )
             )
 
@@ -585,12 +659,14 @@ class RunMixin:
                         None,
                         dry_run=dry_run,
                         config=config,
+                        stage=remote_stage,
                     ),
                     env=None,
                     assigned_paths=list(assigned),
                     capacity=profile.slots,
                     manifest=remote_manifest,
                     stdin_payload=json.dumps(remote_manifest, ensure_ascii=False),
+                    stage=remote_stage,
                 )
             )
 
@@ -709,6 +785,9 @@ class RunMixin:
                 )
             except (TypeError, ValueError):
                 segments = None
+            artifact_metadata = event.get("artifact_metadata")
+            if not isinstance(artifact_metadata, dict):
+                artifact_metadata = None
 
             if job and job.job_id is not None:
                 _db.finish_job(
@@ -719,6 +798,8 @@ class RunMixin:
                     wall_sec=wall_sec,
                     video_dur=video_dur,
                     segments=segments,
+                    artifact_path=event.get("artifact_path") or None,
+                    artifact_metadata=artifact_metadata,
                 )
             elif status != "done":
                 job_id = _db.create_job(
@@ -801,6 +882,83 @@ class RunMixin:
         self._refresh_history()
         self._refresh_live_panels()
 
+    def _trigger_translate_from_artifact(self, artifact_path: str) -> None:
+        """Start a Stage-2 translation run from a pre-existing stage artifact.
+
+        Builds the CLI command with ``--translate-from-artifact`` and the
+        target language from the artifact, then launches it via the same
+        subprocess path used by ``_trigger``.
+        """
+        try:
+            from vid_to_sub_app.cli.stage_artifact import load_stage_artifact
+
+            artifact = load_stage_artifact(Path(artifact_path))
+            target_lang = artifact.get("target_lang") or None
+        except Exception as exc:
+            self._log(f"[red]Cannot read artifact {artifact_path}: {exc}[/]")
+            return
+        if not target_lang:
+            self._log(
+                "[yellow]Artifact has no target_lang. "
+                "Set a translation target in the form and re-run.[/]"
+            )
+            return
+
+        try:
+            config = self._snapshot_run_config(dry_run=False)
+        except ValueError as exc:
+            self._log(f"[bold red]✕ {exc}[/]")
+            return
+
+        # Build a minimal stage-2-only command using the correct dry_run=False signature.
+        # _build_cmd() only accepts a bool; config snapshot is used for env vars only.
+        base_cmd = self._build_cmd(dry_run=False)
+        # Remove any --translate-to and --stage1-only already in the command,
+        # then append --translate-from-artifact and --translate-to.
+        clean: list[str] = []
+        skip_next = False
+        for tok in base_cmd:
+            if skip_next:
+                skip_next = False
+                continue
+            if tok in ("--translate-to", "--stage1-only"):
+                skip_next = True
+                continue
+            clean.append(tok)
+        clean += [
+            "--translate-from-artifact",
+            artifact_path,
+            "--translate-to",
+            target_lang,
+        ]
+
+        self._clear_runtime_logs()
+        self._log(
+            f"[bold cyan]Stage-2 translation[/] from artifact {Path(artifact_path).name}"
+        )
+        self._reset_run_state(preserve_shell=True)
+        self._run_last_shell = (
+            f"[cyan]Stage-2 translate[/] · artifact={Path(artifact_path).name}"
+        )
+        self._run_total_queued = 1
+        self._pending_paths = {"local": {artifact_path}}
+        self._refresh_live_panels()
+        # Build a minimal ExecutorPlan and launch via the standard _stream() path
+        from ..helpers import ExecutorPlan
+        plan = ExecutorPlan(
+            name="local",
+            kind="local",
+            label="local",
+            cmd=clean,
+            env=self._build_run_env(config),
+            assigned_paths=[artifact_path],
+            capacity=1,
+            manifest={"entries": [], "folders": []},
+            stdin_payload=None,
+            stage="stage2",
+        )
+        self._active_worker = self._stream([plan])
+
     def _trigger(self, dry_run: bool = False) -> None:
         try:
             config = self._snapshot_run_config(dry_run)
@@ -808,9 +966,8 @@ class RunMixin:
             self._log(f"[bold red]✕ {exc}[/]")
             return
 
-        log = self.query_one("#log", RichLog)
-        log.clear()
-        log.write(
+        self._clear_runtime_logs()
+        self._log(
             "[bold cyan]Preparing run[/] discovering video files and building execution plan…"
         )
 
@@ -846,22 +1003,21 @@ class RunMixin:
         if config.request_id != self._run_request_id:
             return
 
-        log = self.query_one("#log", RichLog)
-        log.clear()
+        self._clear_runtime_logs()
         if config.execution_mode == "distributed" and len(plans) > 1:
-            log.write(
+            self._log(
                 f"[bold cyan]Distributed run[/] {len(videos)} video(s) across {len(plans)} executor(s)"
             )
         elif plans[0].kind == "remote":
-            log.write(
+            self._log(
                 f"[bold cyan]Remote run[/] {len(videos)} video(s) via {plans[0].label}"
             )
         else:
-            log.write(
+            self._log(
                 "[bold cyan]$ " + " ".join(_mask(plans[0].cmd[2:])) + "[/bold cyan]"
             )
         for plan in plans:
-            log.write(
+            self._log(
                 f"[dim]{plan.label}[/] {len(plan.assigned_paths)} file(s) · capacity={plan.capacity}"
             )
 
@@ -958,7 +1114,7 @@ class RunMixin:
 
     @work(thread=True, exclusive=True, exit_on_error=False, name="_stream")
     def _stream(self, plans: list[ExecutorPlan]) -> None:
-        output_queue: queue.Queue[tuple[str, str | None]] = queue.Queue()
+        output_queue: queue.Queue[tuple[str, str | None]] = queue.Queue(maxsize=2048)
         launched: list[
             tuple[
                 ExecutorPlan,
@@ -1086,15 +1242,23 @@ class RunMixin:
                 try:
                     rc = proc.wait(timeout=1) if rc is None else proc.wait()
                 except subprocess.TimeoutExpired:
-                    continue
+                    # Terminate timed out — escalate to SIGKILL.
+                    try:
+                        proc.kill()
+                    except OSError:
+                        pass
+                    try:
+                        proc.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        pass
 
                 self._procs.pop(plan.label, None)
                 if self._proc is proc:
                     self._proc = None
 
-                if rc != 0:
+                if rc is not None and rc != 0:
                     failed_executors.append((plan, rc))
-                elif multi_executor:
+                elif rc is not None and multi_executor:
                     completed_labels.append(plan.label)
 
         had_error = bool(failed_executors)
@@ -1113,3 +1277,136 @@ class RunMixin:
             )
         else:
             self.call_from_thread(self._log, "\n[bold green]✓ Completed (exit 0)[/]")
+
+        # Distributed stage-handoff: if any remote plan ran stage1-only and
+        # completed successfully, collect their stage1 artifacts and queue a
+        # local stage2 translation pass.  This closes the remote-transcription →
+        # local-translation pipeline that _build_executor_plans() intends.
+        if not had_error:
+            remote_stage1_plans = [
+                plan
+                for plan in plans
+                if plan.kind == "remote" and getattr(plan, "stage", "full") == "stage1"
+            ]
+            if remote_stage1_plans:
+                import glob as _glob
+                artifact_paths: list[str] = []
+                for plan in remote_stage1_plans:
+                    for video_path in plan.assigned_paths:
+                        # Artifact lives next to the video (or output_base).
+                        # Standard naming: <stem>.stage1.json
+                        from pathlib import Path as _Path
+                        video_p = _Path(video_path)
+                        candidate = video_p.with_suffix(".stage1.json")
+                        if not candidate.exists():
+                            # also check <stem>.stage1.json in same dir
+                            alt = video_p.parent / (video_p.stem + ".stage1.json")
+                            candidate = alt if alt.exists() else candidate
+                        if candidate.exists():
+                            artifact_paths.append(str(candidate))
+                if artifact_paths:
+                    self.call_from_thread(
+                        self._log,
+                        f"[bold cyan]Distributed handoff:[/] {len(artifact_paths)} stage-1 artifact(s) found. "
+                        "Launching local stage-2 translation…",
+                    )
+                    self.call_from_thread(
+                        self._schedule_remote_stage2, artifact_paths
+                    )
+                else:
+                    self.call_from_thread(
+                        self._log,
+                        "[yellow]Distributed handoff: remote stage-1 completed but no .stage1.json artifacts "
+                        "were found locally. Run --translate-from-artifact manually.[/]",
+                    )
+
+    def _schedule_remote_stage2(self, artifact_paths: list[str]) -> None:
+        """Launch local Stage-2 translation for a batch of stage-1 artifacts.
+
+        Called on the main thread (via call_from_thread) after a distributed
+        remote stage-1 run completes successfully.  Each artifact must contain
+        a ``target_lang`` field; artifacts that lack one are skipped with a
+        warning.  All valid artifacts are submitted as a single multi-executor
+        _stream() call so that progress tracking works correctly.
+        """
+        from pathlib import Path as _Path
+        from vid_to_sub_app.cli.stage_artifact import load_stage_artifact
+        from ..helpers import ExecutorPlan
+
+        try:
+            config = self._snapshot_run_config(dry_run=False)
+        except ValueError as exc:
+            self._log(f"[bold red]✕ Cannot start stage-2 batch: {exc}[/]")
+            return
+
+        plans: list[ExecutorPlan] = []
+        for artifact_path in artifact_paths:
+            try:
+                artifact = load_stage_artifact(_Path(artifact_path))
+                target_lang = artifact.get("target_lang") or None
+            except Exception as exc:
+                self._log(
+                    f"[yellow]Skipping artifact {artifact_path}: cannot read ({exc})[/]"
+                )
+                continue
+            if not target_lang:
+                self._log(
+                    f"[yellow]Skipping artifact {_Path(artifact_path).name}: no target_lang.[/]"
+                )
+                continue
+
+            base_cmd = self._build_cmd(dry_run=False)
+            clean: list[str] = []
+            skip_next = False
+            for tok in base_cmd:
+                if skip_next:
+                    skip_next = False
+                    continue
+                if tok in ("--translate-to", "--stage1-only"):
+                    skip_next = True
+                    continue
+                clean.append(tok)
+            clean += [
+                "--translate-from-artifact",
+                artifact_path,
+                "--translate-to",
+                target_lang,
+            ]
+
+            label = f"stage2:{_Path(artifact_path).stem}"
+            plans.append(
+                ExecutorPlan(
+                    name=label,
+                    kind="local",
+                    label=label,
+                    cmd=clean,
+                    env=self._build_run_env(config),
+                    assigned_paths=[artifact_path],
+                    capacity=1,
+                    manifest={"entries": [], "folders": []},
+                    stdin_payload=None,
+                    stage="stage2",
+                )
+            )
+
+        if not plans:
+            self._log(
+                "[yellow]Distributed handoff: no valid artifacts with target_lang. "
+                "Nothing to translate.[/]"
+            )
+            return
+
+        self._log(
+            f"[bold cyan]Distributed handoff:[/] launching local stage-2 for "
+            f"{len(plans)} artifact(s)…"
+        )
+        self._reset_run_state(preserve_shell=True)
+        self._run_last_shell = (
+            f"[cyan]Stage-2 translate[/] · {len(plans)} artifact(s) from remote stage-1"
+        )
+        self._run_total_queued = len(plans)
+        self._pending_paths = {
+            "local": {p for plan in plans for p in plan.assigned_paths}
+        }
+        self._refresh_live_panels()
+        self._active_worker = self._stream(plans)

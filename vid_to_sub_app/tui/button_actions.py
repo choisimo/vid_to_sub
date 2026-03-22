@@ -76,6 +76,9 @@ class ButtonId(StrEnum):
     HIST_REFRESH = "btn-hist-refresh"
     HIST_LOAD = "btn-hist-load"
     HIST_RERUN = "btn-hist-rerun"
+    HIST_TRANSLATE = "btn-hist-translate"
+    HIST_SELECT_MODE = "btn-hist-select-mode"
+    HIST_COPY = "btn-hist-copy"
     HIST_CLEAR = "btn-hist-clear"
     HIST_DELETE = "btn-hist-delete"
 
@@ -154,6 +157,9 @@ HISTORY_ACTIONS: dict[ButtonId, ActionSpec] = {
     ButtonId.HIST_REFRESH: ActionSpec("_action_hist_refresh"),
     ButtonId.HIST_LOAD: ActionSpec("_action_hist_load"),
     ButtonId.HIST_RERUN: ActionSpec("_action_hist_rerun"),
+    ButtonId.HIST_TRANSLATE: ActionSpec("_action_hist_translate"),
+    ButtonId.HIST_SELECT_MODE: ActionSpec("_action_hist_select_mode"),
+    ButtonId.HIST_COPY: ActionSpec("_action_hist_copy"),
     ButtonId.HIST_CLEAR: ActionSpec("_action_hist_clear"),
     ButtonId.HIST_DELETE: ActionSpec("_action_hist_delete"),
 }
