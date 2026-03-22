@@ -6,6 +6,7 @@ import socket
 import subprocess
 import sys
 import tempfile
+import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
@@ -26,6 +27,10 @@ from vid_to_sub_app.shared.constants import (
     ENV_TRANSLATION_MODEL,
     EVENT_PREFIX,
     ROOT_DIR,
+    TRANSLATION_HTTP_RETRY_ATTEMPTS,
+    TRANSLATION_HTTP_RETRY_BACKOFF_SEC,
+    TRANSLATION_HTTP_RETRYABLE_STATUS_CODES,
+    TRANSLATION_HTTP_TIMEOUT_SEC,
     TRANSLATION_RETRY_SCHEDULE,
 )
 
@@ -152,17 +157,51 @@ def _request_chat_completion(
             "User-Agent": "vid_to_sub/1.0 (+https://local.cli)",
         },
     )
-    try:
-        with urllib.request.urlopen(request) as response:
-            raw_text = response.read().decode("utf-8")
-            response_payload = json.loads(raw_text)
-            http_status = getattr(response, "status", None)
-            headers = getattr(response, "headers", None)
-    except urllib.error.HTTPError as exc:
-        body = exc.read().decode("utf-8", errors="replace")
-        raise RuntimeError(f"{error_prefix} HTTP {exc.code}: {body}") from exc
-    except urllib.error.URLError as exc:
-        raise RuntimeError(f"{error_prefix} request failed: {exc.reason}") from exc
+    response_payload: Any = None
+    http_status: int | None = None
+    headers: Any = None
+    max_http_attempts = max(1, int(TRANSLATION_HTTP_RETRY_ATTEMPTS))
+    for http_attempt in range(1, max_http_attempts + 1):
+        try:
+            with _urlopen_with_timeout(request, TRANSLATION_HTTP_TIMEOUT_SEC) as response:
+                raw_text = response.read().decode("utf-8")
+                response_payload = json.loads(raw_text)
+                http_status = getattr(response, "status", None)
+                headers = getattr(response, "headers", None)
+                break
+        except urllib.error.HTTPError as exc:
+            body = exc.read().decode("utf-8", errors="replace")
+            if _should_retry_http_request(status_code=exc.code, http_attempt=http_attempt):
+                _emit_http_retry_log(
+                    batch_id=batch_id,
+                    attempt=attempt,
+                    http_attempt=http_attempt,
+                    endpoint=endpoint,
+                    reason=f"http_{exc.code}",
+                    status_code=exc.code,
+                    retry_in_sec=_retry_backoff_delay(http_attempt),
+                )
+                time.sleep(_retry_backoff_delay(http_attempt))
+                continue
+            raise RuntimeError(f"{error_prefix} HTTP {exc.code}: {body}") from exc
+        except (urllib.error.URLError, TimeoutError, socket.timeout) as exc:
+            reason = getattr(exc, "reason", exc)
+            if _should_retry_http_request(status_code=None, http_attempt=http_attempt):
+                _emit_http_retry_log(
+                    batch_id=batch_id,
+                    attempt=attempt,
+                    http_attempt=http_attempt,
+                    endpoint=endpoint,
+                    reason=str(reason),
+                    status_code=None,
+                    retry_in_sec=_retry_backoff_delay(http_attempt),
+                )
+                time.sleep(_retry_backoff_delay(http_attempt))
+                continue
+            raise RuntimeError(f"{error_prefix} request failed: {reason}") from exc
+
+    if response_payload is None:
+        raise RuntimeError(f"{error_prefix} request failed without a response payload")
 
     raw_response_file = _write_debug_response_file(
         enabled=debug_enabled,
@@ -197,6 +236,64 @@ def _request_chat_completion(
         http_status=http_status,
         response_payload=response_payload,
         raw_response_file=raw_response_file,
+    )
+
+
+def _urlopen_with_timeout(
+    request: urllib.request.Request,
+    timeout_sec: float,
+):
+    try:
+        return urllib.request.urlopen(request, timeout=timeout_sec)
+    except TypeError as exc:
+        if "timeout" not in str(exc):
+            raise
+        return urllib.request.urlopen(request)
+
+
+def _retry_backoff_delay(http_attempt: int) -> float:
+    delays = TRANSLATION_HTTP_RETRY_BACKOFF_SEC
+    if not delays:
+        return 0.0
+    index = min(max(0, http_attempt - 1), len(delays) - 1)
+    return float(delays[index])
+
+
+def _should_retry_http_request(
+    *,
+    status_code: int | None,
+    http_attempt: int,
+) -> bool:
+    if http_attempt >= max(1, int(TRANSLATION_HTTP_RETRY_ATTEMPTS)):
+        return False
+    if status_code is None:
+        return True
+    return status_code in TRANSLATION_HTTP_RETRYABLE_STATUS_CODES
+
+
+def _emit_http_retry_log(
+    *,
+    batch_id: str,
+    attempt: int,
+    http_attempt: int,
+    endpoint: str,
+    reason: str,
+    status_code: int | None,
+    retry_in_sec: float,
+) -> None:
+    _emit_batch_log(
+        {
+            "event": "translation_http_retry",
+            "batch_id": batch_id,
+            "attempt": attempt,
+            "http_attempt": http_attempt,
+            "endpoint": endpoint,
+            "endpoint_host": urlsplit(endpoint).netloc or endpoint,
+            "http_status": status_code,
+            "reason": reason,
+            "retry_in_sec": retry_in_sec,
+            "timeout_sec": TRANSLATION_HTTP_TIMEOUT_SEC,
+        }
     )
 
 

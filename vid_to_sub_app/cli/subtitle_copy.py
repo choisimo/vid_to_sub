@@ -11,8 +11,7 @@ import shutil
 from pathlib import Path
 from typing import TypedDict
 
-# Subtitle extensions considered "subtitle" outputs vs. raw transcription JSON
-_SUBTITLE_EXTENSIONS: frozenset[str] = frozenset({".srt", ".vtt", ".txt", ".tsv"})
+from vid_to_sub_app.shared.constants import SUBTITLE_OUTPUT_EXTENSIONS
 
 
 class CopyResult(TypedDict):
@@ -22,11 +21,18 @@ class CopyResult(TypedDict):
     error: str | None
 
 
+def is_subtitle_output_path(path: str | Path) -> bool:
+    candidate = Path(path)
+    if candidate.name.lower().endswith(".stage1.json"):
+        return False
+    return candidate.suffix.lower() in SUBTITLE_OUTPUT_EXTENSIONS
+
+
 def subtitle_paths_from_output_paths(output_paths_json: str | None) -> list[Path]:
     """Return subtitle-format paths from a jobs.output_paths JSON string.
 
-    Filters to extensions in _SUBTITLE_EXTENSIONS. Returns an empty list for
-    null, empty, or malformed input without raising.
+    Filters to extensions in SUBTITLE_OUTPUT_EXTENSIONS. Returns an empty list
+    for null, empty, or malformed input without raising.
     """
     if not output_paths_json:
         return []
@@ -36,9 +42,7 @@ def subtitle_paths_from_output_paths(output_paths_json: str | None) -> list[Path
         return []
     if not isinstance(raw, list):
         return []
-    return [
-        Path(str(p)) for p in raw if Path(str(p)).suffix.lower() in _SUBTITLE_EXTENSIONS
-    ]
+    return [Path(str(p)) for p in raw if is_subtitle_output_path(str(p))]
 
 
 def bulk_copy_subtitles(

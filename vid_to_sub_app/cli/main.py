@@ -20,13 +20,14 @@ from vid_to_sub_app.shared.constants import (
     SUPPORTED_FORMATS,
 )
 from vid_to_sub_app.shared.env import (
+    load_env_from_sqlite,
+    load_project_env_fallback,
     resolve_runtime_model,
-    load_project_env,
     resolve_runtime_backend_and_device,
     resolve_runtime_backend_threads,
 )
 
-from .discovery import discover_videos
+from .discovery import discover_videos, hash_video_folder
 from .manifest import (
     FolderAwareScheduler,
     ProcessResult,
@@ -43,6 +44,44 @@ from .runner import (
     run_stage2,
 )
 from .stage_artifact import artifact_path_for, load_stage_artifact
+
+
+def _emit_stage2_job_events(
+    artifact_path: Path,
+    result: ProcessResult,
+) -> None:
+    source_path = Path(result.video_path)
+    emit_progress_event(
+        "job_finished",
+        video_path=str(source_path),
+        worker_id=result.worker_id,
+        status="done" if result.success else "failed",
+        stage=result.stage,
+        error=result.error,
+        elapsed_sec=result.elapsed_sec,
+        language=result.language,
+        video_duration=result.video_duration,
+        output_paths=result.output_paths or [],
+        segments=result.segments,
+        artifact_path=result.artifact_path or str(artifact_path),
+        artifact_metadata=result.artifact_metadata,
+        folder_hash=result.folder_hash,
+        folder_path=result.folder_path,
+        folder_total_files=1,
+        folder_completed_files=1,
+        folder_status="completed" if result.success else "failed",
+        folder_completed=True,
+    )
+    emit_progress_event(
+        "folder_finished",
+        folder_hash=result.folder_hash,
+        folder_path=result.folder_path,
+        total_files=1,
+        folder_total_files=1,
+        folder_completed_files=1,
+        folder_status="completed" if result.success else "failed",
+        folder_completed=True,
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -105,7 +144,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--translation-model", default=None, metavar="MODEL", help="Model name for the translation API. Falls back to VID_TO_SUB_TRANSLATION_MODEL env var.")
     parser.add_argument("--translation-base-url", default=None, metavar="URL", help="Base URL for the OpenAI-compatible translation API (e.g. https://host/v1).")
     parser.add_argument("--translation-api-key", default=None, metavar="KEY", help="Bearer token for the translation API. Falls back to VID_TO_SUB_TRANSLATION_API_KEY.")
-    parser.add_argument("--translation-chunk-size", type=int, default=100, metavar="N")
+    parser.add_argument(
+        "--translation-chunk-size",
+        type=int,
+        default=100,
+        metavar="N",
+        help="Maximum subtitle items per translation batch before contract-aware retries split the work.",
+    )
     parser.add_argument(
         "--translation-mode",
         choices=TRANSLATION_MODES,
@@ -254,7 +299,19 @@ def _print_dry_run_plan(
 
 
 def main(argv: Optional[list[str]] = None) -> int:
-    load_project_env(override=False)
+    bootstrap_env_db = None
+    try:
+        from vid_to_sub_app.db import Database
+
+        bootstrap_env_db = Database()
+        load_env_from_sqlite(bootstrap_env_db.get_all, override=True)
+        load_project_env_fallback(override=False)
+    except Exception:
+        load_project_env_fallback(override=False)
+    finally:
+        if bootstrap_env_db is not None:
+            bootstrap_env_db.close()
+
     parser = build_parser()
     args = parser.parse_args(argv)
 
@@ -323,6 +380,14 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     if args.translate_from_artifact:
         artifact_path = Path(args.translate_from_artifact).expanduser().resolve()
+        stage2_source_path: Path | None = None
+        try:
+            stage2_artifact = load_stage_artifact(artifact_path)
+            source_raw = str(stage2_artifact.get("source_path") or "").strip()
+            if source_raw:
+                stage2_source_path = Path(source_raw).expanduser().resolve()
+        except Exception:
+            stage2_source_path = None
         emit_progress_event(
             "queue_prepared",
             backend=args.backend,
@@ -342,7 +407,16 @@ def main(argv: Optional[list[str]] = None) -> int:
             return 0
 
         started_at = time.monotonic()
+        if stage2_source_path is not None:
+            emit_progress_event(
+                "job_started",
+                video_path=str(stage2_source_path),
+                worker_id=0,
+                folder_hash=hash_video_folder(stage2_source_path.parent),
+                folder_path=str(stage2_source_path.parent),
+            )
         result = run_stage2(artifact_path, args)
+        _emit_stage2_job_events(artifact_path, result)
         elapsed_total = time.monotonic() - started_at
         ok = 1 if result.success else 0
         err = 0 if result.success else 1

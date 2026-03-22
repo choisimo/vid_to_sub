@@ -4,6 +4,7 @@ import subprocess
 import re
 import sys
 import tempfile
+import threading
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -23,6 +24,11 @@ from vid_to_sub_app.shared.env import (
 )
 
 from .output import parse_srt, parse_whisper_cpp_progress_seconds
+
+_FasterWhisperRequestedKey = tuple[str, str, str]
+_FasterWhisperRuntimeKey = tuple[str, str, str]
+_FasterWhisperModelCacheKey = tuple[str, str, str, int]
+_faster_whisper_thread_state = threading.local()
 
 
 def configure_torch_cpu_threads(threads: int) -> None:
@@ -130,6 +136,53 @@ def _announce_faster_whisper_load(model_name: str, device: str, compute_type: st
     )
 
 
+def _faster_whisper_cpu_threads(device: str, threads: int) -> int:
+    if device != "cpu":
+        return 0
+    return max(1, int(threads))
+
+
+def _get_faster_whisper_thread_cache(
+    model_class_identity: int,
+) -> dict[str, object]:
+    state = getattr(_faster_whisper_thread_state, "state", None)
+    if (
+        state is None
+        or not isinstance(state, dict)
+        or state.get("model_class_identity") != model_class_identity
+    ):
+        state = {
+            "model_class_identity": model_class_identity,
+            "models": {},
+            "preferred_runtime": {},
+        }
+        _faster_whisper_thread_state.state = state
+    return state
+
+
+def _preferred_gpu_candidates(
+    candidates: list[str],
+    preferred_runtime: _FasterWhisperRuntimeKey | None,
+) -> list[str]:
+    if not preferred_runtime or preferred_runtime[1] != "cuda":
+        return candidates
+
+    preferred_model = preferred_runtime[0]
+    if preferred_model not in candidates:
+        return [preferred_model, *candidates]
+
+    return [preferred_model, *[candidate for candidate in candidates if candidate != preferred_model]]
+
+
+def _coerce_preferred_runtime(value: object) -> _FasterWhisperRuntimeKey | None:
+    if not isinstance(value, tuple) or len(value) != 3:
+        return None
+    model_name, device, compute_type = value
+    if not all(isinstance(item, str) for item in value):
+        return None
+    return model_name, device, compute_type
+
+
 def transcribe_faster_whisper(
     video: Path,
     model_name: str,
@@ -151,16 +204,33 @@ def transcribe_faster_whisper(
 
     dev, default_compute_type = resolve_device_fw(device)
     ct = compute_type or default_compute_type
+    requested_runtime: _FasterWhisperRequestedKey = (model_name, dev, ct)
+    thread_cache = _get_faster_whisper_thread_cache(id(WhisperModel))
+    model_cache = thread_cache["models"]
+    preferred_runtime_map = thread_cache["preferred_runtime"]
     candidate_chain = faster_whisper_model_candidates(model_name)
     selected_model = model_name
 
     def load_model(target_model: str, target_device: str, target_compute_type: str):
-        return WhisperModel(
+        cache_key: _FasterWhisperModelCacheKey = (
+            target_model,
+            target_device,
+            target_compute_type,
+            _faster_whisper_cpu_threads(target_device, threads),
+        )
+        cached_model = model_cache.get(cache_key)
+        if cached_model is not None:
+            return cached_model
+
+        _announce_faster_whisper_load(target_model, target_device, target_compute_type)
+        model = WhisperModel(
             target_model,
             device=target_device,
             compute_type=target_compute_type,
-            cpu_threads=max(1, int(threads)) if target_device == "cpu" else 0,
+            cpu_threads=cache_key[3],
         )
+        model_cache[cache_key] = model
+        return model
 
     if dev == "cuda":
         available_vram_gb = detect_cuda_total_memory_gb()
@@ -168,8 +238,15 @@ def transcribe_faster_whisper(
             model_name,
             available_vram_gb=available_vram_gb,
         )
+        preferred_runtime = _coerce_preferred_runtime(
+            preferred_runtime_map.get(requested_runtime)
+        )
         gpu_succeeded = False
-        if gpu_candidates and gpu_candidates[0] != model_name:
+        if (
+            gpu_candidates
+            and gpu_candidates[0] != model_name
+            and preferred_runtime is None
+        ):
             vram_summary = (
                 f"{available_vram_gb:.1f} GiB"
                 if available_vram_gb is not None
@@ -182,10 +259,27 @@ def transcribe_faster_whisper(
                 flush=True,
             )
 
-        if gpu_candidates:
+        reuse_cpu_fallback = preferred_runtime is not None and preferred_runtime[1] == "cpu"
+        if reuse_cpu_fallback:
+            dev = preferred_runtime[1]
+            ct = preferred_runtime[2]
+            selected_model = preferred_runtime[0]
+        else:
+            gpu_candidates = _preferred_gpu_candidates(gpu_candidates, preferred_runtime)
+
+        if reuse_cpu_fallback:
+            model = load_model(selected_model, dev, ct)
+            segs_raw, info_raw = model.transcribe(
+                str(video),
+                language=language,
+                beam_size=beam_size,
+                word_timestamps=False,
+            )
+            gpu_succeeded = True
+            preferred_runtime_map[requested_runtime] = (selected_model, dev, ct)
+        elif gpu_candidates:
             for index, candidate_model in enumerate(gpu_candidates):
                 selected_model = candidate_model
-                _announce_faster_whisper_load(selected_model, dev, ct)
                 try:
                     model = load_model(selected_model, dev, ct)
                 except Exception as exc:
@@ -214,10 +308,10 @@ def transcribe_faster_whisper(
                         word_timestamps=False,
                     )
                     gpu_succeeded = True
+                    preferred_runtime_map[requested_runtime] = (selected_model, dev, ct)
                     break
                 except Exception as exc:
                     if _is_cuda_oom_error(exc):
-                        del model
                         _release_cuda_cache()
                         next_candidate = gpu_candidates[index + 1] if index + 1 < len(gpu_candidates) else None
                         if next_candidate:
@@ -231,7 +325,7 @@ def transcribe_faster_whisper(
                             continue
                         break
                     raise
-        if not gpu_candidates or not gpu_succeeded:
+        if not reuse_cpu_fallback and (not gpu_candidates or not gpu_succeeded):
             fallback_model = candidate_chain[-1] if candidate_chain else model_name
             print(
                 f"[WARN] faster-whisper GPU candidates exhausted; "
@@ -242,7 +336,6 @@ def transcribe_faster_whisper(
             dev = "cpu"
             ct = "int8"
             selected_model = fallback_model
-            _announce_faster_whisper_load(selected_model, dev, ct)
             try:
                 model = load_model(selected_model, dev, ct)
             except Exception as exc:
@@ -255,8 +348,13 @@ def transcribe_faster_whisper(
                 beam_size=beam_size,
                 word_timestamps=False,
             )
+            preferred_runtime_map[requested_runtime] = (selected_model, dev, ct)
     else:
-        _announce_faster_whisper_load(selected_model, dev, ct)
+        preferred_runtime = _coerce_preferred_runtime(
+            preferred_runtime_map.get(requested_runtime)
+        )
+        if preferred_runtime and preferred_runtime[1] == dev and preferred_runtime[2] == ct:
+            selected_model = preferred_runtime[0]
         try:
             model = load_model(selected_model, dev, ct)
         except Exception as exc:
@@ -267,6 +365,7 @@ def transcribe_faster_whisper(
             beam_size=beam_size,
             word_timestamps=False,
         )
+        preferred_runtime_map[requested_runtime] = (selected_model, dev, ct)
 
     segments = [{"start": seg.start, "end": seg.end, "text": seg.text} for seg in segs_raw]
     info = {

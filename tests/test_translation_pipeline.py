@@ -5,6 +5,7 @@ import io
 import json
 import os
 import tempfile
+import urllib.error
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
@@ -156,6 +157,109 @@ class TranslationPipelineTests(unittest.TestCase):
         self.assertEqual(
             ["안녕", "세상"], [segment["text"] for segment in translated_segments]
         )
+
+    def test_translation_retries_after_retryable_http_error(self) -> None:
+        segments = [{"start": 0.0, "end": 1.0, "text": "Hello"}]
+        calls = 0
+        stdout_buffer = io.StringIO()
+        stderr_buffer = io.StringIO()
+
+        def fake_urlopen(request):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise urllib.error.HTTPError(
+                    url="https://translation.example/v1/chat/completions",
+                    code=429,
+                    msg="rate limited",
+                    hdrs=None,
+                    fp=io.BytesIO(b'{"error":"rate limited"}'),
+                )
+            return _FakeHTTPResponse(
+                _chat_payload(
+                    json.dumps(
+                        [{"segment_number": 1, "text": "안녕"}], ensure_ascii=False
+                    )
+                )
+            )
+
+        with (
+            patch(
+                "vid_to_sub_app.cli.translation.urllib.request.urlopen",
+                side_effect=fake_urlopen,
+            ),
+            patch("vid_to_sub_app.cli.translation.time.sleep") as sleep,
+            redirect_stdout(stdout_buffer),
+            redirect_stderr(stderr_buffer),
+        ):
+            translated_segments, _ = translate_segments_openai_compatible(
+                segments=segments,
+                target_language="ko",
+                translation_model="gpt-4.1-mini",
+                translation_base_url="https://translation.example/v1",
+                translation_api_key="secret",
+                source_language="en",
+                chunk_size=1,
+            )
+
+        self.assertEqual(["안녕"], [segment["text"] for segment in translated_segments])
+        self.assertEqual(2, calls)
+        sleep.assert_called_once_with(1.0)
+        retry_event = next(
+            event
+            for event in _event_payloads(stderr_buffer)
+            if event["event"] == "translation_http_retry"
+        )
+        self.assertEqual(429, retry_event["http_status"])
+        self.assertEqual("http_429", retry_event["reason"])
+
+    def test_translation_retries_after_transient_url_error(self) -> None:
+        segments = [{"start": 0.0, "end": 1.0, "text": "Hello"}]
+        calls = 0
+        stderr_buffer = io.StringIO()
+
+        def fake_urlopen(request):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise urllib.error.URLError("temporary dns failure")
+            return _FakeHTTPResponse(
+                _chat_payload(
+                    json.dumps(
+                        [{"segment_number": 1, "text": "안녕"}], ensure_ascii=False
+                    )
+                )
+            )
+
+        with (
+            patch(
+                "vid_to_sub_app.cli.translation.urllib.request.urlopen",
+                side_effect=fake_urlopen,
+            ),
+            patch("vid_to_sub_app.cli.translation.time.sleep") as sleep,
+            redirect_stdout(io.StringIO()),
+            redirect_stderr(stderr_buffer),
+        ):
+            translated_segments, _ = translate_segments_openai_compatible(
+                segments=segments,
+                target_language="ko",
+                translation_model="gpt-4.1-mini",
+                translation_base_url="https://translation.example/v1",
+                translation_api_key="secret",
+                source_language="en",
+                chunk_size=1,
+            )
+
+        self.assertEqual(["안녕"], [segment["text"] for segment in translated_segments])
+        self.assertEqual(2, calls)
+        sleep.assert_called_once_with(1.0)
+        retry_event = next(
+            event
+            for event in _event_payloads(stderr_buffer)
+            if event["event"] == "translation_http_retry"
+        )
+        self.assertIsNone(retry_event["http_status"])
+        self.assertIn("temporary dns failure", retry_event["reason"])
 
     def test_translation_retries_after_legacy_string_array_count_mismatch(
         self,
@@ -1225,6 +1329,78 @@ class TranslationPipelineTests(unittest.TestCase):
         self.assertEqual(0, exit_code)
         run_stage2_mock.assert_called_once_with(artifact_path.resolve(), ANY)
         run_stage1_mock.assert_not_called()
+
+    def test_translate_from_artifact_emits_stage2_job_events(self) -> None:
+        artifact_path = Path("/tmp/movie.stage1.json")
+        artifact: StageArtifact = {
+            "schema_version": ARTIFACT_SCHEMA_VERSION,
+            "source_path": "/tmp/movie.mp4",
+            "output_base": "/tmp",
+            "source_fingerprint": "10:1700000000",
+            "backend": "faster-whisper",
+            "device": "cpu",
+            "model": "large-v3",
+            "language": "en",
+            "target_lang": "ko",
+            "formats": ["srt"],
+            "primary_outputs": ["/tmp/movie.srt"],
+            "segments": [{"start": 0.0, "end": 1.0, "text": "Hello"}],
+            "stage_status": {
+                "transcription_complete": True,
+                "translation_pending": True,
+                "translation_complete": False,
+                "translation_failed": False,
+                "translation_error": None,
+            },
+        }
+        stage2_result = ProcessResult(
+            success=True,
+            video_path="/tmp/movie.mp4",
+            folder_hash="folder-hash",
+            folder_path="/tmp",
+            worker_id=0,
+            elapsed_sec=0.1,
+            language="en",
+            output_paths=["/tmp/movie.ko.srt"],
+            segments=1,
+            artifact_path=str(artifact_path),
+            artifact_metadata=build_stage_artifact_metadata(artifact_path, artifact),
+        )
+
+        stdout_buf = io.StringIO()
+        with (
+            patch(
+                "vid_to_sub_app.cli.main.load_stage_artifact",
+                return_value=artifact,
+            ),
+            patch(
+                "vid_to_sub_app.cli.main.run_stage2",
+                return_value=stage2_result,
+            ),
+            redirect_stdout(stdout_buf),
+        ):
+            exit_code = main(
+                [
+                    "--translate-from-artifact",
+                    str(artifact_path),
+                    "--translate-to",
+                    "ko",
+                ]
+            )
+
+        payloads = _event_payloads(stdout_buf)
+        started = next(
+            payload for payload in payloads if payload.get("event") == "job_started"
+        )
+        finished = next(
+            payload for payload in payloads if payload.get("event") == "job_finished"
+        )
+
+        self.assertEqual(0, exit_code)
+        self.assertEqual("/tmp/movie.mp4", started.get("video_path"))
+        self.assertEqual("/tmp/movie.mp4", finished.get("video_path"))
+        self.assertEqual("done", finished.get("status"))
+        self.assertEqual(str(artifact_path), finished.get("artifact_path"))
 
     def test_mutually_exclusive_stage_flags(self) -> None:
         with patch.object(
