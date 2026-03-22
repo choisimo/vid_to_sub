@@ -162,6 +162,7 @@ class VidToSubApp(
         self._detect_results: DetectResult = {}
         self._detected_ggml_models: dict[str, str] = {}
         self._remote_resources: list[RemoteResourceProfile] = []
+        self._remote_resource_warnings: list[str] = []
         self._ssh_selected_id: int | None = None  # selected SSH connection id
         self._agent_plan: dict[str, Any] | None = None
         self._active_worker: Worker[None] | None = None
@@ -416,6 +417,15 @@ class VidToSubApp(
                                 id="inp-language",
                                 classes="fwidget",
                             )
+                        with Horizontal(classes="frow"):
+                            yield Label("Content type", classes="flabel")
+                            yield Select(
+                                _opts(["auto", "speech", "music"], "auto"),
+                                id="sel-content-type",
+                                classes="fwidget",
+                                value="auto",
+                                allow_blank=False,
+                            )
 
                         yield Static("Hardware", classes="stitle")
                         with Horizontal(classes="frow"):
@@ -528,6 +538,9 @@ class VidToSubApp(
                                     type="integer",
                                     classes="fwidget",
                                 )
+                            with Horizontal(classes="crow"):
+                                yield Label("Force Stage-2 on suspicious artifacts")
+                                yield Switch(id="sw-force-translate", value=False)
                             with Horizontal(classes="crow"):
                                 yield Label("Enable post-edit agent")
                                 yield Switch(id="sw-postprocess", value=False)
@@ -777,13 +790,25 @@ class VidToSubApp(
                                 classes="fwidget",
                                 placeholder="ko",
                             )
+                        with Horizontal(classes="frow"):
+                            yield Label("Content type", classes="flabel")
+                            yield Select(
+                                _opts(["auto", "speech", "music"], "auto"),
+                                id="stg-default-content-type",
+                                classes="fwidget",
+                                value="auto",
+                                allow_blank=False,
+                            )
                         with Horizontal(classes="crow"):
                             yield Label("Translation enabled by default")
                             yield Switch(id="sw-stg-translate-enabled", value=True)
+                        with Horizontal(classes="crow"):
+                            yield Label("Force Stage-2 by default")
+                            yield Switch(id="sw-stg-force-translate", value=False)
 
                         yield Static("Remote Resources", classes="stitle")
                         yield Static(
-                            "[dim]JSON array of SSH resources. Distributed mode assumes shared storage or explicit path_map prefixes. Nothing runs remotely until you switch execution mode and press Run.[/]",
+                            "[dim]Legacy JSON fallback/import for SSH resource profiles. Prefer saving remote executors in SSH Connections. Distributed mode assumes shared storage or explicit path_map prefixes, and duplicate names prefer the saved SSH connection entry. Nothing runs remotely until you switch execution mode and press Run.[/]",
                             classes="hint",
                             markup=True,
                         )
@@ -807,7 +832,7 @@ class VidToSubApp(
 
                         yield Static("SSH Connections", classes="stitle")
                         yield Static(
-                            "[dim]Define SSH servers for remote transcription. Each connection can be selected — in the Transcribe tab — as a remote executor.[/]",
+                            "[dim]Primary remote executor list for distributed transcription. Saved connections are merged with any legacy Remote Resources JSON, and warnings are shown when names or targets drift.[/]",
                             classes="hint",
                             markup=True,
                         )
@@ -1731,6 +1756,7 @@ class VidToSubApp(
         Both sources are merged; DB connections take priority.
         """
         profiles: list[RemoteResourceProfile] = []
+        warnings: list[str] = []
 
         # 1. Structured SSH connections from DB (primary source)
         for row in _db.get_ssh_connections(enabled_only=True):
@@ -1742,11 +1768,19 @@ class VidToSubApp(
         if raw and raw.strip() not in ("", "[]"):
             try:
                 legacy = parse_remote_resources(raw)
-                # Only add profiles whose name isn't already taken by a DB connection
                 existing_names = {p.name for p in profiles}
+                shadowed_legacy_names: list[str] = []
                 for lp in legacy:
-                    if lp.name not in existing_names:
-                        profiles.append(lp)
+                    if lp.name in existing_names:
+                        shadowed_legacy_names.append(lp.name)
+                        continue
+                    profiles.append(lp)
+                if shadowed_legacy_names:
+                    names = ", ".join(sorted(set(shadowed_legacy_names)))
+                    warnings.append(
+                        "SSH connections override legacy remote JSON for duplicate "
+                        f"name(s): {names}."
+                    )
             except ValueError as exc:
                 try:
                     self.query_one("#stg-status", Static).update(
@@ -1754,7 +1788,32 @@ class VidToSubApp(
                     )
                 except NoMatches:
                     pass
+
+        duplicate_targets: dict[tuple[str, str], set[str]] = {}
+        for profile in profiles:
+            signature = (
+                profile.ssh_target.strip(),
+                profile.remote_workdir.strip(),
+            )
+            duplicate_targets.setdefault(signature, set()).add(profile.name)
+        colliding_target_names = sorted(
+            names
+            for names in (
+                sorted(profile_names)
+                for profile_names in duplicate_targets.values()
+                if len(profile_names) > 1
+            )
+        )
+        if colliding_target_names:
+            rendered = "; ".join(
+                ", ".join(profile_names) for profile_names in colliding_target_names
+            )
+            warnings.append(
+                "Remote profiles share the same ssh target/workdir under different "
+                f"names: {rendered}. Distributed assignment still keys off profile names."
+            )
         self._remote_resources = profiles
+        self._remote_resource_warnings = warnings
 
     def _update_remote_status(self) -> None:
         """Refresh the remote-status label in the Transcribe tab."""
@@ -1770,6 +1829,10 @@ class VidToSubApp(
                 msg = "[yellow]Distributed mode selected but no remote resources configured.[/]"
             else:
                 msg = "[dim]Local execution.[/]"
+            if self._remote_resource_warnings:
+                msg = f"{msg}\n[yellow]Warning:[/] " + " ".join(
+                    self._remote_resource_warnings
+                )
             self.query_one("#remote-status", Static).update(msg)
         except NoMatches:
             pass

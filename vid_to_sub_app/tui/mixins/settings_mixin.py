@@ -10,7 +10,11 @@ from textual.app import App
 from textual.css.query import NoMatches
 from textual.widgets import DataTable, Input, Select, Static, Switch, TextArea
 
-from vid_to_sub_app.db import TUI_DEFAULT_TRANSLATE_ENABLED_KEY
+from vid_to_sub_app.db import (
+    TUI_DEFAULT_CONTENT_TYPE_KEY,
+    TUI_DEFAULT_FORCE_TRANSLATE_KEY,
+    TUI_DEFAULT_TRANSLATE_ENABLED_KEY,
+)
 
 from ..helpers import (
     ENV_AGENT_KEY,
@@ -42,6 +46,7 @@ class SettingsMixin:
 
     _ssh_selected_id: int | None = None
     _remote_resources: list[RemoteResourceProfile] = []
+    _remote_resource_warnings: list[str] = []
     _run_last_shell = ""
 
     def _query_one(
@@ -84,6 +89,7 @@ class SettingsMixin:
 
     def _load_remote_resources(self) -> None:
         profiles: list[RemoteResourceProfile] = []
+        warnings: list[str] = []
 
         for row in _db.get_ssh_connections(enabled_only=True):
             conn = ssh_connection_from_row(row)
@@ -94,9 +100,18 @@ class SettingsMixin:
             try:
                 legacy = parse_remote_resources(raw)
                 existing_names = {profile.name for profile in profiles}
+                shadowed_legacy_names: list[str] = []
                 for profile in legacy:
-                    if profile.name not in existing_names:
-                        profiles.append(profile)
+                    if profile.name in existing_names:
+                        shadowed_legacy_names.append(profile.name)
+                        continue
+                    profiles.append(profile)
+                if shadowed_legacy_names:
+                    names = ", ".join(sorted(set(shadowed_legacy_names)))
+                    warnings.append(
+                        "SSH connections override legacy remote JSON for duplicate "
+                        f"name(s): {names}."
+                    )
             except ValueError as exc:
                 try:
                     self.query_one("#stg-status", Static).update(
@@ -105,7 +120,32 @@ class SettingsMixin:
                 except NoMatches:
                     pass
 
+        duplicate_targets: dict[tuple[str, str], set[str]] = {}
+        for profile in profiles:
+            signature = (
+                profile.ssh_target.strip(),
+                profile.remote_workdir.strip(),
+            )
+            duplicate_targets.setdefault(signature, set()).add(profile.name)
+        colliding_target_names = sorted(
+            names
+            for names in (
+                sorted(profile_names)
+                for profile_names in duplicate_targets.values()
+                if len(profile_names) > 1
+            )
+        )
+        if colliding_target_names:
+            rendered = "; ".join(
+                ", ".join(profile_names) for profile_names in colliding_target_names
+            )
+            warnings.append(
+                "Remote profiles share the same ssh target/workdir under different "
+                f"names: {rendered}. Distributed assignment still keys off profile names."
+            )
+
         self._remote_resources = profiles
+        self._remote_resource_warnings = warnings
 
     def _run_detection(self) -> Any:
         refresh_detection = getattr(self, "_refresh_detection_from_worker", None)
@@ -163,6 +203,10 @@ class SettingsMixin:
                 )
             else:
                 msg = "[dim]Local execution.[/]"
+            if self._remote_resource_warnings:
+                msg = f"{msg}\n[yellow]Warning:[/] " + " ".join(
+                    self._remote_resource_warnings
+                )
             self.query_one("#remote-status", Static).update(msg)
         except NoMatches:
             pass
@@ -281,6 +325,18 @@ class SettingsMixin:
         except NoMatches:
             pass
         try:
+            self.query_one("#sw-stg-force-translate", Switch).value = bool(
+                _db.get_setting(TUI_DEFAULT_FORCE_TRANSLATE_KEY, False)
+            )
+        except NoMatches:
+            pass
+        try:
+            self.query_one("#stg-default-content-type", Select).value = (
+                _db.get(TUI_DEFAULT_CONTENT_TYPE_KEY, "auto") or "auto"
+            )
+        except NoMatches:
+            pass
+        try:
             self.query_one("#stg-remote-resources", TextArea).text = _db.get(
                 "tui.remote_resources", "[]"
             )
@@ -322,6 +378,18 @@ class SettingsMixin:
         try:
             self.query_one("#sw-translate", Switch).value = bool(
                 _db.get_setting(TUI_DEFAULT_TRANSLATE_ENABLED_KEY, True)
+            )
+        except NoMatches:
+            pass
+        try:
+            self.query_one("#sw-force-translate", Switch).value = bool(
+                _db.get_setting(TUI_DEFAULT_FORCE_TRANSLATE_KEY, False)
+            )
+        except NoMatches:
+            pass
+        try:
+            self.query_one("#sel-content-type", Select).value = (
+                _db.get(TUI_DEFAULT_CONTENT_TYPE_KEY, "auto") or "auto"
             )
         except NoMatches:
             pass
@@ -375,6 +443,19 @@ class SettingsMixin:
 
             widget.value = (updated_values.get(key) or "").strip()
         try:
+            select = self.query_one("#sel-content-type", Select)
+        except NoMatches:
+            select = None
+        if select is not None:
+            previous = (
+                previous_values.get(TUI_DEFAULT_CONTENT_TYPE_KEY) or "auto"
+            ).strip() or "auto"
+            current = str(select.value) if select.value is not Select.BLANK else "auto"
+            if current == previous:
+                select.value = (
+                    updated_values.get(TUI_DEFAULT_CONTENT_TYPE_KEY) or "auto"
+                ).strip() or "auto"
+        try:
             switch = self.query_one("#sw-translate", Switch)
         except NoMatches:
             switch = None
@@ -384,6 +465,17 @@ class SettingsMixin:
         ):
             switch.value = bool(
                 _db.get_setting(TUI_DEFAULT_TRANSLATE_ENABLED_KEY, True)
+            )
+        try:
+            force_switch = self.query_one("#sw-force-translate", Switch)
+        except NoMatches:
+            force_switch = None
+        if force_switch is not None and (
+            updated_values.get(TUI_DEFAULT_FORCE_TRANSLATE_KEY)
+            != previous_values.get(TUI_DEFAULT_FORCE_TRANSLATE_KEY)
+        ):
+            force_switch.value = bool(
+                _db.get_setting(TUI_DEFAULT_FORCE_TRANSLATE_KEY, False)
             )
 
     def _save_settings(self) -> None:
@@ -420,6 +512,15 @@ class SettingsMixin:
             )
         except NoMatches:
             pass
+        data[TUI_DEFAULT_CONTENT_TYPE_KEY] = self._sel(
+            "stg-default-content-type", "auto"
+        )
+        try:
+            data[TUI_DEFAULT_FORCE_TRANSLATE_KEY] = (
+                "1" if self.query_one("#sw-stg-force-translate", Switch).value else "0"
+            )
+        except NoMatches:
+            pass
         try:
             data["tui.remote_resources"] = (
                 self.query_one("#stg-remote-resources", TextArea).text.strip() or "[]"
@@ -438,6 +539,12 @@ class SettingsMixin:
         previous_values = {key: _db.get(key) for _, key in pairs}
         previous_values[TUI_DEFAULT_TRANSLATE_ENABLED_KEY] = _db.get(
             TUI_DEFAULT_TRANSLATE_ENABLED_KEY
+        )
+        previous_values[TUI_DEFAULT_CONTENT_TYPE_KEY] = _db.get(
+            TUI_DEFAULT_CONTENT_TYPE_KEY
+        )
+        previous_values[TUI_DEFAULT_FORCE_TRANSLATE_KEY] = _db.get(
+            TUI_DEFAULT_FORCE_TRANSLATE_KEY
         )
         _db.set_many(data)
         self._apply_db_to_env()
