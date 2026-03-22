@@ -6,6 +6,7 @@ import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -38,6 +39,17 @@ from vid_to_sub_app.shared.constants import (
 _BATCH_COUNTER = count(1)
 
 
+def _translation_max_concurrency() -> int:
+    raw_value = os.getenv("VID_TO_SUB_TRANSLATION_MAX_CONCURRENCY", "1").strip()
+    try:
+        return max(1, int(raw_value))
+    except ValueError:
+        return 1
+
+
+_TRANSLATION_SEMAPHORE = threading.BoundedSemaphore(_translation_max_concurrency())
+
+
 @dataclass(frozen=True)
 class ProviderResponse:
     message: str
@@ -56,6 +68,12 @@ class ParsedTranslationPayload:
     parsed_count: int
     parsed_sample: list[Any]
     payload_kind: str
+
+
+@dataclass
+class StructuredOutputPolicy:
+    enabled: bool = True
+    disabled_reason: str | None = None
 
 
 class TranslationPayloadError(ValueError):
@@ -81,6 +99,18 @@ class TranslationContractError(RuntimeError):
     pass
 
 
+class RetryableProviderError(RuntimeError):
+    def __init__(self, message: str, *, status_code: int | None = None) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+
+
+class StructuredOutputFallbackRequired(RuntimeError):
+    def __init__(self, message: str, *, status_code: int | None = None) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+
+
 def extract_json_array(text: str) -> list[str]:
     payload = _extract_json_payload(text)
     if not isinstance(payload, list) or not all(
@@ -91,11 +121,120 @@ def extract_json_array(text: str) -> list[str]:
 
 
 def _extract_json_payload(text: str) -> Any:
-    start = text.find("[")
-    end = text.rfind("]")
-    if start == -1 or end == -1 or end < start:
-        raise ValueError("No JSON array found in model response")
+    candidates: list[tuple[int, str, str]] = []
+    array_start = text.find("[")
+    if array_start != -1:
+        candidates.append((array_start, "[", "]"))
+    object_start = text.find("{")
+    if object_start != -1:
+        candidates.append((object_start, "{", "}"))
+
+    if not candidates:
+        raise ValueError("No JSON payload found in model response")
+
+    start, _open_char, close_char = min(candidates, key=lambda item: item[0])
+    end = text.rfind(close_char)
+    if end == -1 or end < start:
+        raise ValueError("No JSON payload found in model response")
     return json.loads(text[start : end + 1])
+
+
+def _structured_output_response_format(stage: str) -> dict[str, Any]:
+    schema_name = (
+        "subtitle_postprocess_batch"
+        if stage == "postprocess"
+        else "subtitle_translation_batch"
+    )
+    return {
+        "type": "json_schema",
+        "json_schema": {
+            "name": schema_name,
+            "strict": True,
+            "schema": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "items": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "additionalProperties": False,
+                            "properties": {
+                                "segment_number": {"type": "integer"},
+                                "text": {"type": "string"},
+                            },
+                            "required": ["segment_number", "text"],
+                        },
+                    }
+                },
+                "required": ["items"],
+            },
+        },
+    }
+
+
+def _build_chat_completion_payload(
+    *,
+    model: str,
+    system_prompt: str,
+    user_payload: dict[str, Any],
+    stage: str,
+    structured_output_enabled: bool,
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "model": model,
+        "temperature": 0,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {
+                "role": "user",
+                "content": json.dumps(user_payload, ensure_ascii=False),
+            },
+        ],
+    }
+    if structured_output_enabled:
+        payload["response_format"] = _structured_output_response_format(stage)
+    return payload
+
+
+def _should_fallback_structured_outputs(
+    *, status_code: int | None, body: str, payload: dict[str, Any]
+) -> bool:
+    if "response_format" not in payload or status_code != 400:
+        return False
+
+    normalized_body = body.lower()
+    malformed_schema_terms = (
+        "invalid_schema",
+        "schema_validation_error",
+        "failed to validate schema",
+        "invalid json schema",
+        "json schema is invalid",
+        "response_format schema",
+    )
+    if any(term in normalized_body for term in malformed_schema_terms):
+        return False
+
+    capability_terms = (
+        "response_format",
+        "json_schema",
+        "json schema",
+        "structured output",
+        "structured outputs",
+    )
+    support_boundary_terms = (
+        "unsupported",
+        "not supported",
+        "unsupported_parameter",
+        "does not support",
+        "only supported",
+        "not available",
+        "not enabled",
+        "unsupported value",
+    )
+    return any(term in normalized_body for term in capability_terms) and any(
+        term in normalized_body for term in support_boundary_terms
+    )
 
 
 def _resolve_chat_config(
@@ -146,59 +285,88 @@ def _request_chat_completion(
     debug_enabled: bool,
     batch_id: str,
     attempt: int,
+    stage: str,
+    payload_chars: int,
 ) -> ProviderResponse:
+    payload_json = json.dumps(payload, ensure_ascii=False)
     request = urllib.request.Request(
         endpoint,
-        data=json.dumps(payload).encode("utf-8"),
+        data=payload_json.encode("utf-8"),
         headers={
             "Content-Type": "application/json",
             "Accept": "application/json",
             "Authorization": f"Bearer {api_key}",
             "User-Agent": "vid_to_sub/1.0 (+https://local.cli)",
+            "X-Client-Request-Id": batch_id,
         },
     )
     response_payload: Any = None
     http_status: int | None = None
     headers: Any = None
     max_http_attempts = max(1, int(TRANSLATION_HTTP_RETRY_ATTEMPTS))
-    for http_attempt in range(1, max_http_attempts + 1):
-        try:
-            with _urlopen_with_timeout(request, TRANSLATION_HTTP_TIMEOUT_SEC) as response:
-                raw_text = response.read().decode("utf-8")
-                response_payload = json.loads(raw_text)
-                http_status = getattr(response, "status", None)
-                headers = getattr(response, "headers", None)
-                break
-        except urllib.error.HTTPError as exc:
-            body = exc.read().decode("utf-8", errors="replace")
-            if _should_retry_http_request(status_code=exc.code, http_attempt=http_attempt):
-                _emit_http_retry_log(
-                    batch_id=batch_id,
-                    attempt=attempt,
-                    http_attempt=http_attempt,
-                    endpoint=endpoint,
-                    reason=f"http_{exc.code}",
-                    status_code=exc.code,
-                    retry_in_sec=_retry_backoff_delay(http_attempt),
-                )
-                time.sleep(_retry_backoff_delay(http_attempt))
-                continue
-            raise RuntimeError(f"{error_prefix} HTTP {exc.code}: {body}") from exc
-        except (urllib.error.URLError, TimeoutError, socket.timeout) as exc:
-            reason = getattr(exc, "reason", exc)
-            if _should_retry_http_request(status_code=None, http_attempt=http_attempt):
-                _emit_http_retry_log(
-                    batch_id=batch_id,
-                    attempt=attempt,
-                    http_attempt=http_attempt,
-                    endpoint=endpoint,
-                    reason=str(reason),
-                    status_code=None,
-                    retry_in_sec=_retry_backoff_delay(http_attempt),
-                )
-                time.sleep(_retry_backoff_delay(http_attempt))
-                continue
-            raise RuntimeError(f"{error_prefix} request failed: {reason}") from exc
+    with _TRANSLATION_SEMAPHORE:
+        for http_attempt in range(1, max_http_attempts + 1):
+            try:
+                with _urlopen_with_timeout(
+                    request, TRANSLATION_HTTP_TIMEOUT_SEC
+                ) as response:
+                    raw_text = response.read().decode("utf-8")
+                    response_payload = json.loads(raw_text)
+                    http_status = getattr(response, "status", None)
+                    headers = getattr(response, "headers", None)
+                    break
+            except urllib.error.HTTPError as exc:
+                body = exc.read().decode("utf-8", errors="replace")
+                if _should_fallback_structured_outputs(
+                    status_code=exc.code, body=body, payload=payload
+                ):
+                    raise StructuredOutputFallbackRequired(
+                        f"{error_prefix} structured outputs fallback: HTTP {exc.code}: {body}",
+                        status_code=exc.code,
+                    ) from exc
+                if _should_retry_http_request(
+                    status_code=exc.code, http_attempt=http_attempt
+                ):
+                    _emit_http_retry_log(
+                        batch_id=batch_id,
+                        attempt=attempt,
+                        http_attempt=http_attempt,
+                        endpoint=endpoint,
+                        reason=f"http_{exc.code}",
+                        status_code=exc.code,
+                        retry_in_sec=_retry_backoff_delay(http_attempt),
+                        stage=stage,
+                        payload_chars=payload_chars,
+                    )
+                    time.sleep(_retry_backoff_delay(http_attempt))
+                    continue
+                if exc.code in TRANSLATION_HTTP_RETRYABLE_STATUS_CODES:
+                    raise RetryableProviderError(
+                        f"{error_prefix} HTTP {exc.code}: {body}",
+                        status_code=exc.code,
+                    ) from exc
+                raise RuntimeError(f"{error_prefix} HTTP {exc.code}: {body}") from exc
+            except (urllib.error.URLError, TimeoutError, socket.timeout) as exc:
+                reason = getattr(exc, "reason", exc)
+                if _should_retry_http_request(
+                    status_code=None, http_attempt=http_attempt
+                ):
+                    _emit_http_retry_log(
+                        batch_id=batch_id,
+                        attempt=attempt,
+                        http_attempt=http_attempt,
+                        endpoint=endpoint,
+                        reason=str(reason),
+                        status_code=None,
+                        retry_in_sec=_retry_backoff_delay(http_attempt),
+                        stage=stage,
+                        payload_chars=payload_chars,
+                    )
+                    time.sleep(_retry_backoff_delay(http_attempt))
+                    continue
+                raise RetryableProviderError(
+                    f"{error_prefix} request failed: {reason}"
+                ) from exc
 
     if response_payload is None:
         raise RuntimeError(f"{error_prefix} request failed without a response payload")
@@ -280,6 +448,8 @@ def _emit_http_retry_log(
     reason: str,
     status_code: int | None,
     retry_in_sec: float,
+    stage: str,
+    payload_chars: int,
 ) -> None:
     _emit_batch_log(
         {
@@ -292,6 +462,8 @@ def _emit_http_retry_log(
             "http_status": status_code,
             "reason": reason,
             "retry_in_sec": retry_in_sec,
+            "stage": stage,
+            "payload_chars": payload_chars,
             "timeout_sec": TRANSLATION_HTTP_TIMEOUT_SEC,
         }
     )
@@ -303,6 +475,10 @@ def _parse_translation_payload(
     expected_segment_numbers: list[int],
 ) -> ParsedTranslationPayload:
     payload = _extract_json_payload(message)
+    if isinstance(payload, dict):
+        payload = payload.get("items")
+        if not isinstance(payload, list):
+            raise TranslationPayloadError("model_response_object_missing_items_array")
     if not isinstance(payload, list):
         raise TranslationPayloadError("model_response_is_not_a_json_array")
 
@@ -570,6 +746,39 @@ def _next_retry_size(batch_len: int, schedule: list[int]) -> int | None:
     return None
 
 
+def _estimate_item_chars(item: dict[str, Any], *, stage: str, text_key: str) -> int:
+    if stage == "postprocess":
+        return len(str(item.get("source", ""))) + len(str(item.get("draft", ""))) + 96
+    return len(str(item.get(text_key, ""))) + 48
+
+
+def _iter_budgeted_batches(
+    items: list[dict[str, Any]],
+    *,
+    stage: str,
+    text_key: str,
+    max_items: int,
+    max_payload_chars: int,
+):
+    batch: list[dict[str, Any]] = []
+    total_chars = 0
+
+    for item in items:
+        item_chars = _estimate_item_chars(item, stage=stage, text_key=text_key)
+        if batch and (
+            len(batch) >= max_items or total_chars + item_chars > max_payload_chars
+        ):
+            yield batch
+            batch = []
+            total_chars = 0
+
+        batch.append(item)
+        total_chars += item_chars
+
+    if batch:
+        yield batch
+
+
 def _translate_batch(
     *,
     batch: list[dict[str, Any]],
@@ -584,26 +793,25 @@ def _translate_batch(
     translation_mode: str,
     debug_enabled: bool,
     fingerprint: dict[str, Any],
+    stage: str,
     attempt: int,
     requested_count: int | None = None,
     blank_or_whitespace_count: int = 0,
+    on_batch_success: Callable[[list[int], list[str]], None] | None = None,
+    structured_output_policy: StructuredOutputPolicy | None = None,
 ) -> list[str]:
     batch_id = _make_batch_id(error_prefix)
     segment_numbers = [int(item["segment_number"]) for item in batch]
-    payload = {
-        "model": model,
-        "temperature": 0,
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {
-                "role": "user",
-                "content": json.dumps(
-                    build_user_payload(batch, segment_numbers[0] - 1),
-                    ensure_ascii=False,
-                ),
-            },
-        ],
-    }
+    user_payload = build_user_payload(batch, segment_numbers[0] - 1)
+    policy = structured_output_policy or StructuredOutputPolicy()
+    payload = _build_chat_completion_payload(
+        model=model,
+        system_prompt=system_prompt,
+        user_payload=user_payload,
+        stage=stage,
+        structured_output_enabled=policy.enabled,
+    )
+    payload_chars = len(json.dumps(payload, ensure_ascii=False))
     actual_batch_size = len(batch)
     batch_requested_count = (
         actual_batch_size
@@ -612,15 +820,61 @@ def _translate_batch(
     )
     provider_response: ProviderResponse | None = None
     try:
-        provider_response = _request_chat_completion(
-            endpoint=endpoint,
-            api_key=api_key,
-            payload=payload,
-            error_prefix=error_prefix,
-            debug_enabled=debug_enabled,
-            batch_id=batch_id,
-            attempt=attempt,
-        )
+        try:
+            provider_response = _request_chat_completion(
+                endpoint=endpoint,
+                api_key=api_key,
+                payload=payload,
+                error_prefix=error_prefix,
+                debug_enabled=debug_enabled,
+                batch_id=batch_id,
+                attempt=attempt,
+                stage=stage,
+                payload_chars=payload_chars,
+            )
+        except StructuredOutputFallbackRequired as exc:
+            policy.enabled = False
+            policy.disabled_reason = str(exc)
+            _emit_batch_log(
+                {
+                    "event": "translation_structured_output_fallback",
+                    "batch_id": batch_id,
+                    "attempt": attempt,
+                    "stage": stage,
+                    "batch_start_idx": segment_numbers[0],
+                    "batch_end_idx": segment_numbers[-1],
+                    "segment_numbers": segment_numbers,
+                    "requested_count": batch_requested_count,
+                    "blank_or_whitespace_count": blank_or_whitespace_count,
+                    "effective_sent_count": actual_batch_size,
+                    "chunk_size": actual_batch_size,
+                    "configured_chunk_size": configured_chunk_size,
+                    "endpoint": endpoint,
+                    "endpoint_host": urlsplit(endpoint).netloc or endpoint,
+                    "model": model,
+                    "http_status": exc.status_code,
+                    "reason": str(exc),
+                }
+            )
+            payload = _build_chat_completion_payload(
+                model=model,
+                system_prompt=system_prompt,
+                user_payload=user_payload,
+                stage=stage,
+                structured_output_enabled=False,
+            )
+            payload_chars = len(json.dumps(payload, ensure_ascii=False))
+            provider_response = _request_chat_completion(
+                endpoint=endpoint,
+                api_key=api_key,
+                payload=payload,
+                error_prefix=error_prefix,
+                debug_enabled=debug_enabled,
+                batch_id=batch_id,
+                attempt=attempt,
+                stage=stage,
+                payload_chars=payload_chars,
+            )
         parsed = _parse_translation_payload(
             message=provider_response.message,
             expected_segment_numbers=segment_numbers,
@@ -631,6 +885,59 @@ def _translate_batch(
                 parsed_count=parsed.parsed_count,
                 parsed_sample=parsed.parsed_sample,
             )
+    except RetryableProviderError as exc:
+        next_size = _next_retry_size(len(batch), retry_schedule)
+        _emit_batch_log(
+            {
+                "event": "translation_batch_transport_error",
+                "batch_id": batch_id,
+                "attempt": attempt,
+                "stage": stage,
+                "batch_start_idx": segment_numbers[0],
+                "batch_end_idx": segment_numbers[-1],
+                "segment_numbers": segment_numbers,
+                "requested_count": batch_requested_count,
+                "blank_or_whitespace_count": blank_or_whitespace_count,
+                "effective_sent_count": actual_batch_size,
+                "chunk_size": actual_batch_size,
+                "configured_chunk_size": configured_chunk_size,
+                "payload_chars": payload_chars,
+                "endpoint": endpoint,
+                "endpoint_host": urlsplit(endpoint).netloc or endpoint,
+                "model": model,
+                "http_status": exc.status_code,
+                "reason": str(exc),
+                "next_retry_size": next_size,
+            }
+        )
+        if next_size is not None:
+            outputs: list[str] = []
+            for start_idx in range(0, len(batch), next_size):
+                sub_batch = batch[start_idx : start_idx + next_size]
+                outputs.extend(
+                    _translate_batch(
+                        batch=sub_batch,
+                        model=model,
+                        endpoint=endpoint,
+                        api_key=api_key,
+                        system_prompt=system_prompt,
+                        build_user_payload=build_user_payload,
+                        error_prefix=error_prefix,
+                        configured_chunk_size=configured_chunk_size,
+                        retry_schedule=retry_schedule,
+                        translation_mode=translation_mode,
+                        debug_enabled=debug_enabled,
+                        fingerprint=fingerprint,
+                        stage=stage,
+                        attempt=attempt + 1,
+                        requested_count=batch_requested_count,
+                        blank_or_whitespace_count=blank_or_whitespace_count,
+                        on_batch_success=on_batch_success,
+                        structured_output_policy=policy,
+                    )
+                )
+            return outputs
+        raise
     except (ValueError, TranslationPayloadError) as exc:
         contract_error = _format_contract_error(
             error_prefix=error_prefix,
@@ -659,6 +966,8 @@ def _translate_batch(
                 "effective_sent_count": actual_batch_size,
                 "chunk_size": actual_batch_size,
                 "configured_chunk_size": configured_chunk_size,
+                "stage": stage,
+                "payload_chars": payload_chars,
                 "endpoint": endpoint,
                 "endpoint_host": urlsplit(endpoint).netloc or endpoint,
                 "model": model,
@@ -704,9 +1013,12 @@ def _translate_batch(
                         translation_mode=translation_mode,
                         debug_enabled=debug_enabled,
                         fingerprint=fingerprint,
+                        stage=stage,
                         attempt=attempt + 1,
                         requested_count=batch_requested_count,
                         blank_or_whitespace_count=blank_or_whitespace_count,
+                        on_batch_success=on_batch_success,
+                        structured_output_policy=policy,
                     )
                 )
             return outputs
@@ -733,6 +1045,8 @@ def _translate_batch(
             "effective_sent_count": actual_batch_size,
             "chunk_size": actual_batch_size,
             "configured_chunk_size": configured_chunk_size,
+            "stage": stage,
+            "payload_chars": payload_chars,
             "endpoint": endpoint,
             "endpoint_host": urlsplit(endpoint).netloc or endpoint,
             "model": model,
@@ -749,6 +1063,8 @@ def _translate_batch(
             "payload_kind": parsed.payload_kind,
         }
     )
+    if on_batch_success is not None:
+        on_batch_success(segment_numbers, parsed.texts)
     return parsed.texts
 
 
@@ -763,13 +1079,16 @@ def _run_subtitle_agent_batches(
     build_user_payload: Callable[[list[dict[str, Any]], int], dict[str, Any]],
     error_prefix: str,
     chunk_size: int,
+    max_payload_chars: int,
     translation_mode: str,
     stage: str,
+    on_batch_success: Callable[[list[int], list[str]], None] | None = None,
 ) -> list[str]:
     if not items:
         return []
 
     debug_enabled = _debug_response_persistence_enabled(ENV_TRANSLATION_DEBUG)
+    structured_output_policy = StructuredOutputPolicy()
     fingerprint = _emit_execution_fingerprint(
         endpoint=endpoint,
         model=model,
@@ -778,8 +1097,13 @@ def _run_subtitle_agent_batches(
     )
     retry_schedule = _build_retry_schedule(chunk_size)
     outputs: list[str] = []
-    for start_idx in range(0, len(items), chunk_size):
-        batch = items[start_idx : start_idx + chunk_size]
+    for batch in _iter_budgeted_batches(
+        items,
+        stage=stage,
+        text_key=text_key,
+        max_items=chunk_size,
+        max_payload_chars=max_payload_chars,
+    ):
         batch_translatable, batch_blank_values = _split_blank_items(batch, text_key)
         if not batch_translatable:
             continue
@@ -797,9 +1121,12 @@ def _run_subtitle_agent_batches(
                 translation_mode=translation_mode,
                 debug_enabled=debug_enabled,
                 fingerprint=fingerprint,
+                stage=stage,
                 attempt=1,
                 requested_count=len(batch),
                 blank_or_whitespace_count=len(batch_blank_values),
+                on_batch_success=on_batch_success,
+                structured_output_policy=structured_output_policy,
             )
         )
     return outputs
@@ -828,7 +1155,10 @@ def translate_segments_openai_compatible(
     translation_api_key: str | None,
     source_language: str | None,
     chunk_size: int = 100,
+    max_payload_chars: int = 16000,
     translation_mode: str = "strict",
+    resume_text_by_number: dict[int, str] | None = None,
+    on_batch_success: Callable[[list[int], list[str]], None] | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     model, endpoint, api_key = _resolve_chat_config(
         label="Translation",
@@ -850,9 +1180,25 @@ def translate_segments_openai_compatible(
     ]
     translatable_items, blank_values = _split_blank_items(indexed_segments, "text")
     translated_by_number = dict(blank_values)
-    if translatable_items:
+    resumed_count = 0
+    if resume_text_by_number:
+        for segment_number, text in resume_text_by_number.items():
+            if 1 <= int(segment_number) <= len(segments):
+                translated_by_number[int(segment_number)] = str(text)
+        resumed_count = sum(
+            1
+            for item in translatable_items
+            if item["segment_number"] in translated_by_number
+        )
+
+    remaining_items = [
+        item
+        for item in translatable_items
+        if item["segment_number"] not in translated_by_number
+    ]
+    if remaining_items:
         translated_texts = _run_subtitle_agent_batches(
-            items=indexed_segments,
+            items=remaining_items,
             text_key="text",
             model=model,
             endpoint=endpoint,
@@ -880,13 +1226,15 @@ def translate_segments_openai_compatible(
             },
             error_prefix="Translation API",
             chunk_size=chunk_size,
+            max_payload_chars=max_payload_chars,
             translation_mode=translation_mode,
             stage="translate",
+            on_batch_success=on_batch_success,
         )
         translated_by_number.update(
             {
                 item["segment_number"]: translated_text
-                for item, translated_text in zip(translatable_items, translated_texts)
+                for item, translated_text in zip(remaining_items, translated_texts)
             }
         )
 
@@ -905,8 +1253,10 @@ def translate_segments_openai_compatible(
         "target_language": target_language,
         "source_language": source_language,
         "chunk_size": chunk_size,
+        "max_payload_chars": max_payload_chars,
         "mode": translation_mode,
         "blank_segment_count": len(blank_values),
+        "resumed_segment_count": resumed_count,
     }
     return translated_segments, info
 
@@ -925,7 +1275,10 @@ def postprocess_translated_segments_openai_compatible(
     translation_base_url: str | None,
     translation_api_key: str | None,
     chunk_size: int = 100,
+    max_payload_chars: int = 12000,
     translation_mode: str = "strict",
+    resume_text_by_number: dict[int, str] | None = None,
+    on_batch_success: Callable[[list[int], list[str]], None] | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     model, endpoint, api_key = _resolve_chat_config(
         label="Postprocess",
@@ -978,9 +1331,25 @@ def postprocess_translated_segments_openai_compatible(
     ]
     translatable_items, blank_values = _split_blank_items(items, "draft")
     final_text_by_number = dict(blank_values)
-    if translatable_items:
+    resumed_count = 0
+    if resume_text_by_number:
+        for segment_number, text in resume_text_by_number.items():
+            if 1 <= int(segment_number) <= len(translated_segments):
+                final_text_by_number[int(segment_number)] = str(text)
+        resumed_count = sum(
+            1
+            for item in translatable_items
+            if item["segment_number"] in final_text_by_number
+        )
+
+    remaining_items = [
+        item
+        for item in translatable_items
+        if item["segment_number"] not in final_text_by_number
+    ]
+    if remaining_items:
         postprocessed_texts = _run_subtitle_agent_batches(
-            items=items,
+            items=remaining_items,
             text_key="draft",
             model=model,
             endpoint=endpoint,
@@ -1016,13 +1385,15 @@ def postprocess_translated_segments_openai_compatible(
             },
             error_prefix="Postprocess API",
             chunk_size=chunk_size,
+            max_payload_chars=max_payload_chars,
             translation_mode=translation_mode,
             stage="postprocess",
+            on_batch_success=on_batch_success,
         )
         final_text_by_number.update(
             {
                 item["segment_number"]: final_text
-                for item, final_text in zip(translatable_items, postprocessed_texts)
+                for item, final_text in zip(remaining_items, postprocessed_texts)
             }
         )
 
@@ -1041,7 +1412,9 @@ def postprocess_translated_segments_openai_compatible(
         "target_language": target_language,
         "source_language": source_language,
         "chunk_size": chunk_size,
+        "max_payload_chars": max_payload_chars,
         "translation_mode": translation_mode,
         "blank_segment_count": len(blank_values),
+        "resumed_segment_count": resumed_count,
     }
     return final_segments, info

@@ -99,7 +99,12 @@ def build_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
 
-    parser.add_argument("paths", nargs="*", metavar="PATH", help="Input video files or directories to scan recursively.")
+    parser.add_argument(
+        "paths",
+        nargs="*",
+        metavar="PATH",
+        help="Input video files or directories to scan recursively.",
+    )
     parser.add_argument(
         "-o",
         "--output-dir",
@@ -110,40 +115,123 @@ def build_parser() -> argparse.ArgumentParser:
             "Directory will be created if it does not exist."
         ),
     )
-    parser.add_argument("--no-recurse", action="store_true", default=False, help="Do not recurse into subdirectories; only process the top-level paths given.")
-    parser.add_argument("--skip-existing", action="store_true", default=False, help="Skip videos that already have a primary output file (checked by filename).")
-    parser.add_argument("--dry-run", action="store_true", default=False, help="Print the job queue without running any transcription or translation.")
+    parser.add_argument(
+        "--no-recurse",
+        action="store_true",
+        default=False,
+        help="Do not recurse into subdirectories; only process the top-level paths given.",
+    )
+    parser.add_argument(
+        "--skip-existing",
+        action="store_true",
+        default=False,
+        help="Skip videos that already have a primary output file (checked by filename).",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        default=False,
+        help="Print the job queue without running any transcription or translation.",
+    )
     parser.add_argument(
         "--backend",
         choices=["whisper-cpp", "faster-whisper", "whisper", "whisperx"],
         default=runtime_default_backend,
         help="Transcription backend to use. Defaults to the fastest available backend on the current hardware.",
     )
-    parser.add_argument("--model", default=runtime_default_model, metavar="MODEL", help="Model name, e.g. large-v3, medium, small. Defaults to the best model that fits detected VRAM.")
-    parser.add_argument("--language", default=None, metavar="LANG", help="Source audio language code (e.g. en, ja). Auto-detected when omitted.")
+    parser.add_argument(
+        "--model",
+        default=runtime_default_model,
+        metavar="MODEL",
+        help="Model name, e.g. large-v3, medium, small. Defaults to the best model that fits detected VRAM.",
+    )
+    parser.add_argument(
+        "--language",
+        default=None,
+        metavar="LANG",
+        help="Source audio language code (e.g. en, ja). Auto-detected when omitted.",
+    )
+    parser.add_argument(
+        "--content-type",
+        choices=["auto", "speech", "music"],
+        default="auto",
+        help=(
+            "Audio content hint for transcription. Use 'music' for lyric-heavy or "
+            "music-dominant inputs; this enables safer decoding on supported backends "
+            "and requires --language."
+        ),
+    )
     parser.add_argument(
         "--device",
         default=runtime_default_device,
         choices=["auto", "cpu", "cuda", "mps"],
         help="Compute device. 'auto' selects CUDA > MPS > CPU in that priority order.",
     )
-    parser.add_argument("--compute-type", default=None, metavar="TYPE", help="Quantisation type passed to faster-whisper, e.g. int8, float16. Backend-specific.")
-    parser.add_argument("--beam-size", type=int, default=5, metavar="N", help="Beam width used by faster-whisper and openai-whisper. Larger values improve accuracy at the cost of speed.")
+    parser.add_argument(
+        "--compute-type",
+        default=None,
+        metavar="TYPE",
+        help="Quantisation type passed to faster-whisper, e.g. int8, float16. Backend-specific.",
+    )
+    parser.add_argument(
+        "--beam-size",
+        type=int,
+        default=5,
+        metavar="N",
+        help="Beam width used by faster-whisper and openai-whisper. Larger values improve accuracy at the cost of speed.",
+    )
     parser.add_argument(
         "--format",
         dest="formats",
         action="append",
         choices=sorted(SUPPORTED_FORMATS),
         metavar="FMT",
-        help="Output format(s) to write. May be repeated. Choices: " + ", ".join(sorted(SUPPORTED_FORMATS)) + ". Defaults to srt.",
+        help="Output format(s) to write. May be repeated. Choices: "
+        + ", ".join(sorted(SUPPORTED_FORMATS))
+        + ". Defaults to srt.",
     )
-    parser.add_argument("--whisper-cpp-model-path", default=None, metavar="PATH", help="Explicit path to the GGML model file for the whisper-cpp backend.")
-    parser.add_argument("--hf-token", default=None, metavar="TOKEN", help="Hugging Face token required for whisperX diarization models.")
-    parser.add_argument("--diarize", action="store_true", default=False, help="Enable speaker diarization via whisperX (requires --hf-token).")
-    parser.add_argument("--translate-to", default=None, metavar="LANG", help="Translate subtitles to this language code (e.g. ko, fr) using an OpenAI-compatible API.")
-    parser.add_argument("--translation-model", default=None, metavar="MODEL", help="Model name for the translation API. Falls back to VID_TO_SUB_TRANSLATION_MODEL env var.")
-    parser.add_argument("--translation-base-url", default=None, metavar="URL", help="Base URL for the OpenAI-compatible translation API (e.g. https://host/v1).")
-    parser.add_argument("--translation-api-key", default=None, metavar="KEY", help="Bearer token for the translation API. Falls back to VID_TO_SUB_TRANSLATION_API_KEY.")
+    parser.add_argument(
+        "--whisper-cpp-model-path",
+        default=None,
+        metavar="PATH",
+        help="Explicit path to the GGML model file for the whisper-cpp backend.",
+    )
+    parser.add_argument(
+        "--hf-token",
+        default=None,
+        metavar="TOKEN",
+        help="Hugging Face token required for whisperX diarization models.",
+    )
+    parser.add_argument(
+        "--diarize",
+        action="store_true",
+        default=False,
+        help="Enable speaker diarization via whisperX (requires --hf-token).",
+    )
+    parser.add_argument(
+        "--translate-to",
+        default=None,
+        metavar="LANG",
+        help="Translate subtitles to this language code (e.g. ko, fr) using an OpenAI-compatible API.",
+    )
+    parser.add_argument(
+        "--translation-model",
+        default=None,
+        metavar="MODEL",
+        help="Model name for the translation API. Falls back to VID_TO_SUB_TRANSLATION_MODEL env var.",
+    )
+    parser.add_argument(
+        "--translation-base-url",
+        default=None,
+        metavar="URL",
+        help="Base URL for the OpenAI-compatible translation API (e.g. https://host/v1).",
+    )
+    parser.add_argument(
+        "--translation-api-key",
+        default=None,
+        metavar="KEY",
+        help="Bearer token for the translation API. Falls back to VID_TO_SUB_TRANSLATION_API_KEY.",
+    )
     parser.add_argument(
         "--translation-chunk-size",
         type=int,
@@ -152,35 +240,120 @@ def build_parser() -> argparse.ArgumentParser:
         help="Maximum subtitle items per translation batch before contract-aware retries split the work.",
     )
     parser.add_argument(
+        "--postprocess-chunk-size",
+        type=int,
+        default=None,
+        metavar="N",
+        help="Maximum subtitle items per postprocess batch. Defaults to --translation-chunk-size.",
+    )
+    parser.add_argument(
+        "--translation-max-payload-chars",
+        type=int,
+        default=16000,
+        metavar="N",
+        help="Approximate character budget per translation batch payload before adaptive splitting.",
+    )
+    parser.add_argument(
+        "--postprocess-max-payload-chars",
+        type=int,
+        default=12000,
+        metavar="N",
+        help="Approximate character budget per postprocess batch payload before adaptive splitting.",
+    )
+    parser.add_argument(
         "--translation-mode",
         choices=TRANSLATION_MODES,
         default="strict",
         metavar="MODE",
         help="Translation contract mode. 'strict' fails on malformed batches; 'best-effort' retries smaller batches before giving up.",
     )
-    parser.add_argument("--postprocess-translation", action="store_true", default=False, help="Run a second agent pass to correct and polish the translated subtitles.")
+    parser.add_argument(
+        "--postprocess-translation",
+        action="store_true",
+        default=False,
+        help="Run a second agent pass to correct and polish the translated subtitles.",
+    )
     parser.add_argument(
         "--postprocess-mode",
         choices=POSTPROCESS_MODES,
         default="auto",
         metavar="MODE",
     )
-    parser.add_argument("--postprocess-model", default=None, metavar="MODEL", help="Model for the post-editing pass. Falls back to the translation model when omitted.")
-    parser.add_argument("--postprocess-base-url", default=None, metavar="URL", help="Base URL for the post-editing API. Falls back to the translation base URL when omitted.")
-    parser.add_argument("--postprocess-api-key", default=None, metavar="KEY", help="API key for the post-editing pass. Falls back to the translation API key when omitted.")
-    parser.add_argument("--workers", type=int, default=1, metavar="N", help="Number of parallel transcription workers.")
-    parser.add_argument("--backend-threads", type=int, default=None, metavar="N", help="CPU threads allocated per worker. Defaults to all available threads divided across workers.")
-    parser.add_argument("--manifest-stdin", action="store_true", default=False, help="Read a JSON job manifest from stdin instead of discovering videos from PATH arguments.")
-    parser.add_argument("--stage1-only", action="store_true", default=False, help="Transcribe only and write a .stage1.json artifact next to each output. Use --translate-from-artifact later to translate without re-transcribing.")
-    parser.add_argument("--translate-from-artifact", metavar="PATH", default=None, help="Translate a previously written .stage1.json artifact (Stage 2 only). Requires --translate-to.")
+    parser.add_argument(
+        "--postprocess-model",
+        default=None,
+        metavar="MODEL",
+        help="Model for the post-editing pass. Falls back to the translation model when omitted.",
+    )
+    parser.add_argument(
+        "--postprocess-base-url",
+        default=None,
+        metavar="URL",
+        help="Base URL for the post-editing API. Falls back to the translation base URL when omitted.",
+    )
+    parser.add_argument(
+        "--postprocess-api-key",
+        default=None,
+        metavar="KEY",
+        help="API key for the post-editing pass. Falls back to the translation API key when omitted.",
+    )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=1,
+        metavar="N",
+        help="Number of parallel transcription workers.",
+    )
+    parser.add_argument(
+        "--backend-threads",
+        type=int,
+        default=None,
+        metavar="N",
+        help="CPU threads allocated per worker. Defaults to all available threads divided across workers.",
+    )
+    parser.add_argument(
+        "--manifest-stdin",
+        action="store_true",
+        default=False,
+        help="Read a JSON job manifest from stdin instead of discovering videos from PATH arguments.",
+    )
+    parser.add_argument(
+        "--stage1-only",
+        action="store_true",
+        default=False,
+        help="Transcribe only and write a .stage1.json artifact next to each output. Use --translate-from-artifact later to translate without re-transcribing.",
+    )
+    parser.add_argument(
+        "--translate-from-artifact",
+        metavar="PATH",
+        default=None,
+        help="Translate a previously written .stage1.json artifact (Stage 2 only). Uses the artifact's saved target language unless you override it with --translate-to.",
+    )
+    parser.add_argument(
+        "--force-translate",
+        action="store_true",
+        default=False,
+        help="Allow Stage 2 translation to run even when the Stage 1 artifact is flagged as suspicious.",
+    )
     parser.add_argument(
         "--overwrite-translation",
         action="store_true",
         default=False,
         help="Re-run Stage 2 even if the artifact already records translation_complete=True.",
     )
-    parser.add_argument("-v", "--verbose", action="store_true", default=False, help="Print extra progress detail during transcription.")
-    parser.add_argument("--list-models", action="store_true", default=False, help="Print built-in model identifiers and exit.")
+    parser.add_argument(
+        "-v",
+        "--verbose",
+        action="store_true",
+        default=False,
+        help="Print extra progress detail during transcription.",
+    )
+    parser.add_argument(
+        "--list-models",
+        action="store_true",
+        default=False,
+        help="Print built-in model identifiers and exit.",
+    )
 
     return parser
 
@@ -369,6 +542,18 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     args.workers = max(1, int(args.workers))
     args.translation_chunk_size = max(1, int(args.translation_chunk_size))
+    args.postprocess_chunk_size = max(
+        1,
+        int(args.postprocess_chunk_size or args.translation_chunk_size),
+    )
+    args.translation_max_payload_chars = max(
+        2000,
+        int(args.translation_max_payload_chars),
+    )
+    args.postprocess_max_payload_chars = max(
+        2000,
+        int(args.postprocess_max_payload_chars),
+    )
     if args.backend_threads is None:
         args.backend_threads = resolve_runtime_backend_threads(
             args.backend,
