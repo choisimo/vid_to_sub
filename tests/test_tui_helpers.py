@@ -433,7 +433,9 @@ class TuiHelperTests(unittest.TestCase):
 
         self.assertEqual(1, len(plans))
         self.assertEqual("local", plans[0].label)
+        self.assertEqual("stage1", plans[0].stage)
         self.assertIn("--manifest-stdin", plans[0].cmd)
+        self.assertIn("--stage1-only", plans[0].cmd)
         self.assertIn("--workers", plans[0].cmd)
         self.assertIn("--backend-threads", plans[0].cmd)
         self.assertIn("--translate-to", plans[0].cmd)
@@ -454,8 +456,7 @@ class TuiHelperTests(unittest.TestCase):
     def test_build_executor_plans_distributed_with_translation_uses_stage1_for_remote(
         self,
     ) -> None:
-        """U4: In distributed mode with translation enabled, remote plans get stage='stage1'
-        and the local plan keeps stage='full'.
+        """Translation-enabled distributed runs split into stage1 across all executors.
         """
         from vid_to_sub_app.tui.models import RemoteResourceProfile
 
@@ -525,12 +526,17 @@ class TuiHelperTests(unittest.TestCase):
                 "Remote plan command must include --stage1-only",
             )
 
-        # Local plans (if any) run the full pass
+        # Local plans (if any) also run stage1 so translation is handed off later.
         for lp in local_plans:
             self.assertEqual(
-                "full",
+                "stage1",
                 lp.stage,
-                f"Local plan should be stage='full' but got '{lp.stage}'",
+                f"Local plan should be stage='stage1' but got '{lp.stage}'",
+            )
+            self.assertIn(
+                "--stage1-only",
+                " ".join(lp.cmd),
+                "Local plan command must include --stage1-only",
             )
 
     def test_sync_transcribe_overrides_updates_inherited_values_only(self) -> None:
@@ -1162,6 +1168,10 @@ class TestTranslationDefaultSetting(unittest.TestCase):
                 return_value="cuda",
             ),
             patch(
+                "vid_to_sub_app.shared.env.detect_cuda_free_memory_gb",
+                return_value=None,
+            ),
+            patch(
                 "vid_to_sub_app.shared.env.detect_cuda_total_memory_gb",
                 return_value=4.5,
             ),
@@ -1311,6 +1321,67 @@ class TestTranslationDefaultSetting(unittest.TestCase):
             "Loading faster-whisper model 'large-v3'", captured_stdout.getvalue()
         )
 
+    def test_transcribe_faster_whisper_reuses_cached_model_and_logs_once(self) -> None:
+        init_calls: list[dict[str, object]] = []
+        transcribe_calls = 0
+
+        class FakeSegment:
+            start = 0.0
+            end = 1.0
+            text = "hello"
+
+        class FakeInfo:
+            language = "en"
+            language_probability = 0.99
+            duration = 1.0
+
+        class FakeWhisperModel:
+            def __init__(self, model_name: str, **kwargs) -> None:
+                init_calls.append({"model_name": model_name, **kwargs})
+
+            def transcribe(self, *_args, **_kwargs):
+                nonlocal transcribe_calls
+                transcribe_calls += 1
+                return [FakeSegment()], FakeInfo()
+
+        captured_stdout = io.StringIO()
+        with (
+            patch.dict(
+                "sys.modules",
+                {"faster_whisper": SimpleNamespace(WhisperModel=FakeWhisperModel)},
+            ),
+            redirect_stdout(captured_stdout),
+        ):
+            first_segments, _first_info = transcribe_faster_whisper(
+                video=Path("/tmp/sample-1.mp4"),
+                model_name="large-v3",
+                device="cpu",
+                language=None,
+                beam_size=5,
+                compute_type=None,
+                threads=4,
+            )
+            second_segments, _second_info = transcribe_faster_whisper(
+                video=Path("/tmp/sample-2.mp4"),
+                model_name="large-v3",
+                device="cpu",
+                language=None,
+                beam_size=5,
+                compute_type=None,
+                threads=4,
+            )
+
+        self.assertEqual(1, len(init_calls))
+        self.assertEqual(2, transcribe_calls)
+        self.assertEqual("hello", first_segments[0]["text"])
+        self.assertEqual("hello", second_segments[0]["text"])
+        self.assertEqual(
+            1,
+            captured_stdout.getvalue().count(
+                "Loading faster-whisper model 'large-v3'"
+            ),
+        )
+
     def test_transcribe_faster_whisper_reports_incomplete_cache(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             cache_root = Path(tmpdir) / "models--Systran--faster-whisper-large-v3"
@@ -1412,6 +1483,84 @@ class TestTranslationDefaultSetting(unittest.TestCase):
         self.assertEqual("faster-whisper", info["backend"])
         self.assertEqual("tiny", info["model"])
         self.assertIn("falling back to CPU int8", captured_stderr.getvalue())
+
+    def test_transcribe_faster_whisper_reuses_cpu_fallback_choice_across_calls(
+        self,
+    ) -> None:
+        attempts: list[tuple[str, str]] = []
+        transcribe_calls = 0
+
+        class FakeSegment:
+            start = 0.0
+            end = 1.0
+            text = "hello"
+
+        class FakeInfo:
+            language = "en"
+            language_probability = 0.99
+            duration = 1.0
+
+        class FakeWhisperModel:
+            def __init__(self, model_name: str, *, device: str, **_kwargs) -> None:
+                attempts.append((model_name, device))
+                if device == "cuda":
+                    raise RuntimeError("CUDA failed with error out of memory")
+
+            def transcribe(self, *_args, **_kwargs):
+                nonlocal transcribe_calls
+                transcribe_calls += 1
+                return [FakeSegment()], FakeInfo()
+
+        captured_stderr = io.StringIO()
+        with (
+            patch.dict(
+                "sys.modules",
+                {"faster_whisper": SimpleNamespace(WhisperModel=FakeWhisperModel)},
+            ),
+            patch(
+                "vid_to_sub_app.cli.transcription.detect_best_device",
+                return_value="cuda",
+            ),
+            patch(
+                "vid_to_sub_app.cli.transcription.detect_cuda_total_memory_gb",
+                return_value=4.5,
+            ),
+            redirect_stderr(captured_stderr),
+        ):
+            _segments1, _info1 = transcribe_faster_whisper(
+                video=Path("/tmp/sample-1.mp4"),
+                model_name="large-v3",
+                device="auto",
+                language=None,
+                beam_size=5,
+                compute_type=None,
+                threads=4,
+            )
+            _segments2, info2 = transcribe_faster_whisper(
+                video=Path("/tmp/sample-2.mp4"),
+                model_name="large-v3",
+                device="auto",
+                language=None,
+                beam_size=5,
+                compute_type=None,
+                threads=4,
+            )
+
+        self.assertEqual(
+            [
+                ("small", "cuda"),
+                ("base", "cuda"),
+                ("tiny", "cuda"),
+                ("tiny", "cpu"),
+            ],
+            attempts,
+        )
+        self.assertEqual(2, transcribe_calls)
+        self.assertEqual("tiny", info2["model"])
+        self.assertEqual(
+            1,
+            captured_stderr.getvalue().count("falling back to CPU int8"),
+        )
 
     def test_translate_segments_openai_compatible_sends_accept_and_user_agent(
         self,

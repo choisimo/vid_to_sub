@@ -34,6 +34,166 @@ from .translation import (
 # pre-split behaviour). Useful as a quick rollback knob without code changes.
 # ---------------------------------------------------------------------------
 _LEGACY_INLINE = os.environ.get("VID_TO_SUB_LEGACY_INLINE", "").strip() == "1"
+_STAGE2_PROGRESS_SUFFIX = ".stage2.progress.jsonl"
+
+
+def _assess_stage1_quality(
+    segments: list[dict[str, Any]], info: dict[str, Any]
+) -> dict[str, Any]:
+    texts = [str(segment.get("text", "")).strip().lower() for segment in segments]
+    non_empty_texts = [text for text in texts if text]
+    unique_ratio = len(set(non_empty_texts)) / max(1, len(non_empty_texts))
+    repeated_ratio = 1.0 - unique_ratio
+    noise_like_ratio = sum(
+        1
+        for text in non_empty_texts
+        if len(text) <= 2 or text in {".", ",", "...", "-"}
+    ) / max(1, len(non_empty_texts))
+    lang_prob = info.get("language_probability")
+
+    reasons: list[str] = []
+    if isinstance(lang_prob, (int, float)) and float(lang_prob) < 0.80:
+        reasons.append("low_language_probability")
+    if repeated_ratio > 0.35:
+        reasons.append("high_repetition")
+    if noise_like_ratio > 0.20:
+        reasons.append("noise_like_segments")
+
+    return {
+        "language_probability": round(float(lang_prob), 4)
+        if isinstance(lang_prob, (int, float))
+        else None,
+        "unique_ratio": round(unique_ratio, 4),
+        "repeated_ratio": round(repeated_ratio, 4),
+        "noise_like_ratio": round(noise_like_ratio, 4),
+        "suspicious": bool(reasons),
+        "reasons": reasons,
+    }
+
+
+def _resolved_postprocess_chunk_size(args: argparse.Namespace) -> int:
+    return max(
+        1,
+        int(
+            getattr(args, "postprocess_chunk_size", None)
+            or getattr(args, "translation_chunk_size", 100)
+        ),
+    )
+
+
+def _stage2_progress_path(artifact_path: Path) -> Path:
+    artifact_name = artifact_path.name
+    if artifact_name.endswith(".stage1.json"):
+        stem = artifact_name[: -len(".stage1.json")]
+    else:
+        stem = artifact_path.stem
+    return artifact_path.with_name(f"{stem}{_STAGE2_PROGRESS_SUFFIX}")
+
+
+def _load_stage2_progress(
+    progress_path: Path, segment_count: int
+) -> dict[str, dict[int, str]]:
+    progress: dict[str, dict[int, str]] = {"translate": {}, "postprocess": {}}
+    if not progress_path.exists():
+        return progress
+
+    try:
+        raw_lines = progress_path.read_text(encoding="utf-8").splitlines()
+    except OSError as exc:
+        print(
+            f"[WARN] Unable to read stage2 progress file {progress_path}: {exc}",
+            file=sys.stderr,
+        )
+        return progress
+
+    for line_number, raw_line in enumerate(raw_lines, start=1):
+        line = raw_line.strip()
+        if not line:
+            continue
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError as exc:
+            print(
+                f"[WARN] Ignoring malformed stage2 progress line {line_number} in {progress_path}: {exc}",
+                file=sys.stderr,
+            )
+            continue
+
+        stage = str(record.get("stage") or "")
+        if stage not in progress:
+            print(
+                f"[WARN] Ignoring unknown stage2 progress stage on line {line_number} in {progress_path}: {stage}",
+                file=sys.stderr,
+            )
+            continue
+
+        items = record.get("items")
+        if not isinstance(items, list):
+            print(
+                f"[WARN] Ignoring malformed stage2 progress items on line {line_number} in {progress_path}",
+                file=sys.stderr,
+            )
+            continue
+
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            raw_segment_number = item.get("segment_number")
+            if raw_segment_number is None:
+                continue
+            try:
+                segment_number = int(raw_segment_number)
+            except (TypeError, ValueError):
+                continue
+            if segment_number < 1 or segment_number > segment_count:
+                continue
+            progress[stage][segment_number] = str(item.get("text") or "")
+
+    return progress
+
+
+def _append_stage2_progress(
+    progress_path: Path,
+    *,
+    stage: str,
+    segment_numbers: list[int],
+    texts: list[str],
+) -> None:
+    if len(segment_numbers) != len(texts):
+        raise ValueError("stage2 progress append requires matching segment/text counts")
+
+    record = {
+        "stage": stage,
+        "items": [
+            {"segment_number": segment_number, "text": text}
+            for segment_number, text in zip(segment_numbers, texts)
+        ],
+    }
+    with progress_path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+
+def _clear_stage2_progress(progress_path: Path) -> None:
+    try:
+        progress_path.unlink()
+    except FileNotFoundError:
+        return
+    except OSError as exc:
+        print(
+            f"[WARN] Unable to remove stage2 progress file {progress_path}: {exc}",
+            file=sys.stderr,
+        )
+
+
+def _expected_translated_outputs(
+    primary_outputs: list[str], target_language: str
+) -> list[Path]:
+    return [
+        Path(str(path)).with_name(
+            Path(str(path)).stem + f".{target_language}" + Path(str(path)).suffix
+        )
+        for path in primary_outputs
+    ]
 
 
 def translation_capable(args: argparse.Namespace) -> bool:
@@ -105,6 +265,7 @@ def _process_one_inline(
             model_name=args.model,
             device=args.device,
             language=args.language,
+            content_type=getattr(args, "content_type", "auto"),
             beam_size=args.beam_size,
             compute_type=args.compute_type,
             hf_token=args.hf_token,
@@ -154,6 +315,9 @@ def _process_one_inline(
                 translation_api_key=args.translation_api_key,
                 source_language=info.get("language"),
                 chunk_size=max(1, int(getattr(args, "translation_chunk_size", 100))),
+                max_payload_chars=max(
+                    2000, int(getattr(args, "translation_max_payload_chars", 16000))
+                ),
                 translation_mode=getattr(args, "translation_mode", "strict"),
             )
             if getattr(args, "postprocess_translation", False):
@@ -172,6 +336,12 @@ def _process_one_inline(
                         translation_model=args.translation_model,
                         translation_base_url=args.translation_base_url,
                         translation_api_key=args.translation_api_key,
+                        chunk_size=_resolved_postprocess_chunk_size(args),
+                        max_payload_chars=max(
+                            2000,
+                            int(getattr(args, "postprocess_max_payload_chars", 12000)),
+                        ),
+                        translation_mode=getattr(args, "translation_mode", "strict"),
                     )
                 )
             translated_written = write_outputs(
@@ -304,6 +474,7 @@ def run_stage1(
             model_name=args.model,
             device=args.device,
             language=args.language,
+            content_type=getattr(args, "content_type", "auto"),
             beam_size=args.beam_size,
             compute_type=args.compute_type,
             hf_token=args.hf_token,
@@ -343,6 +514,7 @@ def run_stage1(
         written = write_outputs(video, segments, formats, output_dir, info)
         output_base = output_dir if output_dir else video.parent
         source_stat = video.stat()
+        quality = _assess_stage1_quality(segments, info)
         artifact: StageArtifact = {
             "schema_version": ARTIFACT_SCHEMA_VERSION,
             "source_path": str(video),
@@ -352,6 +524,17 @@ def run_stage1(
             "device": str(info.get("device") or args.device),
             "model": str(info.get("model") or args.model),
             "language": info.get("language"),
+            "language_probability": (
+                round(float(info["language_probability"]), 4)
+                if isinstance(info.get("language_probability"), (int, float))
+                else None
+            ),
+            "duration": (
+                round(float(info["duration"]), 3)
+                if isinstance(info.get("duration"), (int, float))
+                else None
+            ),
+            "quality": quality,
             "target_lang": args.translate_to,
             "formats": sorted(formats),
             "primary_outputs": [str(path) for path in written],
@@ -421,9 +604,43 @@ def run_stage2(artifact_path: Path, args: argparse.Namespace) -> ProcessResult:
 
     source_path = Path(artifact["source_path"])
     output_dir = Path(artifact["output_base"])
+    progress_path = _stage2_progress_path(artifact_path)
     folder_hash = hash_video_folder(source_path.parent)
     folder_path = str(source_path.parent)
     target_language = artifact.get("target_lang") or args.translate_to
+    quality = artifact.get("quality") or {}
+    if quality.get("suspicious") and not getattr(args, "force_translate", False):
+        reasons = quality.get("reasons") or []
+        reason_suffix = (
+            f" Reasons: {', '.join(str(reason) for reason in reasons)}."
+            if reasons
+            else ""
+        )
+        error = (
+            "Stage 1 transcript quality is suspicious; refusing Stage 2 translation "
+            "without --force-translate."
+            f"{reason_suffix}"
+        )
+        artifact["stage_status"]["translation_pending"] = False
+        artifact["stage_status"]["translation_complete"] = False
+        artifact["stage_status"]["translation_failed"] = True
+        artifact["stage_status"]["translation_error"] = error
+        write_stage_artifact(artifact, output_dir, source_path)
+        artifact_metadata = build_stage_artifact_metadata(artifact_path, artifact)
+        return ProcessResult(
+            success=False,
+            video_path=str(source_path),
+            folder_hash=folder_hash,
+            folder_path=folder_path,
+            worker_id=0,
+            error=error,
+            stage="translate",
+            elapsed_sec=round(time.monotonic() - started_at, 3),
+            language=artifact.get("language"),
+            segments=len(artifact["segments"]),
+            artifact_path=str(artifact_path),
+            artifact_metadata=artifact_metadata,
+        )
     if not target_language:
         error = "Stage artifact does not include a translation target."
         artifact["stage_status"]["translation_pending"] = False
@@ -449,6 +666,8 @@ def run_stage2(artifact_path: Path, args: argparse.Namespace) -> ProcessResult:
 
     # Idempotency guard: skip if translation already completed and outputs exist.
     stage_status = artifact.get("stage_status") or {}
+    if getattr(args, "overwrite_translation", False):
+        _clear_stage2_progress(progress_path)
     if stage_status.get("translation_complete") and not getattr(
         args, "overwrite_translation", False
     ):
@@ -461,14 +680,15 @@ def run_stage2(artifact_path: Path, args: argparse.Namespace) -> ProcessResult:
         ]
         if existing_outputs:
             # idempotency: ALL expected translated outputs must exist, not just any.
-            expected_translated = [
-                Path(str(p)).with_name(
-                    Path(str(p)).stem + f".{target_language}" + Path(str(p)).suffix
-                )
-                for p in (artifact.get("primary_outputs") or [])
-            ]
-            all_exist = expected_translated and all(ep.exists() for ep in expected_translated)
+            expected_translated = _expected_translated_outputs(
+                artifact.get("primary_outputs") or [],
+                target_language,
+            )
+            all_exist = expected_translated and all(
+                ep.exists() for ep in expected_translated
+            )
             if all_exist:
+                _clear_stage2_progress(progress_path)
                 return ProcessResult(
                     success=True,
                     video_path=str(source_path),
@@ -483,6 +703,8 @@ def run_stage2(artifact_path: Path, args: argparse.Namespace) -> ProcessResult:
                     artifact_metadata=artifact_metadata,
                 )
 
+    stage2_progress = _load_stage2_progress(progress_path, len(artifact["segments"]))
+
     try:
         translated_segments, translation_info = translate_segments_openai_compatible(
             segments=artifact["segments"],
@@ -492,7 +714,17 @@ def run_stage2(artifact_path: Path, args: argparse.Namespace) -> ProcessResult:
             translation_api_key=args.translation_api_key,
             source_language=artifact.get("language"),
             chunk_size=max(1, int(getattr(args, "translation_chunk_size", 100))),
+            max_payload_chars=max(
+                2000, int(getattr(args, "translation_max_payload_chars", 16000))
+            ),
             translation_mode=getattr(args, "translation_mode", "strict"),
+            resume_text_by_number=stage2_progress["translate"],
+            on_batch_success=lambda segment_numbers, texts: _append_stage2_progress(
+                progress_path,
+                stage="translate",
+                segment_numbers=segment_numbers,
+                texts=texts,
+            ),
         )
         if args.postprocess_translation:
             translated_segments, postprocess_info = (
@@ -508,6 +740,20 @@ def run_stage2(artifact_path: Path, args: argparse.Namespace) -> ProcessResult:
                     translation_model=args.translation_model,
                     translation_base_url=args.translation_base_url,
                     translation_api_key=args.translation_api_key,
+                    chunk_size=_resolved_postprocess_chunk_size(args),
+                    max_payload_chars=max(
+                        2000,
+                        int(getattr(args, "postprocess_max_payload_chars", 12000)),
+                    ),
+                    translation_mode=getattr(args, "translation_mode", "strict"),
+                    resume_text_by_number=stage2_progress["postprocess"],
+                    on_batch_success=lambda segment_numbers,
+                    texts: _append_stage2_progress(
+                        progress_path,
+                        stage="postprocess",
+                        segment_numbers=segment_numbers,
+                        texts=texts,
+                    ),
                 )
             )
             translation_info["postprocess"] = postprocess_info
@@ -555,6 +801,7 @@ def run_stage2(artifact_path: Path, args: argparse.Namespace) -> ProcessResult:
     artifact["stage_status"]["translation_failed"] = False
     artifact["stage_status"]["translation_error"] = None
     write_stage_artifact(artifact, output_dir, source_path)
+    _clear_stage2_progress(progress_path)
     artifact_metadata = build_stage_artifact_metadata(artifact_path, artifact)
 
     return ProcessResult(

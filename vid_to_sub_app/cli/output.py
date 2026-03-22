@@ -30,8 +30,8 @@ def vtt_timestamp(seconds: float) -> str:
     return srt_timestamp(seconds).replace(",", ".")
 
 
-def tsv_row(idx: int, start: float, end: float, text: str) -> str:
-    return f"{idx}\t{start:.3f}\t{end:.3f}\t{text.strip()}"
+def tsv_row(start: float, end: float, text: str) -> str:
+    return f"{start:.3f}\t{end:.3f}\t{text.strip()}"
 
 
 def parse_media_timestamp(value: str) -> float:
@@ -135,7 +135,7 @@ def segments_to_txt(segments) -> str:
 def segments_to_tsv(segments) -> str:
     rows = ["start\tend\ttext"]
     for seg in segments:
-        rows.append(tsv_row(0, seg["start"], seg["end"], seg["text"]))
+        rows.append(tsv_row(seg["start"], seg["end"], seg["text"]))
     return "\n".join(rows)
 
 

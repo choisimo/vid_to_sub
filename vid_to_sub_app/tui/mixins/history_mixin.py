@@ -358,6 +358,18 @@ class HistoryMixin:
             app._log("[red]No subtitle files exist on disk — cannot translate.[/]")
             return
 
+        srt_paths = [
+            subtitle_path
+            for subtitle_path in existing_paths
+            if Path(subtitle_path).suffix.lower() == ".srt"
+        ]
+        skipped_non_srt = len(existing_paths) - len(srt_paths)
+        if not srt_paths:
+            app._log(
+                "[yellow]History translate currently supports SRT outputs only.[/]"
+            )
+            return
+
         target_lang = (
             job.get("target_lang") or app._val("inp-translate-to") or ""
         ).strip()
@@ -367,7 +379,11 @@ class HistoryMixin:
 
         if missing_paths:
             app._log(f"[yellow]Skipped {len(missing_paths)} missing file(s).[/]")
-        self._trigger_translate_from_paths(existing_paths, target_lang)
+        if skipped_non_srt:
+            app._log(
+                f"[yellow]Skipped {skipped_non_srt} non-SRT subtitle file(s).[/]"
+            )
+        self._trigger_translate_from_paths(srt_paths, target_lang)
 
     @work(thread=True, exclusive=True, exit_on_error=False, name="history-translate")
     def _trigger_translate_from_paths(

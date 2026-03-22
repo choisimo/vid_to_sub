@@ -1,2 +1,29 @@
-# Created by venv; see https://docs.python.org/3/library/venv.html
-*
+# Python caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+
+# Virtualenvs
+.venv/
+venv/
+env/
+bin/
+include/
+lib/
+lib64
+pyvenv.cfg
+
+# Local runtime state
+.env
+*.db
+*.db-shm
+*.db-wal
+*.log
+media/
+models/
+
+# Local planning artifacts
+.sisyphus/
+source-code-export.md
+export-source-markdown.js

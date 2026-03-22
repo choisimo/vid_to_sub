@@ -47,8 +47,8 @@ from vid_to_sub_app.cli import (
     hash_video_folder,
 )
 from vid_to_sub_app.cli.runner import primary_output_exists as _primary_output_exists
-from vid_to_sub_app.shared.constants import DEVICES, ROOT_DIR
-from vid_to_sub_app.shared.env import find_whisper_cpp_bin, load_project_env
+from vid_to_sub_app.shared.constants import DEVICES, ROOT_DIR, TRANSLATION_MODES
+from vid_to_sub_app.shared.env import find_whisper_cpp_bin
 
 from .helpers import (
     BACKENDS,
@@ -510,6 +510,22 @@ class VidToSubApp(
                                     placeholder="(from Settings)",
                                     id="inp-trans-key",
                                     password=True,
+                                    classes="fwidget",
+                                )
+                            with Horizontal(classes="frow"):
+                                yield Label("Translation mode", classes="flabel")
+                                yield Select(
+                                    _opts(list(TRANSLATION_MODES), "strict"),
+                                    id="sel-translation-mode",
+                                    classes="fwidget",
+                                    value="strict",
+                                )
+                            with Horizontal(classes="frow"):
+                                yield Label("Chunk size", classes="flabel")
+                                yield Input(
+                                    value="100",
+                                    id="inp-translation-chunk-size",
+                                    type="integer",
                                     classes="fwidget",
                                 )
                             with Horizontal(classes="crow"):
