@@ -114,6 +114,8 @@ ENV_KEYS = (
 )
 
 TUI_DEFAULT_TRANSLATE_ENABLED_KEY = "tui.default_translate_enabled"
+TUI_DEFAULT_CONTENT_TYPE_KEY = "tui.default_content_type"
+TUI_DEFAULT_FORCE_TRANSLATE_KEY = "tui.default_force_translate"
 
 _DEFAULT_SETTINGS: dict[str, str] = {
     # Environment variable settings
@@ -139,6 +141,8 @@ _DEFAULT_SETTINGS: dict[str, str] = {
     "tui.default_language": "",
     "tui.default_output_dir": "",
     TUI_DEFAULT_TRANSLATE_ENABLED_KEY: "1",
+    TUI_DEFAULT_CONTENT_TYPE_KEY: "auto",
+    TUI_DEFAULT_FORCE_TRANSLATE_KEY: "0",
     "tui.default_translate_to": "ko",
     "tui.default_formats": '["srt"]',
     "tui.execution_mode": "local",

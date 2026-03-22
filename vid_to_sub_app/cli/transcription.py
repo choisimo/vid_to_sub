@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import subprocess
+import importlib
 import re
 import sys
 import tempfile
 import threading
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Any, Callable, Mapping, Optional, TypedDict, cast
 
 from vid_to_sub_app.shared.constants import (
     DEFAULT_DEVICE,
@@ -29,6 +30,60 @@ _FasterWhisperRequestedKey = tuple[str, str, str]
 _FasterWhisperRuntimeKey = tuple[str, str, str]
 _FasterWhisperModelCacheKey = tuple[str, str, str, int]
 _faster_whisper_thread_state = threading.local()
+
+
+class TranscriptSegment(TypedDict):
+    start: float
+    end: float
+    text: str
+
+
+class _FasterWhisperThreadCache(TypedDict):
+    model_class_identity: int
+    models: dict[_FasterWhisperModelCacheKey, Any]
+    preferred_runtime: dict[_FasterWhisperRequestedKey, _FasterWhisperRuntimeKey]
+
+
+def _normalize_content_type(content_type: Optional[str]) -> str:
+    normalized = (content_type or "auto").strip().lower()
+    if normalized not in {"auto", "speech", "music"}:
+        raise ValueError(f"Unknown content type: {content_type!r}")
+    return normalized
+
+
+def _music_safe_backend_options(
+    backend: str,
+    language: Optional[str],
+) -> dict[str, Any]:
+    if not language:
+        raise RuntimeError(
+            "--content-type music requires --language because automatic language "
+            "detection is unreliable on music-dominant audio."
+        )
+    if backend == "faster-whisper":
+        return {
+            "condition_on_previous_text": False,
+            "vad_filter": True,
+        }
+    if backend == "whisper":
+        return {
+            "condition_on_previous_text": False,
+        }
+    raise RuntimeError(
+        f"--content-type music is not supported for backend '{backend}'. "
+        "Use --backend faster-whisper or --backend whisper."
+    )
+
+
+def _transcribe_options_for_content_type(
+    backend: str,
+    content_type: Optional[str],
+    language: Optional[str],
+) -> tuple[str, dict[str, Any]]:
+    normalized = _normalize_content_type(content_type)
+    if normalized != "music":
+        return normalized, {}
+    return normalized, _music_safe_backend_options(backend, language)
 
 
 def configure_torch_cpu_threads(threads: int) -> None:
@@ -85,7 +140,9 @@ def _describe_faster_whisper_load_error(model_name: str, exc: Exception) -> str:
     raw_message = str(exc).strip() or exc.__class__.__name__
     model_dir = _extract_faster_whisper_model_dir(raw_message)
     if "Unable to open file 'model.bin'" not in raw_message or model_dir is None:
-        return f"faster-whisper failed while loading model '{model_name}': {raw_message}"
+        return (
+            f"faster-whisper failed while loading model '{model_name}': {raw_message}"
+        )
 
     cache_dir = model_dir
     if model_dir.parent.name == "snapshots":
@@ -128,7 +185,9 @@ def _release_cuda_cache() -> None:
         pass
 
 
-def _announce_faster_whisper_load(model_name: str, device: str, compute_type: str) -> None:
+def _announce_faster_whisper_load(
+    model_name: str, device: str, compute_type: str
+) -> None:
     print(
         f"[INFO] Loading faster-whisper model '{model_name}' on {device} ({compute_type}). "
         "First run may take time while the model is downloaded or loaded.",
@@ -144,7 +203,7 @@ def _faster_whisper_cpu_threads(device: str, threads: int) -> int:
 
 def _get_faster_whisper_thread_cache(
     model_class_identity: int,
-) -> dict[str, object]:
+) -> _FasterWhisperThreadCache:
     state = getattr(_faster_whisper_thread_state, "state", None)
     if (
         state is None
@@ -157,7 +216,52 @@ def _get_faster_whisper_thread_cache(
             "preferred_runtime": {},
         }
         _faster_whisper_thread_state.state = state
-    return state
+    models = state.get("models")
+    preferred_runtime = state.get("preferred_runtime")
+    if not isinstance(models, dict) or not isinstance(preferred_runtime, dict):
+        refreshed_state: _FasterWhisperThreadCache = {
+            "model_class_identity": model_class_identity,
+            "models": {},
+            "preferred_runtime": {},
+        }
+        _faster_whisper_thread_state.state = refreshed_state
+        return refreshed_state
+    return {
+        "model_class_identity": model_class_identity,
+        "models": cast(dict[_FasterWhisperModelCacheKey, Any], models),
+        "preferred_runtime": cast(
+            dict[_FasterWhisperRequestedKey, _FasterWhisperRuntimeKey],
+            preferred_runtime,
+        ),
+    }
+
+
+def _result_mapping(result: object, backend: str) -> Mapping[str, object]:
+    if not isinstance(result, Mapping):
+        raise RuntimeError(f"{backend} returned an unexpected result payload.")
+    return result
+
+
+def _segments_from_mapping(result: Mapping[str, object]) -> list[TranscriptSegment]:
+    segments_raw = result.get("segments", [])
+    if not isinstance(segments_raw, list):
+        return []
+
+    segments: list[TranscriptSegment] = []
+    for segment in segments_raw:
+        if not isinstance(segment, Mapping):
+            continue
+        start = segment.get("start")
+        end = segment.get("end")
+        text = segment.get("text")
+        if not isinstance(start, (int, float)):
+            continue
+        if not isinstance(end, (int, float)):
+            continue
+        if not isinstance(text, str):
+            continue
+        segments.append({"start": float(start), "end": float(end), "text": text})
+    return segments
 
 
 def _preferred_gpu_candidates(
@@ -171,7 +275,10 @@ def _preferred_gpu_candidates(
     if preferred_model not in candidates:
         return [preferred_model, *candidates]
 
-    return [preferred_model, *[candidate for candidate in candidates if candidate != preferred_model]]
+    return [
+        preferred_model,
+        *[candidate for candidate in candidates if candidate != preferred_model],
+    ]
 
 
 def _coerce_preferred_runtime(value: object) -> _FasterWhisperRuntimeKey | None:
@@ -188,10 +295,14 @@ def transcribe_faster_whisper(
     model_name: str,
     device: str,
     language: Optional[str],
+    content_type: str,
     beam_size: int,
     compute_type: Optional[str],
     threads: int,
-) -> tuple[list[dict], dict]:
+) -> tuple[list[TranscriptSegment], dict[str, object]]:
+    normalized_content_type, extra_transcribe_options = (
+        _transcribe_options_for_content_type("faster-whisper", content_type, language)
+    )
     try:
         from faster_whisper import WhisperModel
     except ImportError:
@@ -210,8 +321,12 @@ def transcribe_faster_whisper(
     preferred_runtime_map = thread_cache["preferred_runtime"]
     candidate_chain = faster_whisper_model_candidates(model_name)
     selected_model = model_name
+    segs_raw: Any = []
+    info_raw: Any | None = None
 
-    def load_model(target_model: str, target_device: str, target_compute_type: str):
+    def load_model(
+        target_model: str, target_device: str, target_compute_type: str
+    ) -> Any:
         cache_key: _FasterWhisperModelCacheKey = (
             target_model,
             target_device,
@@ -259,13 +374,18 @@ def transcribe_faster_whisper(
                 flush=True,
             )
 
-        reuse_cpu_fallback = preferred_runtime is not None and preferred_runtime[1] == "cpu"
+        reuse_cpu_fallback = (
+            preferred_runtime is not None and preferred_runtime[1] == "cpu"
+        )
         if reuse_cpu_fallback:
+            assert preferred_runtime is not None
             dev = preferred_runtime[1]
             ct = preferred_runtime[2]
             selected_model = preferred_runtime[0]
         else:
-            gpu_candidates = _preferred_gpu_candidates(gpu_candidates, preferred_runtime)
+            gpu_candidates = _preferred_gpu_candidates(
+                gpu_candidates, preferred_runtime
+            )
 
         if reuse_cpu_fallback:
             model = load_model(selected_model, dev, ct)
@@ -274,6 +394,7 @@ def transcribe_faster_whisper(
                 language=language,
                 beam_size=beam_size,
                 word_timestamps=False,
+                **extra_transcribe_options,
             )
             gpu_succeeded = True
             preferred_runtime_map[requested_runtime] = (selected_model, dev, ct)
@@ -285,7 +406,11 @@ def transcribe_faster_whisper(
                 except Exception as exc:
                     if _is_cuda_oom_error(exc):
                         _release_cuda_cache()
-                        next_candidate = gpu_candidates[index + 1] if index + 1 < len(gpu_candidates) else None
+                        next_candidate = (
+                            gpu_candidates[index + 1]
+                            if index + 1 < len(gpu_candidates)
+                            else None
+                        )
                         if next_candidate:
                             print(
                                 f"[WARN] faster-whisper model '{selected_model}' "
@@ -306,6 +431,7 @@ def transcribe_faster_whisper(
                         language=language,
                         beam_size=beam_size,
                         word_timestamps=False,
+                        **extra_transcribe_options,
                     )
                     gpu_succeeded = True
                     preferred_runtime_map[requested_runtime] = (selected_model, dev, ct)
@@ -313,7 +439,11 @@ def transcribe_faster_whisper(
                 except Exception as exc:
                     if _is_cuda_oom_error(exc):
                         _release_cuda_cache()
-                        next_candidate = gpu_candidates[index + 1] if index + 1 < len(gpu_candidates) else None
+                        next_candidate = (
+                            gpu_candidates[index + 1]
+                            if index + 1 < len(gpu_candidates)
+                            else None
+                        )
                         if next_candidate:
                             print(
                                 f"[WARN] faster-whisper model '{selected_model}' "
@@ -347,33 +477,47 @@ def transcribe_faster_whisper(
                 language=language,
                 beam_size=beam_size,
                 word_timestamps=False,
+                **extra_transcribe_options,
             )
             preferred_runtime_map[requested_runtime] = (selected_model, dev, ct)
     else:
         preferred_runtime = _coerce_preferred_runtime(
             preferred_runtime_map.get(requested_runtime)
         )
-        if preferred_runtime and preferred_runtime[1] == dev and preferred_runtime[2] == ct:
+        if (
+            preferred_runtime
+            and preferred_runtime[1] == dev
+            and preferred_runtime[2] == ct
+        ):
             selected_model = preferred_runtime[0]
         try:
             model = load_model(selected_model, dev, ct)
         except Exception as exc:
-            raise RuntimeError(_describe_faster_whisper_load_error(selected_model, exc)) from exc
+            raise RuntimeError(
+                _describe_faster_whisper_load_error(selected_model, exc)
+            ) from exc
         segs_raw, info_raw = model.transcribe(
             str(video),
             language=language,
             beam_size=beam_size,
             word_timestamps=False,
+            **extra_transcribe_options,
         )
         preferred_runtime_map[requested_runtime] = (selected_model, dev, ct)
 
-    segments = [{"start": seg.start, "end": seg.end, "text": seg.text} for seg in segs_raw]
-    info = {
+    if info_raw is None:
+        raise RuntimeError("faster-whisper returned no transcription metadata.")
+
+    segments: list[TranscriptSegment] = [
+        {"start": seg.start, "end": seg.end, "text": seg.text} for seg in segs_raw
+    ]
+    info: dict[str, object] = {
         "language": info_raw.language,
         "language_probability": round(info_raw.language_probability, 4),
         "duration": round(info_raw.duration, 3),
         "backend": "faster-whisper",
         "model": selected_model,
+        "content_type": normalized_content_type,
     }
     return segments, info
 
@@ -383,9 +527,13 @@ def transcribe_openai_whisper(
     model_name: str,
     device: str,
     language: Optional[str],
+    content_type: str,
     beam_size: int,
     threads: int,
-) -> tuple[list[dict], dict]:
+) -> tuple[list[TranscriptSegment], dict[str, object]]:
+    normalized_content_type, extra_transcribe_options = (
+        _transcribe_options_for_content_type("whisper", content_type, language)
+    )
     try:
         import whisper as ow
     except ImportError:
@@ -399,17 +547,20 @@ def transcribe_openai_whisper(
     dev = detect_torch_device() if device == "auto" else device
     if dev == "cpu":
         configure_torch_cpu_threads(threads)
-
     model = ow.load_model(model_name, device=dev)
-    result = model.transcribe(str(video), language=language, beam_size=beam_size)
-    segments = [
-        {"start": segment["start"], "end": segment["end"], "text": segment["text"]}
-        for segment in result.get("segments", [])
-    ]
-    info = {
-        "language": result.get("language"),
+    result = model.transcribe(
+        str(video),
+        language=language,
+        beam_size=beam_size,
+        **extra_transcribe_options,
+    )
+    result_map = _result_mapping(result, "openai-whisper")
+    segments = _segments_from_mapping(result_map)
+    info: dict[str, object] = {
+        "language": result_map.get("language"),
         "backend": "openai-whisper",
         "model": model_name,
+        "content_type": normalized_content_type,
     }
     return segments, info
 
@@ -424,9 +575,9 @@ def transcribe_whisperx(
     hf_token: Optional[str],
     diarize: bool,
     threads: int,
-) -> tuple[list[dict], dict]:
+) -> tuple[list[TranscriptSegment], dict[str, object]]:
     try:
-        import whisperx
+        whisperx = importlib.import_module("whisperx")
     except ImportError:
         print(
             "[ERROR] whisperx is not installed.\n  Install with: pip install whisperx",
@@ -442,20 +593,22 @@ def transcribe_whisperx(
     model = whisperx.load_model(model_name, dev, compute_type=ct, language=language)
     audio = whisperx.load_audio(str(video))
     result = model.transcribe(audio, batch_size=16, language=language)
+    result_map = _result_mapping(result, "whisperx")
 
     try:
         align_model, metadata = whisperx.load_align_model(
-            language_code=result["language"],
+            language_code=result_map["language"],
             device=dev,
         )
         result = whisperx.align(
-            result["segments"],
+            result_map["segments"],
             align_model,
             metadata,
             audio,
             dev,
             return_char_alignments=False,
         )
+        result_map = _result_mapping(result, "whisperx")
     except Exception as exc:
         print(
             f"[WARN] Alignment failed ({exc}); using unaligned segments.",
@@ -476,18 +629,16 @@ def transcribe_whisperx(
                 )
                 diarize_segments = diarize_model(audio)
                 result = whisperx.assign_word_speakers(diarize_segments, result)
+                result_map = _result_mapping(result, "whisperx")
             except Exception as exc:
                 print(
                     f"[WARN] Diarization failed ({exc}); continuing without it.",
                     file=sys.stderr,
                 )
 
-    segments = [
-        {"start": segment["start"], "end": segment["end"], "text": segment["text"]}
-        for segment in result.get("segments", [])
-    ]
-    info = {
-        "language": result.get("language"),
+    segments = _segments_from_mapping(result_map)
+    info: dict[str, object] = {
+        "language": result_map.get("language"),
         "backend": "whisperx",
         "model": model_name,
     }
@@ -512,7 +663,9 @@ def extract_audio_for_whisper_cpp(video: Path, wav_path: Path) -> None:
     try:
         subprocess.run(command, check=True)
     except FileNotFoundError as exc:
-        raise RuntimeError("ffmpeg is required on PATH for whisper.cpp backend") from exc
+        raise RuntimeError(
+            "ffmpeg is required on PATH for whisper.cpp backend"
+        ) from exc
     except subprocess.CalledProcessError as exc:
         raise RuntimeError(
             f"ffmpeg audio extraction failed (exit {exc.returncode})"
@@ -548,7 +701,8 @@ def resolve_whisper_cpp_srt_path(output_prefix: Path, wav_path: Path) -> Path:
     preferred = [
         path
         for path in discovered
-        if path.name.startswith(output_prefix.name) or path.name.startswith(wav_path.name)
+        if path.name.startswith(output_prefix.name)
+        or path.name.startswith(wav_path.name)
     ]
     if len(preferred) == 1:
         return preferred[0]
@@ -569,7 +723,7 @@ def transcribe_whisper_cpp(
     threads: int,
     whisper_cpp_model_path: Optional[str],
     progress_callback: Optional[Callable[[float], None]] = None,
-) -> tuple[list[dict], dict]:
+) -> tuple[list[TranscriptSegment], dict[str, object]]:
     if device not in {"auto", DEFAULT_DEVICE}:
         print(
             "[WARN] whisper.cpp backend is CPU-oriented here; using CPU.",
@@ -657,8 +811,10 @@ def transcribe_whisper_cpp(
 
         srt_path = resolve_whisper_cpp_srt_path(output_prefix, wav_path)
 
-        segments = parse_srt(srt_path.read_text(encoding="utf-8"))
-        info = {
+        segments = _segments_from_mapping(
+            {"segments": parse_srt(srt_path.read_text(encoding="utf-8"))}
+        )
+        info: dict[str, object] = {
             "language": language or "auto",
             "backend": "whisper-cpp",
             "model": model_name,
@@ -673,6 +829,7 @@ def transcribe(
     model_name: str,
     device: str,
     language: Optional[str],
+    content_type: str,
     beam_size: int,
     compute_type: Optional[str],
     hf_token: Optional[str],
@@ -680,8 +837,9 @@ def transcribe(
     whisper_cpp_model_path: Optional[str],
     threads: int,
     progress_callback: Optional[Callable[[float], None]] = None,
-) -> tuple[list[dict], dict]:
+) -> tuple[list[TranscriptSegment], dict[str, object]]:
     if backend == "whisper-cpp":
+        _transcribe_options_for_content_type("whisper-cpp", content_type, language)
         return transcribe_whisper_cpp(
             video,
             model_name,
@@ -697,6 +855,7 @@ def transcribe(
             model_name,
             device,
             language,
+            content_type,
             beam_size,
             compute_type,
             threads,
@@ -707,10 +866,12 @@ def transcribe(
             model_name,
             device,
             language,
+            content_type,
             beam_size,
             threads,
         )
     if backend == "whisperx":
+        _transcribe_options_for_content_type("whisperx", content_type, language)
         return transcribe_whisperx(
             video,
             model_name,
@@ -722,4 +883,5 @@ def transcribe(
             diarize,
             threads,
         )
+    _normalize_content_type(content_type)
     raise ValueError(f"Unknown backend: {backend!r}")
