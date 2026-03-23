@@ -11,6 +11,7 @@ Stores:
 
 from __future__ import annotations
 
+import atexit
 import json
 import sqlite3
 import threading
@@ -113,6 +114,8 @@ ENV_KEYS = (
 )
 
 TUI_DEFAULT_TRANSLATE_ENABLED_KEY = "tui.default_translate_enabled"
+TUI_DEFAULT_CONTENT_TYPE_KEY = "tui.default_content_type"
+TUI_DEFAULT_FORCE_TRANSLATE_KEY = "tui.default_force_translate"
 
 _DEFAULT_SETTINGS: dict[str, str] = {
     # Environment variable settings
@@ -138,6 +141,8 @@ _DEFAULT_SETTINGS: dict[str, str] = {
     "tui.default_language": "",
     "tui.default_output_dir": "",
     TUI_DEFAULT_TRANSLATE_ENABLED_KEY: "1",
+    TUI_DEFAULT_CONTENT_TYPE_KEY: "auto",
+    TUI_DEFAULT_FORCE_TRANSLATE_KEY: "0",
     "tui.default_translate_to": "ko",
     "tui.default_formats": '["srt"]',
     "tui.execution_mode": "local",
@@ -153,7 +158,10 @@ class Database:
     def __init__(self, path: Path = DB_PATH) -> None:
         self._path = path
         self._local = threading.local()
+        self._connections: dict[int, sqlite3.Connection] = {}
+        self._connections_lock = threading.Lock()
         self._init_schema()
+        atexit.register(self.close)
 
     # ── Internal ──────────────────────────────────────────────────────────
 
@@ -163,7 +171,20 @@ class Database:
             conn = sqlite3.connect(str(self._path), check_same_thread=False)
             conn.row_factory = sqlite3.Row
             self._local.conn = conn
+            with self._connections_lock:
+                self._connections[threading.get_ident()] = conn
         return conn
+
+    def close(self) -> None:
+        with self._connections_lock:
+            connections = list(self._connections.values())
+            self._connections.clear()
+        for conn in connections:
+            try:
+                conn.close()
+            except Exception:
+                pass
+        self._local.conn = None
 
     def _init_schema(self) -> None:
         self._conn().executescript(_SCHEMA)

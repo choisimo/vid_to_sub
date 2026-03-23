@@ -30,6 +30,9 @@ VIDEO_EXTENSIONS: frozenset[str] = frozenset(
 
 FORMATS: list[str] = ["srt", "vtt", "txt", "tsv", "json"]
 SUPPORTED_FORMATS: frozenset[str] = frozenset({*FORMATS, "all"})
+SUBTITLE_OUTPUT_EXTENSIONS: frozenset[str] = frozenset(
+    {".srt", ".vtt", ".txt", ".tsv"}
+)
 POSTPROCESS_MODES: tuple[str, ...] = ("auto", "web_lookup", "context_polish")
 
 KNOWN_MODELS: tuple[str, ...] = (
@@ -186,6 +189,12 @@ ENV_AGENT_MODEL = "VID_TO_SUB_AGENT_MODEL"
 ENV_TRANSLATION_DEBUG = "VID_TO_SUB_TRANSLATION_DEBUG"
 TRANSLATION_MODES: tuple[str, ...] = ("strict", "best-effort")
 TRANSLATION_RETRY_SCHEDULE: tuple[int, ...] = (100, 50, 20, 10, 5, 1)
+TRANSLATION_HTTP_TIMEOUT_SEC = 120.0
+TRANSLATION_HTTP_RETRY_ATTEMPTS = 4
+TRANSLATION_HTTP_RETRYABLE_STATUS_CODES: frozenset[int] = frozenset(
+    {408, 409, 425, 429, 500, 502, 503, 504}
+)
+TRANSLATION_HTTP_RETRY_BACKOFF_SEC: tuple[float, ...] = (1.0, 2.0, 4.0)
 
 EVENT_PREFIX = "@@VID_TO_SUB_EVENT@@"
 

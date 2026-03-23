@@ -6,6 +6,7 @@ ARTIFACT_SCHEMA_VERSION = "1"
 ARTIFACT_FILENAME_SUFFIX = ".stage1.json"
 
 StageStatus = dict[str, bool | str | None]
+StageQuality = dict[str, Any]
 
 
 class StageArtifact(TypedDict):
@@ -17,6 +18,9 @@ class StageArtifact(TypedDict):
     device: str
     model: str
     language: str | None
+    language_probability: float | None
+    duration: float | None
+    quality: StageQuality
     target_lang: str | None
     formats: list[str]
     primary_outputs: list[str]

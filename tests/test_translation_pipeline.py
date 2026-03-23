@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import argparse
+from email.message import Message
 import io
 import json
 import os
 import tempfile
+import urllib.error
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
@@ -12,7 +14,8 @@ from tempfile import TemporaryDirectory
 from typing import Any
 from unittest.mock import ANY, patch
 
-from vid_to_sub_app.cli.main import main
+import vid_to_sub_app.cli.translation as translation_module
+from vid_to_sub_app.cli.main import build_parser, main
 from vid_to_sub_app.cli.manifest import ProcessResult
 from vid_to_sub_app.cli.runner import process_one, run_stage1, run_stage2
 from vid_to_sub_app.cli.stage_artifact import (
@@ -78,9 +81,74 @@ def _event_payloads(buffer: io.StringIO) -> list[dict[str, Any]]:
 
 
 class TranslationPipelineTests(unittest.TestCase):
+    def test_translation_max_concurrency_defaults_to_one_for_invalid_env(self) -> None:
+        with patch.dict(
+            os.environ,
+            {"VID_TO_SUB_TRANSLATION_MAX_CONCURRENCY": "not-a-number"},
+            clear=False,
+        ):
+            self.assertEqual(1, translation_module._translation_max_concurrency())
+
     def test_retry_schedule_uses_expected_ladder(self) -> None:
         self.assertEqual([100, 50, 20, 10, 5, 1], _build_retry_schedule(100))
         self.assertEqual([20, 10, 5, 1], _build_retry_schedule(20))
+
+    def test_translation_requests_run_inside_bounded_semaphore(self) -> None:
+        segments = [{"start": 0.0, "end": 1.0, "text": "Hello"}]
+
+        class _RecordingSemaphore:
+            def __init__(self) -> None:
+                self.enter_count = 0
+                self.exit_count = 0
+                self.active_count = 0
+
+            def __enter__(self) -> "_RecordingSemaphore":
+                self.enter_count += 1
+                self.active_count += 1
+                return self
+
+            def __exit__(self, exc_type, exc, tb) -> bool:
+                self.exit_count += 1
+                self.active_count -= 1
+                return False
+
+        semaphore = _RecordingSemaphore()
+
+        def fake_urlopen_with_timeout(request, timeout_sec):
+            self.assertEqual(1, semaphore.active_count)
+            self.assertGreater(timeout_sec, 0)
+            return _FakeHTTPResponse(
+                _chat_payload(
+                    json.dumps(
+                        [{"segment_number": 1, "text": "안녕"}], ensure_ascii=False
+                    )
+                )
+            )
+
+        with (
+            patch(
+                "vid_to_sub_app.cli.translation._TRANSLATION_SEMAPHORE",
+                semaphore,
+            ),
+            patch(
+                "vid_to_sub_app.cli.translation._urlopen_with_timeout",
+                side_effect=fake_urlopen_with_timeout,
+            ),
+        ):
+            with redirect_stdout(io.StringIO()):
+                translated_segments, _ = translate_segments_openai_compatible(
+                    segments=segments,
+                    target_language="ko",
+                    translation_model="gpt-4.1-mini",
+                    translation_base_url="https://translation.example/v1",
+                    translation_api_key="secret",
+                    source_language="en",
+                )
+
+        self.assertEqual(["안녕"], [segment["text"] for segment in translated_segments])
+        self.assertEqual(1, semaphore.enter_count)
+        self.assertEqual(1, semaphore.exit_count)
+        self.assertEqual(0, semaphore.active_count)
 
     def test_translate_segments_openai_compatible_preserves_segment_boundaries(
         self,
@@ -130,6 +198,188 @@ class TranslationPipelineTests(unittest.TestCase):
         self.assertEqual(100, info["chunk_size"])
         self.assertIn("segment_number", captured_payloads[0]["messages"][0]["content"])
 
+    def test_translate_accepts_structured_output_object_response(self) -> None:
+        segments = [
+            {"start": 0.0, "end": 1.0, "text": "Hello"},
+            {"start": 1.0, "end": 2.0, "text": "World"},
+        ]
+
+        def fake_urlopen(request):
+            return _FakeHTTPResponse(
+                _chat_payload(
+                    json.dumps(
+                        {
+                            "items": [
+                                {"segment_number": 1, "text": "안녕"},
+                                {"segment_number": 2, "text": "세상"},
+                            ]
+                        },
+                        ensure_ascii=False,
+                    )
+                )
+            )
+
+        with patch(
+            "vid_to_sub_app.cli.translation.urllib.request.urlopen",
+            side_effect=fake_urlopen,
+        ):
+            with redirect_stdout(io.StringIO()):
+                translated_segments, _ = translate_segments_openai_compatible(
+                    segments=segments,
+                    target_language="ko",
+                    translation_model="gpt-4.1-mini",
+                    translation_base_url="https://translation.example/v1",
+                    translation_api_key="secret",
+                    source_language="en",
+                )
+
+        self.assertEqual(
+            ["안녕", "세상"], [segment["text"] for segment in translated_segments]
+        )
+
+    def test_translation_falls_back_after_structured_output_capability_error(
+        self,
+    ) -> None:
+        segments = [
+            {"start": 0.0, "end": 1.0, "text": "one"},
+            {"start": 1.0, "end": 2.0, "text": "two"},
+        ]
+        captured_payloads: list[dict[str, Any]] = []
+        stderr_buffer = io.StringIO()
+
+        def fake_urlopen(request):
+            payload = json.loads(request.data.decode("utf-8"))
+            captured_payloads.append(payload)
+            user_payload = json.loads(payload["messages"][1]["content"])
+            segment_number = user_payload["segment_numbers"][0]
+            if len(captured_payloads) == 1:
+                raise urllib.error.HTTPError(
+                    url=request.full_url,
+                    code=400,
+                    msg="bad request",
+                    hdrs=Message(),
+                    fp=io.BytesIO(
+                        json.dumps(
+                            {
+                                "error": {
+                                    "type": "invalid_request_error",
+                                    "code": "unsupported_parameter",
+                                    "message": (
+                                        "response_format json_schema is not supported "
+                                        "for this model"
+                                    ),
+                                }
+                            }
+                        ).encode("utf-8")
+                    ),
+                )
+            return _FakeHTTPResponse(
+                _chat_payload(
+                    json.dumps(
+                        [
+                            {
+                                "segment_number": segment_number,
+                                "text": f"ok-{segment_number}",
+                            }
+                        ],
+                        ensure_ascii=False,
+                    )
+                )
+            )
+
+        with (
+            patch(
+                "vid_to_sub_app.cli.translation.urllib.request.urlopen",
+                side_effect=fake_urlopen,
+            ),
+            redirect_stdout(io.StringIO()),
+            redirect_stderr(stderr_buffer),
+        ):
+            translated_segments, _ = translate_segments_openai_compatible(
+                segments=segments,
+                target_language="ko",
+                translation_model="gpt-4.1-mini",
+                translation_base_url="https://translation.example/v1",
+                translation_api_key="secret",
+                source_language="en",
+                chunk_size=1,
+            )
+
+        self.assertEqual(
+            ["ok-1", "ok-2"], [segment["text"] for segment in translated_segments]
+        )
+        self.assertEqual(
+            [True, False, False],
+            ["response_format" in payload for payload in captured_payloads],
+        )
+        fallback_event = next(
+            event
+            for event in _event_payloads(stderr_buffer)
+            if event["event"] == "translation_structured_output_fallback"
+        )
+        self.assertEqual(400, fallback_event["http_status"])
+        self.assertEqual([1], fallback_event["segment_numbers"])
+        self.assertEqual("translate", fallback_event["stage"])
+
+    def test_translation_does_not_fallback_for_malformed_structured_output_schema(
+        self,
+    ) -> None:
+        segments = [{"start": 0.0, "end": 1.0, "text": "one"}]
+        captured_payloads: list[dict[str, Any]] = []
+        stderr_buffer = io.StringIO()
+
+        def fake_urlopen(request):
+            payload = json.loads(request.data.decode("utf-8"))
+            captured_payloads.append(payload)
+            raise urllib.error.HTTPError(
+                url=request.full_url,
+                code=400,
+                msg="bad request",
+                hdrs=Message(),
+                fp=io.BytesIO(
+                    json.dumps(
+                        {
+                            "error": {
+                                "type": "invalid_request_error",
+                                "code": "invalid_schema",
+                                "message": (
+                                    "response_format json_schema failed to validate schema"
+                                ),
+                            }
+                        }
+                    ).encode("utf-8")
+                ),
+            )
+
+        with (
+            patch(
+                "vid_to_sub_app.cli.translation.urllib.request.urlopen",
+                side_effect=fake_urlopen,
+            ),
+            redirect_stdout(io.StringIO()),
+            redirect_stderr(stderr_buffer),
+        ):
+            with self.assertRaises(RuntimeError) as ctx:
+                translate_segments_openai_compatible(
+                    segments=segments,
+                    target_language="ko",
+                    translation_model="gpt-4.1-mini",
+                    translation_base_url="https://translation.example/v1",
+                    translation_api_key="secret",
+                    source_language="en",
+                    chunk_size=1,
+                )
+
+        self.assertIn("invalid_schema", str(ctx.exception))
+        self.assertEqual(1, len(captured_payloads))
+        self.assertIn("response_format", captured_payloads[0])
+        self.assertFalse(
+            any(
+                event["event"] == "translation_structured_output_fallback"
+                for event in _event_payloads(stderr_buffer)
+            )
+        )
+
     def test_translate_accepts_legacy_string_array_only_when_counts_match(self) -> None:
         segments = [
             {"start": 0.0, "end": 1.0, "text": "Hello"},
@@ -156,6 +406,113 @@ class TranslationPipelineTests(unittest.TestCase):
         self.assertEqual(
             ["안녕", "세상"], [segment["text"] for segment in translated_segments]
         )
+
+    def test_translation_retries_after_retryable_http_error(self) -> None:
+        segments = [{"start": 0.0, "end": 1.0, "text": "Hello"}]
+        calls = 0
+        stdout_buffer = io.StringIO()
+        stderr_buffer = io.StringIO()
+
+        def fake_urlopen(request):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise urllib.error.HTTPError(
+                    url="https://translation.example/v1/chat/completions",
+                    code=429,
+                    msg="rate limited",
+                    hdrs=Message(),
+                    fp=io.BytesIO(b'{"error":"rate limited"}'),
+                )
+            return _FakeHTTPResponse(
+                _chat_payload(
+                    json.dumps(
+                        [{"segment_number": 1, "text": "안녕"}], ensure_ascii=False
+                    )
+                )
+            )
+
+        with (
+            patch(
+                "vid_to_sub_app.cli.translation.urllib.request.urlopen",
+                side_effect=fake_urlopen,
+            ),
+            patch("vid_to_sub_app.cli.translation.time.sleep") as sleep,
+            redirect_stdout(stdout_buffer),
+            redirect_stderr(stderr_buffer),
+        ):
+            translated_segments, _ = translate_segments_openai_compatible(
+                segments=segments,
+                target_language="ko",
+                translation_model="gpt-4.1-mini",
+                translation_base_url="https://translation.example/v1",
+                translation_api_key="secret",
+                source_language="en",
+                chunk_size=1,
+            )
+
+        self.assertEqual(["안녕"], [segment["text"] for segment in translated_segments])
+        self.assertEqual(2, calls)
+        sleep.assert_called_once_with(1.0)
+        retry_event = next(
+            event
+            for event in _event_payloads(stderr_buffer)
+            if event["event"] == "translation_http_retry"
+        )
+        self.assertEqual(429, retry_event["http_status"])
+        self.assertEqual("http_429", retry_event["reason"])
+        self.assertEqual("translate", retry_event["stage"])
+        self.assertGreater(retry_event["payload_chars"], 0)
+
+    def test_translation_retries_after_transient_url_error(self) -> None:
+        segments = [{"start": 0.0, "end": 1.0, "text": "Hello"}]
+        calls = 0
+        stderr_buffer = io.StringIO()
+
+        def fake_urlopen(request):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise urllib.error.URLError("temporary dns failure")
+            return _FakeHTTPResponse(
+                _chat_payload(
+                    json.dumps(
+                        [{"segment_number": 1, "text": "안녕"}], ensure_ascii=False
+                    )
+                )
+            )
+
+        with (
+            patch(
+                "vid_to_sub_app.cli.translation.urllib.request.urlopen",
+                side_effect=fake_urlopen,
+            ),
+            patch("vid_to_sub_app.cli.translation.time.sleep") as sleep,
+            redirect_stdout(io.StringIO()),
+            redirect_stderr(stderr_buffer),
+        ):
+            translated_segments, _ = translate_segments_openai_compatible(
+                segments=segments,
+                target_language="ko",
+                translation_model="gpt-4.1-mini",
+                translation_base_url="https://translation.example/v1",
+                translation_api_key="secret",
+                source_language="en",
+                chunk_size=1,
+            )
+
+        self.assertEqual(["안녕"], [segment["text"] for segment in translated_segments])
+        self.assertEqual(2, calls)
+        sleep.assert_called_once_with(1.0)
+        retry_event = next(
+            event
+            for event in _event_payloads(stderr_buffer)
+            if event["event"] == "translation_http_retry"
+        )
+        self.assertIsNone(retry_event["http_status"])
+        self.assertIn("temporary dns failure", retry_event["reason"])
+        self.assertEqual("translate", retry_event["stage"])
+        self.assertGreater(retry_event["payload_chars"], 0)
 
     def test_translation_retries_after_legacy_string_array_count_mismatch(
         self,
@@ -496,8 +853,8 @@ class TranslationPipelineTests(unittest.TestCase):
             for event in _event_payloads(stderr_buffer)
             if event["event"] == "translation_batch_result"
         )
-        self.assertEqual(3, batch_result["requested_count"])
-        self.assertEqual(1, batch_result["blank_or_whitespace_count"])
+        self.assertEqual(2, batch_result["requested_count"])
+        self.assertEqual(0, batch_result["blank_or_whitespace_count"])
         self.assertEqual(2, batch_result["effective_sent_count"])
         self.assertEqual(
             ["안녕", "   ", "세상"],
@@ -564,6 +921,79 @@ class TranslationPipelineTests(unittest.TestCase):
             ["번역-1", "번역-2", "번역-3"],
             [segment["text"] for segment in translated_segments],
         )
+
+    def test_translation_transport_errors_shrink_batches(self) -> None:
+        segments = [
+            {"start": 0.0, "end": 1.0, "text": "one"},
+            {"start": 1.0, "end": 2.0, "text": "two"},
+            {"start": 2.0, "end": 3.0, "text": "three"},
+        ]
+        request_segment_numbers: list[list[int]] = []
+        client_request_ids: list[str | None] = []
+        stderr_buffer = io.StringIO()
+
+        def fake_urlopen(request):
+            payload = json.loads(request.data.decode("utf-8"))
+            user_payload = json.loads(payload["messages"][1]["content"])
+            segment_numbers = user_payload["segment_numbers"]
+            request_segment_numbers.append(segment_numbers)
+            client_request_ids.append(request.headers.get("X-client-request-id"))
+            if segment_numbers == [1, 2, 3]:
+                raise urllib.error.HTTPError(
+                    url=request.full_url,
+                    code=429,
+                    msg="rate limited",
+                    hdrs=Message(),
+                    fp=io.BytesIO(b'{"error":"rate limited"}'),
+                )
+            items = [
+                {"segment_number": number, "text": f"ok-{number}"}
+                for number in segment_numbers
+            ]
+            return _FakeHTTPResponse(
+                _chat_payload(json.dumps(items, ensure_ascii=False))
+            )
+
+        with (
+            patch(
+                "vid_to_sub_app.cli.translation.urllib.request.urlopen",
+                side_effect=fake_urlopen,
+            ),
+            patch("vid_to_sub_app.cli.translation.time.sleep") as sleep,
+            redirect_stdout(io.StringIO()),
+            redirect_stderr(stderr_buffer),
+        ):
+            translated_segments, _ = translate_segments_openai_compatible(
+                segments=segments,
+                target_language="ko",
+                translation_model="gpt-4.1-mini",
+                translation_base_url="https://translation.example/v1",
+                translation_api_key="secret",
+                source_language="en",
+                chunk_size=3,
+            )
+
+        self.assertEqual([[1, 2, 3]] * 4, request_segment_numbers[:4])
+        self.assertEqual([[1], [2], [3]], request_segment_numbers[4:])
+        self.assertEqual(
+            ["ok-1", "ok-2", "ok-3"], [s["text"] for s in translated_segments]
+        )
+        self.assertEqual(3, sleep.call_count)
+        self.assertTrue(all(client_request_ids))
+        self.assertEqual(1, len(set(client_request_ids[:4])))
+        self.assertEqual(3, len(set(client_request_ids[4:])))
+        self.assertTrue(
+            set(client_request_ids[:4]).isdisjoint(set(client_request_ids[4:]))
+        )
+        transport_event = next(
+            event
+            for event in _event_payloads(stderr_buffer)
+            if event["event"] == "translation_batch_transport_error"
+        )
+        self.assertEqual("translate", transport_event["stage"])
+        self.assertEqual(429, transport_event["http_status"])
+        self.assertEqual(1, transport_event["next_retry_size"])
+        self.assertGreater(transport_event["payload_chars"], 0)
 
     def test_translation_retries_after_json_parse_failure(self) -> None:
         segments = [
@@ -895,6 +1325,100 @@ class TranslationPipelineTests(unittest.TestCase):
             batch_result["endpoint"],
         )
 
+    def test_max_payload_chars_splits_translation_batches(self) -> None:
+        segments = [
+            {"start": 0.0, "end": 1.0, "text": "A" * 40},
+            {"start": 1.0, "end": 2.0, "text": "B" * 40},
+            {"start": 2.0, "end": 3.0, "text": "C" * 40},
+        ]
+        request_segment_numbers: list[list[int]] = []
+
+        def fake_urlopen(request):
+            payload = json.loads(request.data.decode("utf-8"))
+            user_payload = json.loads(payload["messages"][1]["content"])
+            segment_numbers = user_payload["segment_numbers"]
+            request_segment_numbers.append(segment_numbers)
+            items = [
+                {"segment_number": number, "text": f"ok-{number}"}
+                for number in segment_numbers
+            ]
+            return _FakeHTTPResponse(
+                _chat_payload(json.dumps(items, ensure_ascii=False))
+            )
+
+        with patch(
+            "vid_to_sub_app.cli.translation.urllib.request.urlopen",
+            side_effect=fake_urlopen,
+        ):
+            with redirect_stdout(io.StringIO()):
+                translated_segments, info = translate_segments_openai_compatible(
+                    segments=segments,
+                    target_language="ko",
+                    translation_model="gpt-4.1-mini",
+                    translation_base_url="https://translation.example/v1",
+                    translation_api_key="secret",
+                    source_language="en",
+                    chunk_size=3,
+                    max_payload_chars=100,
+                )
+
+        self.assertEqual([[1], [2], [3]], request_segment_numbers)
+        self.assertEqual(
+            ["ok-1", "ok-2", "ok-3"], [s["text"] for s in translated_segments]
+        )
+        self.assertEqual(100, info["max_payload_chars"])
+
+    def test_translate_resume_skips_completed_segments_and_tracks_resumed_count(
+        self,
+    ) -> None:
+        segments = [
+            {"start": 0.0, "end": 1.0, "text": "one"},
+            {"start": 1.0, "end": 2.0, "text": "two"},
+            {"start": 2.0, "end": 3.0, "text": "three"},
+        ]
+        request_segment_numbers: list[list[int]] = []
+        batch_successes: list[tuple[list[int], list[str]]] = []
+
+        def fake_urlopen(request):
+            payload = json.loads(request.data.decode("utf-8"))
+            user_payload = json.loads(payload["messages"][1]["content"])
+            segment_numbers = user_payload["segment_numbers"]
+            request_segment_numbers.append(segment_numbers)
+            items = [
+                {"segment_number": number, "text": f"ok-{number}"}
+                for number in segment_numbers
+            ]
+            return _FakeHTTPResponse(
+                _chat_payload(json.dumps(items, ensure_ascii=False))
+            )
+
+        with patch(
+            "vid_to_sub_app.cli.translation.urllib.request.urlopen",
+            side_effect=fake_urlopen,
+        ):
+            with redirect_stdout(io.StringIO()):
+                translated_segments, info = translate_segments_openai_compatible(
+                    segments=segments,
+                    target_language="ko",
+                    translation_model="gpt-4.1-mini",
+                    translation_base_url="https://translation.example/v1",
+                    translation_api_key="secret",
+                    source_language="en",
+                    chunk_size=3,
+                    resume_text_by_number={2: "cached-2"},
+                    on_batch_success=lambda numbers, texts: batch_successes.append(
+                        (list(numbers), list(texts))
+                    ),
+                )
+
+        self.assertEqual([[1, 3]], request_segment_numbers)
+        self.assertEqual(
+            ["ok-1", "cached-2", "ok-3"],
+            [segment["text"] for segment in translated_segments],
+        )
+        self.assertEqual(1, info["resumed_segment_count"])
+        self.assertEqual([([1, 3], ["ok-1", "ok-3"])], batch_successes)
+
     def test_retry_logs_use_actual_chunk_size_and_unique_batch_ids(self) -> None:
         segments = [
             {"start": 0.0, "end": 1.0, "text": "one"},
@@ -973,15 +1497,15 @@ class TranslationPipelineTests(unittest.TestCase):
                 if event["event"] == "translation_batch_result"
             ]
             self.assertEqual(2, contract_event["chunk_size"])
-            self.assertEqual(3, contract_event["requested_count"])
-            self.assertEqual(1, contract_event["blank_or_whitespace_count"])
+            self.assertEqual(2, contract_event["requested_count"])
+            self.assertEqual(0, contract_event["blank_or_whitespace_count"])
             self.assertEqual(1, contract_event["next_retry_size"])
             self.assertEqual([1, 1], [event["chunk_size"] for event in result_events])
             self.assertEqual(
-                [3, 3], [event["requested_count"] for event in result_events]
+                [2, 2], [event["requested_count"] for event in result_events]
             )
             self.assertEqual(
-                [1, 1],
+                [0, 0],
                 [event["blank_or_whitespace_count"] for event in result_events],
             )
             self.assertEqual(
@@ -1028,6 +1552,9 @@ class TranslationPipelineTests(unittest.TestCase):
                         translation_model="gpt-4.1-mini",
                         translation_base_url="https://translation.example/v1",
                         translation_api_key="translation-secret",
+                        chunk_size=7,
+                        max_payload_chars=4321,
+                        translation_mode="best-effort",
                     )
                 )
 
@@ -1036,6 +1563,9 @@ class TranslationPipelineTests(unittest.TestCase):
             final_segments,
         )
         self.assertEqual("auto", info["mode"])
+        self.assertEqual(7, info["chunk_size"])
+        self.assertEqual(4321, info["max_payload_chars"])
+        self.assertEqual("best-effort", info["translation_mode"])
         self.assertEqual(
             "https://translation.example/v1/chat/completions",
             captured_requests[0].full_url,
@@ -1045,6 +1575,73 @@ class TranslationPipelineTests(unittest.TestCase):
             "silently fall back to contextual correction",
             payload["messages"][0]["content"],
         )
+        self.assertEqual(
+            "application/json", captured_requests[0].headers["Content-type"]
+        )
+        self.assertTrue(
+            captured_requests[0].headers["X-client-request-id"].startswith("pp-")
+        )
+
+    def test_postprocess_resume_skips_completed_segments_and_tracks_resumed_count(
+        self,
+    ) -> None:
+        request_segment_numbers: list[list[int]] = []
+        batch_successes: list[tuple[list[int], list[str]]] = []
+
+        def fake_urlopen(request):
+            payload = json.loads(request.data.decode("utf-8"))
+            user_payload = json.loads(payload["messages"][1]["content"])
+            segment_numbers = user_payload["segment_numbers"]
+            request_segment_numbers.append(segment_numbers)
+            items = [
+                {"segment_number": number, "text": f"final-{number}"}
+                for number in segment_numbers
+            ]
+            return _FakeHTTPResponse(
+                _chat_payload(json.dumps(items, ensure_ascii=False))
+            )
+
+        with patch(
+            "vid_to_sub_app.cli.translation.urllib.request.urlopen",
+            side_effect=fake_urlopen,
+        ):
+            with redirect_stdout(io.StringIO()):
+                final_segments, info = (
+                    postprocess_translated_segments_openai_compatible(
+                        source_segments=[
+                            {"start": 0.0, "end": 1.0, "text": "one"},
+                            {"start": 1.0, "end": 2.0, "text": "two"},
+                            {"start": 2.0, "end": 3.0, "text": "three"},
+                        ],
+                        translated_segments=[
+                            {"start": 0.0, "end": 1.0, "text": "draft-1"},
+                            {"start": 1.0, "end": 2.0, "text": "draft-2"},
+                            {"start": 2.0, "end": 3.0, "text": "draft-3"},
+                        ],
+                        target_language="ko",
+                        postprocess_mode="auto",
+                        postprocess_model=None,
+                        postprocess_base_url=None,
+                        postprocess_api_key=None,
+                        source_language="en",
+                        translation_model="gpt-4.1-mini",
+                        translation_base_url="https://translation.example/v1",
+                        translation_api_key="secret",
+                        chunk_size=3,
+                        resume_text_by_number={2: "cached-final-2"},
+                        on_batch_success=lambda numbers, texts: batch_successes.append(
+                            (list(numbers), list(texts))
+                        ),
+                    )
+                )
+
+        self.assertEqual([[1, 3]], request_segment_numbers)
+        self.assertEqual(
+            ["final-1", "cached-final-2", "final-3"],
+            [segment["text"] for segment in final_segments],
+        )
+        self.assertEqual(1, info["resumed_segment_count"])
+        self.assertEqual([([1, 3], ["final-1", "final-3"])], batch_successes)
 
     def test_translation_fingerprint_distinguishes_worker_identity(self) -> None:
         segments = [{"start": 0.0, "end": 1.0, "text": "Hello"}]
@@ -1226,6 +1823,81 @@ class TranslationPipelineTests(unittest.TestCase):
         run_stage2_mock.assert_called_once_with(artifact_path.resolve(), ANY)
         run_stage1_mock.assert_not_called()
 
+    def test_translate_from_artifact_emits_stage2_job_events(self) -> None:
+        artifact_path = Path("/tmp/movie.stage1.json")
+        artifact: StageArtifact = {
+            "schema_version": ARTIFACT_SCHEMA_VERSION,
+            "source_path": "/tmp/movie.mp4",
+            "output_base": "/tmp",
+            "source_fingerprint": "10:1700000000",
+            "backend": "faster-whisper",
+            "device": "cpu",
+            "model": "large-v3",
+            "language": "en",
+            "language_probability": 0.99,
+            "duration": 1.0,
+            "quality": {"suspicious": False, "reasons": []},
+            "target_lang": "ko",
+            "formats": ["srt"],
+            "primary_outputs": ["/tmp/movie.srt"],
+            "segments": [{"start": 0.0, "end": 1.0, "text": "Hello"}],
+            "stage_status": {
+                "transcription_complete": True,
+                "translation_pending": True,
+                "translation_complete": False,
+                "translation_failed": False,
+                "translation_error": None,
+            },
+        }
+        stage2_result = ProcessResult(
+            success=True,
+            video_path="/tmp/movie.mp4",
+            folder_hash="folder-hash",
+            folder_path="/tmp",
+            worker_id=0,
+            elapsed_sec=0.1,
+            language="en",
+            output_paths=["/tmp/movie.ko.srt"],
+            segments=1,
+            artifact_path=str(artifact_path),
+            artifact_metadata=build_stage_artifact_metadata(artifact_path, artifact),
+        )
+
+        stdout_buf = io.StringIO()
+        with (
+            patch(
+                "vid_to_sub_app.cli.main.load_stage_artifact",
+                return_value=artifact,
+            ),
+            patch(
+                "vid_to_sub_app.cli.main.run_stage2",
+                return_value=stage2_result,
+            ),
+            redirect_stdout(stdout_buf),
+        ):
+            exit_code = main(
+                [
+                    "--translate-from-artifact",
+                    str(artifact_path),
+                    "--translate-to",
+                    "ko",
+                ]
+            )
+
+        payloads = _event_payloads(stdout_buf)
+        started = next(
+            payload for payload in payloads if payload.get("event") == "job_started"
+        )
+        finished = next(
+            payload for payload in payloads if payload.get("event") == "job_finished"
+        )
+
+        self.assertEqual(0, exit_code)
+        self.assertEqual("/tmp/movie.mp4", started.get("video_path"))
+        self.assertEqual("/tmp/movie.mp4", finished.get("video_path"))
+        self.assertEqual("done", finished.get("status"))
+        self.assertEqual(str(artifact_path), finished.get("artifact_path"))
+
     def test_mutually_exclusive_stage_flags(self) -> None:
         with patch.object(
             argparse.ArgumentParser,
@@ -1264,6 +1936,9 @@ class TestStageArtifact(unittest.TestCase):
                 "device": "cuda",
                 "model": "large-v3",
                 "language": "en",
+                "language_probability": 0.99,
+                "duration": 1.0,
+                "quality": {"suspicious": False, "reasons": []},
                 "target_lang": "ko",
                 "formats": ["srt", "json"],
                 "primary_outputs": [
@@ -1349,6 +2024,7 @@ class TestRunnerStageSplit(unittest.TestCase):
             "model": "large-v3",
             "device": "cpu",
             "language": None,
+            "content_type": "auto",
             "beam_size": 5,
             "compute_type": "int8",
             "hf_token": None,
@@ -1416,6 +2092,42 @@ class TestRunnerStageSplit(unittest.TestCase):
         self.assertFalse(metadata.get("translation_failed"))
         write_artifact.assert_called_once()
 
+    def test_stage1_passes_content_type_to_transcribe(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            video_path = (temp_path / "movie.mp4").resolve()
+            video_path.write_bytes(b"video")
+            output_dir = (temp_path / "out").resolve()
+            task = {
+                "video_path": str(video_path),
+                "folder_hash": "folder-hash",
+                "folder_path": str(video_path.parent),
+            }
+            args = self._make_args(content_type="music", language="ja")
+            segments = [{"start": 0.0, "end": 1.0, "text": "Hello"}]
+            info = {"language": "ja", "duration": 1.0}
+            written_paths = [output_dir / "movie.srt"]
+            artifact_path = output_dir / f"movie{ARTIFACT_FILENAME_SUFFIX}"
+
+            with (
+                patch(
+                    "vid_to_sub_app.cli.runner.transcribe",
+                    return_value=(segments, info),
+                ) as mock_transcribe,
+                patch(
+                    "vid_to_sub_app.cli.runner.write_outputs",
+                    return_value=written_paths,
+                ),
+                patch(
+                    "vid_to_sub_app.cli.runner.write_stage_artifact",
+                    return_value=artifact_path,
+                ),
+            ):
+                result = run_stage1(task, args, frozenset({"srt"}), output_dir, 2, 0)
+
+        self.assertTrue(result.success)
+        self.assertEqual("music", mock_transcribe.call_args.kwargs["content_type"])
+
     def test_stage2_does_not_call_transcribe(self) -> None:
         with TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)
@@ -1432,6 +2144,9 @@ class TestRunnerStageSplit(unittest.TestCase):
                 "device": "cpu",
                 "model": "large-v3",
                 "language": "en",
+                "language_probability": 0.99,
+                "duration": 1.0,
+                "quality": {"suspicious": False, "reasons": []},
                 "target_lang": "ko",
                 "formats": ["srt"],
                 "primary_outputs": [str(output_dir / "movie.srt")],
@@ -1529,7 +2244,115 @@ class TestRunStage2Idempotency(unittest.TestCase):
         args.translation_base_url = "http://localhost/v1"
         args.translation_api_key = "test-key"
         args.postprocess_translation = False
+        args.force_translate = False
         return args
+
+    def test_run_stage2_blocks_suspicious_artifact_without_force_translate(
+        self,
+    ) -> None:
+        with TemporaryDirectory() as tmp:
+            tmpdir = Path(tmp)
+            source = tmpdir / "movie.mp4"
+            srt = tmpdir / "movie.srt"
+            srt.write_text("1\n00:00:00,000 --> 00:00:01,000\nHello")
+
+            artifact: StageArtifact = {
+                "schema_version": ARTIFACT_SCHEMA_VERSION,
+                "source_path": str(source),
+                "output_base": str(tmpdir),
+                "source_fingerprint": "1024:1700000000",
+                "backend": "whisper-cpp",
+                "device": "cpu",
+                "model": "large-v3",
+                "language": "en",
+                "language_probability": 0.41,
+                "duration": 1.0,
+                "quality": {
+                    "suspicious": True,
+                    "reasons": ["low_language_probability"],
+                },
+                "target_lang": "ko",
+                "formats": ["srt"],
+                "segments": [{"start": 0.0, "end": 1.0, "text": "Hello"}],
+                "primary_outputs": [str(srt)],
+                "stage_status": {
+                    "transcription_complete": True,
+                    "translation_pending": True,
+                    "translation_complete": False,
+                    "translation_failed": False,
+                    "translation_error": None,
+                },
+            }
+            artifact_path = tmpdir / "movie.stage1.json"
+            write_stage_artifact(artifact, tmpdir, source)
+
+            args = self._make_args(tmpdir)
+            with patch(
+                "vid_to_sub_app.cli.runner.translate_segments_openai_compatible"
+            ) as mock_translate:
+                result = run_stage2(artifact_path, args)
+
+            loaded_artifact = load_stage_artifact(artifact_path)
+
+        self.assertFalse(result.success)
+        self.assertIn("--force-translate", result.error or "")
+        mock_translate.assert_not_called()
+        self.assertTrue(loaded_artifact["stage_status"]["translation_failed"])
+        self.assertFalse(loaded_artifact["stage_status"]["translation_complete"])
+        self.assertEqual(
+            result.error, loaded_artifact["stage_status"]["translation_error"]
+        )
+
+    def test_run_stage2_allows_suspicious_artifact_when_force_translate_enabled(
+        self,
+    ) -> None:
+        with TemporaryDirectory() as tmp:
+            tmpdir = Path(tmp)
+            source = tmpdir / "movie.mp4"
+            srt = tmpdir / "movie.srt"
+            srt.write_text("1\n00:00:00,000 --> 00:00:01,000\nHello")
+
+            artifact: StageArtifact = {
+                "schema_version": ARTIFACT_SCHEMA_VERSION,
+                "source_path": str(source),
+                "output_base": str(tmpdir),
+                "source_fingerprint": "1024:1700000000",
+                "backend": "whisper-cpp",
+                "device": "cpu",
+                "model": "large-v3",
+                "language": "en",
+                "language_probability": 0.41,
+                "duration": 1.0,
+                "quality": {
+                    "suspicious": True,
+                    "reasons": ["low_language_probability"],
+                },
+                "target_lang": "ko",
+                "formats": ["srt"],
+                "segments": [{"start": 0.0, "end": 1.0, "text": "Hello"}],
+                "primary_outputs": [str(srt)],
+                "stage_status": {
+                    "transcription_complete": True,
+                    "translation_pending": True,
+                    "translation_complete": False,
+                    "translation_failed": False,
+                    "translation_error": None,
+                },
+            }
+            artifact_path = tmpdir / "movie.stage1.json"
+            write_stage_artifact(artifact, tmpdir, source)
+
+            args = self._make_args(tmpdir)
+            args.force_translate = True
+            translated_segs = [{"start": 0.0, "end": 1.0, "text": "안녕"}]
+            with patch(
+                "vid_to_sub_app.cli.runner.translate_segments_openai_compatible",
+                return_value=(translated_segs, {}),
+            ) as mock_translate:
+                result = run_stage2(artifact_path, args)
+
+        mock_translate.assert_called_once()
+        self.assertTrue(result.success, result.error)
 
     def test_run_stage2_skips_when_translation_complete_and_output_exists(
         self,
@@ -1560,6 +2383,9 @@ class TestRunStage2Idempotency(unittest.TestCase):
                 "device": "cpu",
                 "model": "large-v3",
                 "language": "en",
+                "language_probability": 0.99,
+                "duration": 1.0,
+                "quality": {"suspicious": False, "reasons": []},
                 "target_lang": "ko",
                 "formats": ["srt"],
                 "segments": [{"start": 0.0, "end": 1.0, "text": "Hello"}],
@@ -1614,6 +2440,9 @@ class TestRunStage2Idempotency(unittest.TestCase):
                 "device": "cpu",
                 "model": "large-v3",
                 "language": "en",
+                "language_probability": 0.99,
+                "duration": 1.0,
+                "quality": {"suspicious": False, "reasons": []},
                 "target_lang": "ko",
                 "formats": ["srt"],
                 "segments": [{"start": 0.0, "end": 1.0, "text": "Hello"}],
@@ -1645,6 +2474,186 @@ class TestRunStage2Idempotency(unittest.TestCase):
             self.assertTrue(metadata.get("translation_complete"))
             self.assertFalse(metadata.get("translation_failed"))
 
+    def test_run_stage2_persists_partial_progress_on_translation_failure(self) -> None:
+        with TemporaryDirectory() as tmp:
+            tmpdir = Path(tmp)
+            source = tmpdir / "movie.mp4"
+            srt = tmpdir / "movie.srt"
+            srt.write_text("1\n00:00:00,000 --> 00:00:01,000\nHello")
+            artifact: StageArtifact = {
+                "schema_version": ARTIFACT_SCHEMA_VERSION,
+                "source_path": str(source),
+                "output_base": str(tmpdir),
+                "source_fingerprint": "1024:1700000000",
+                "backend": "whisper-cpp",
+                "device": "cpu",
+                "model": "large-v3",
+                "language": "en",
+                "language_probability": 0.99,
+                "duration": 1.0,
+                "quality": {"suspicious": False, "reasons": []},
+                "target_lang": "ko",
+                "formats": ["srt"],
+                "segments": [
+                    {"start": 0.0, "end": 1.0, "text": "Hello"},
+                    {"start": 1.0, "end": 2.0, "text": "World"},
+                ],
+                "primary_outputs": [str(srt)],
+                "stage_status": {
+                    "transcription_complete": True,
+                    "translation_pending": True,
+                    "translation_complete": False,
+                    "translation_failed": False,
+                    "translation_error": None,
+                },
+            }
+            artifact_path = tmpdir / "movie.stage1.json"
+            write_stage_artifact(artifact, tmpdir, source)
+            args = self._make_args(tmpdir)
+            progress_path = tmpdir / "movie.stage2.progress.jsonl"
+
+            def fake_translate(**kwargs):
+                kwargs["on_batch_success"]([1], ["안녕"])
+                raise RuntimeError("boom")
+
+            with patch(
+                "vid_to_sub_app.cli.runner.translate_segments_openai_compatible",
+                side_effect=fake_translate,
+            ):
+                result = run_stage2(artifact_path, args)
+
+            self.assertFalse(result.success)
+            self.assertEqual("boom", result.error)
+            self.assertTrue(progress_path.exists())
+            progress_lines = progress_path.read_text(encoding="utf-8").splitlines()
+            self.assertEqual(1, len(progress_lines))
+            self.assertEqual(
+                {
+                    "stage": "translate",
+                    "items": [{"segment_number": 1, "text": "안녕"}],
+                },
+                json.loads(progress_lines[0]),
+            )
+            loaded_artifact = load_stage_artifact(artifact_path)
+            self.assertTrue(loaded_artifact["stage_status"]["translation_failed"])
+            self.assertEqual(
+                "boom", loaded_artifact["stage_status"]["translation_error"]
+            )
+
+    def test_run_stage2_resumes_from_progress_and_clears_sidecar_on_success(
+        self,
+    ) -> None:
+        with TemporaryDirectory() as tmp:
+            tmpdir = Path(tmp)
+            source = tmpdir / "movie.mp4"
+            srt = tmpdir / "movie.srt"
+            srt.write_text("1\n00:00:00,000 --> 00:00:01,000\nHello")
+            artifact: StageArtifact = {
+                "schema_version": ARTIFACT_SCHEMA_VERSION,
+                "source_path": str(source),
+                "output_base": str(tmpdir),
+                "source_fingerprint": "1024:1700000000",
+                "backend": "whisper-cpp",
+                "device": "cpu",
+                "model": "large-v3",
+                "language": "en",
+                "language_probability": 0.99,
+                "duration": 1.0,
+                "quality": {"suspicious": False, "reasons": []},
+                "target_lang": "ko",
+                "formats": ["srt"],
+                "segments": [
+                    {"start": 0.0, "end": 1.0, "text": "Hello"},
+                    {"start": 1.0, "end": 2.0, "text": "World"},
+                ],
+                "primary_outputs": [str(srt)],
+                "stage_status": {
+                    "transcription_complete": True,
+                    "translation_pending": True,
+                    "translation_complete": False,
+                    "translation_failed": False,
+                    "translation_error": None,
+                },
+            }
+            artifact_path = tmpdir / "movie.stage1.json"
+            write_stage_artifact(artifact, tmpdir, source)
+            progress_path = tmpdir / "movie.stage2.progress.jsonl"
+            progress_path.write_text(
+                "\n".join(
+                    [
+                        json.dumps(
+                            {
+                                "stage": "translate",
+                                "items": [{"segment_number": 1, "text": "cached-1"}],
+                            }
+                        ),
+                        json.dumps(
+                            {
+                                "stage": "postprocess",
+                                "items": [{"segment_number": 1, "text": "polished-1"}],
+                            }
+                        ),
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            args = self._make_args(tmpdir)
+            args.postprocess_translation = True
+            args.postprocess_mode = "auto"
+            args.postprocess_model = None
+            args.postprocess_base_url = None
+            args.postprocess_api_key = None
+            translate_resume: dict[int, str] | None = None
+            postprocess_resume: dict[int, str] | None = None
+
+            def fake_translate(**kwargs):
+                nonlocal translate_resume
+                translate_resume = kwargs["resume_text_by_number"]
+                kwargs["on_batch_success"]([2], ["fresh-2"])
+                return (
+                    [
+                        {"start": 0.0, "end": 1.0, "text": "cached-1"},
+                        {"start": 1.0, "end": 2.0, "text": "fresh-2"},
+                    ],
+                    {"model": "test-model", "resumed_segment_count": 1},
+                )
+
+            def fake_postprocess(**kwargs):
+                nonlocal postprocess_resume
+                postprocess_resume = kwargs["resume_text_by_number"]
+                kwargs["on_batch_success"]([2], ["polished-2"])
+                return (
+                    [
+                        {"start": 0.0, "end": 1.0, "text": "polished-1"},
+                        {"start": 1.0, "end": 2.0, "text": "polished-2"},
+                    ],
+                    {"model": "post-model", "resumed_segment_count": 1},
+                )
+
+            with (
+                patch(
+                    "vid_to_sub_app.cli.runner.translate_segments_openai_compatible",
+                    side_effect=fake_translate,
+                ),
+                patch(
+                    "vid_to_sub_app.cli.runner.postprocess_translated_segments_openai_compatible",
+                    side_effect=fake_postprocess,
+                ),
+                patch(
+                    "vid_to_sub_app.cli.runner.write_outputs",
+                    return_value=[tmpdir / "movie.ko.srt"],
+                ),
+            ):
+                result = run_stage2(artifact_path, args)
+
+            self.assertTrue(result.success, result.error)
+            self.assertEqual({1: "cached-1"}, translate_resume)
+            self.assertEqual({1: "polished-1"}, postprocess_resume)
+            self.assertFalse(progress_path.exists())
+            loaded_artifact = load_stage_artifact(artifact_path)
+            self.assertTrue(loaded_artifact["stage_status"]["translation_complete"])
+            self.assertFalse(loaded_artifact["stage_status"]["translation_failed"])
 
     def test_fingerprint_emits_all_required_fields(self) -> None:
         segments = [{"start": 0.0, "end": 1.0, "text": "Hello"}]
@@ -1652,7 +2661,9 @@ class TestRunStage2Idempotency(unittest.TestCase):
         def fake_urlopen(request):
             return _FakeHTTPResponse(
                 _chat_payload(
-                    json.dumps([{"segment_number": 1, "text": "안녕"}], ensure_ascii=False)
+                    json.dumps(
+                        [{"segment_number": 1, "text": "안녕"}], ensure_ascii=False
+                    )
                 )
             )
 
@@ -1714,7 +2725,9 @@ class TestRunStage2Idempotency(unittest.TestCase):
         def fake_urlopen(request):
             return _FakeHTTPResponse(
                 _chat_payload(
-                    json.dumps([{"segment_number": 1, "text": "안녕"}], ensure_ascii=False)
+                    json.dumps(
+                        [{"segment_number": 1, "text": "안녕"}], ensure_ascii=False
+                    )
                 )
             )
 
@@ -1817,9 +2830,7 @@ class TestRunStage2Idempotency(unittest.TestCase):
 
         def fake_urlopen(request):
             return _FakeHTTPResponse(
-                _chat_payload(
-                    json.dumps([{"text": "missing-key"}], ensure_ascii=False)
-                )
+                _chat_payload(json.dumps([{"text": "missing-key"}], ensure_ascii=False))
             )
 
         with patch(
@@ -1860,10 +2871,14 @@ class TestRunStage2Idempotency(unittest.TestCase):
                     for n in segment_numbers
                     if n != 50
                 ]
-                return _FakeHTTPResponse(_chat_payload(json.dumps(items, ensure_ascii=False)))
+                return _FakeHTTPResponse(
+                    _chat_payload(json.dumps(items, ensure_ascii=False))
+                )
             # All smaller batches succeed
             items = [{"segment_number": n, "text": f"ok-{n}"} for n in segment_numbers]
-            return _FakeHTTPResponse(_chat_payload(json.dumps(items, ensure_ascii=False)))
+            return _FakeHTTPResponse(
+                _chat_payload(json.dumps(items, ensure_ascii=False))
+            )
 
         with patch(
             "vid_to_sub_app.cli.translation.urllib.request.urlopen",
@@ -1888,8 +2903,12 @@ class TestRunStage2Idempotency(unittest.TestCase):
             for e in _event_payloads(stderr_buf)
             if e["event"] == "translation_batch_contract_error"
         ]
-        self.assertTrue(contract_events, "no contract error emitted for 100\u219299 mismatch")
-        self.assertEqual("segment_number_contract_mismatch", contract_events[0]["reason"])
+        self.assertTrue(
+            contract_events, "no contract error emitted for 100\u219299 mismatch"
+        )
+        self.assertEqual(
+            "segment_number_contract_mismatch", contract_events[0]["reason"]
+        )
         self.assertNotEqual([], contract_events[0]["parsed_sample"])
         self.assertEqual(100, len(translated_segments))
 
@@ -1920,7 +2939,9 @@ class TestRunStage2Idempotency(unittest.TestCase):
                     )
                 )
             items = [{"segment_number": n, "text": f"ok-{n}"} for n in segment_numbers]
-            return _FakeHTTPResponse(_chat_payload(json.dumps(items, ensure_ascii=False)))
+            return _FakeHTTPResponse(
+                _chat_payload(json.dumps(items, ensure_ascii=False))
+            )
 
         with patch(
             "vid_to_sub_app.cli.translation.urllib.request.urlopen",
@@ -1946,7 +2967,9 @@ class TestRunStage2Idempotency(unittest.TestCase):
             if e["event"] == "translation_batch_contract_error"
         ]
         self.assertTrue(contract_events)
-        self.assertEqual("segment_number_contract_mismatch", contract_events[0]["reason"])
+        self.assertEqual(
+            "segment_number_contract_mismatch", contract_events[0]["reason"]
+        )
 
     def test_translation_retries_on_multi_item_unexpected_segment_number(self) -> None:
         segments = [
@@ -1975,7 +2998,9 @@ class TestRunStage2Idempotency(unittest.TestCase):
                     )
                 )
             items = [{"segment_number": n, "text": f"ok-{n}"} for n in segment_numbers]
-            return _FakeHTTPResponse(_chat_payload(json.dumps(items, ensure_ascii=False)))
+            return _FakeHTTPResponse(
+                _chat_payload(json.dumps(items, ensure_ascii=False))
+            )
 
         with patch(
             "vid_to_sub_app.cli.translation.urllib.request.urlopen",
@@ -2001,7 +3026,11 @@ class TestRunStage2Idempotency(unittest.TestCase):
             if e["event"] == "translation_batch_contract_error"
         ]
         self.assertTrue(contract_events)
-        self.assertEqual("segment_number_contract_mismatch", contract_events[0]["reason"])
+        self.assertEqual(
+            "segment_number_contract_mismatch", contract_events[0]["reason"]
+        )
+
+
 if __name__ == "__main__":
     _ = unittest.main()
 
@@ -2042,6 +3071,9 @@ class TestOverwriteTranslationFlag(unittest.TestCase):
                 "device": "cpu",
                 "model": "large-v3",
                 "language": "en",
+                "language_probability": 0.99,
+                "duration": 1.0,
+                "quality": {"suspicious": False, "reasons": []},
                 "target_lang": "ko",
                 "formats": ["srt"],
                 "segments": [{"start": 0.0, "end": 1.0, "text": "Hello"}],
@@ -2069,6 +3101,22 @@ class TestOverwriteTranslationFlag(unittest.TestCase):
             # --overwrite-translation=True must cause the API to be called again.
             mock_translate.assert_called_once()
             self.assertTrue(result.success, result.error)
+
+
+class TestParserFlags(unittest.TestCase):
+    def test_content_type_flag_parses(self) -> None:
+        parser = build_parser()
+
+        args = parser.parse_args(["/tmp/input", "--content-type", "music"])
+
+        self.assertEqual("music", args.content_type)
+
+    def test_force_translate_flag_parses(self) -> None:
+        parser = build_parser()
+
+        args = parser.parse_args(["/tmp/input", "--force-translate"])
+
+        self.assertTrue(args.force_translate)
 
 
 class TestLegacyInlineRollback(unittest.TestCase):
@@ -2196,21 +3244,21 @@ class TestParallelLoopEventParity(unittest.TestCase):
         self,
         run_fn,  # _run_stage1_parallel or run_parallel
         args: argparse.Namespace,
-        manifest: dict,
-    ) -> tuple[list[dict], list[dict]]:
+        manifest: dict[str, Any],
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
         """Run run_fn and collect emitted events, returning (job_events, folder_events)."""
         from vid_to_sub_app.shared.constants import EVENT_PREFIX
         import sys
 
-        job_events: list[dict] = []
-        folder_events: list[dict] = []
+        job_events: list[dict[str, Any]] = []
+        folder_events: list[dict[str, Any]] = []
 
         def capture_stdout(line: str) -> None:
             line = line.strip()
             if not line.startswith(EVENT_PREFIX):
                 return
             try:
-                payload = json.loads(line[len(EVENT_PREFIX):])
+                payload = json.loads(line[len(EVENT_PREFIX) :])
             except json.JSONDecodeError:
                 return
             if payload.get("event") == "job_finished":
@@ -2235,14 +3283,17 @@ class TestParallelLoopEventParity(unittest.TestCase):
             [
                 str(tmpdir),
                 "--stage1-only",
-                "--translate-to", "ko",
-                "--workers", "1",
-                "--backend-threads", "2",
+                "--translate-to",
+                "ko",
+                "--workers",
+                "1",
+                "--backend-threads",
+                "2",
             ]
         )
         return args
 
-    def _make_manifest_and_video(self, tmpdir: Path) -> tuple[dict, Path]:
+    def _make_manifest_and_video(self, tmpdir: Path) -> tuple[dict[str, Any], Path]:
         """Create one fake video and a corresponding run manifest."""
         video = tmpdir / "clip.mp4"
         video.write_bytes(b"fake")
@@ -2260,13 +3311,17 @@ class TestParallelLoopEventParity(unittest.TestCase):
 
     def _run_stage1_parallel_via_import(self, manifest, args, formats, output_dir):
         from vid_to_sub_app.cli.main import _run_stage1_parallel
+
         return _run_stage1_parallel(manifest, args, formats, output_dir)
 
     def _run_parallel_via_import(self, manifest, args, formats, output_dir):
         from vid_to_sub_app.cli.runner import run_parallel
+
         return run_parallel(manifest, args, formats, output_dir)
 
-    def _fake_run_stage1(self, task, args, formats, output_dir, backend_threads, worker_id):
+    def _fake_run_stage1(
+        self, task, args, formats, output_dir, backend_threads, worker_id
+    ):
         """Minimal stub: returns a successful ProcessResult without actual transcription."""
         fake_srt = Path(str(task["folder_path"])) / "clip.srt"
         fake_srt.write_text("1\n00:00:00,000 --> 00:00:01,000\nHi", encoding="utf-8")
@@ -2280,7 +3335,9 @@ class TestParallelLoopEventParity(unittest.TestCase):
             output_paths=[str(fake_srt)],
         )
 
-    def _fake_process_one(self, task, args, formats, output_dir, backend_threads, worker_id):
+    def _fake_process_one(
+        self, task, args, formats, output_dir, backend_threads, worker_id
+    ):
         """Minimal stub: returns a successful ProcessResult without actual transcription."""
         fake_srt = Path(str(task["folder_path"])) / "clip.srt"
         fake_srt.write_text("1\n00:00:00,000 --> 00:00:01,000\nHi", encoding="utf-8")
@@ -2307,7 +3364,10 @@ class TestParallelLoopEventParity(unittest.TestCase):
             manifest, _ = self._make_manifest_and_video(td)
 
             with (
-                patch("vid_to_sub_app.cli.main.run_stage1", side_effect=self._fake_run_stage1),
+                patch(
+                    "vid_to_sub_app.cli.main.run_stage1",
+                    side_effect=self._fake_run_stage1,
+                ),
                 patch("vid_to_sub_app.cli.manifest.persist_folder_manifest_state"),
             ):
                 job_events, folder_events = self._capture_events(
@@ -2318,16 +3378,20 @@ class TestParallelLoopEventParity(unittest.TestCase):
         job = job_events[0]
         missing = self._REQUIRED_JOB_FINISHED_KEYS - set(job.keys())
         self.assertEqual(
-            set(), missing,
+            set(),
+            missing,
             f"job_finished event missing required keys: {missing}",
         )
 
         # folder_finished should also fire when the single folder completes
-        self.assertGreaterEqual(len(folder_events), 1, "expected at least one folder_finished event")
+        self.assertGreaterEqual(
+            len(folder_events), 1, "expected at least one folder_finished event"
+        )
         folder = folder_events[0]
         missing_f = self._REQUIRED_FOLDER_FINISHED_KEYS - set(folder.keys())
         self.assertEqual(
-            set(), missing_f,
+            set(),
+            missing_f,
             f"folder_finished event missing required keys: {missing_f}",
         )
 
@@ -2347,7 +3411,10 @@ class TestParallelLoopEventParity(unittest.TestCase):
             manifest, _ = self._make_manifest_and_video(td)
 
             with (
-                patch("vid_to_sub_app.cli.runner.process_one", side_effect=self._fake_process_one),
+                patch(
+                    "vid_to_sub_app.cli.runner.process_one",
+                    side_effect=self._fake_process_one,
+                ),
                 patch("vid_to_sub_app.cli.manifest.persist_folder_manifest_state"),
             ):
                 job_events, folder_events = self._capture_events(
@@ -2358,19 +3425,25 @@ class TestParallelLoopEventParity(unittest.TestCase):
         job = job_events[0]
         missing = self._REQUIRED_JOB_FINISHED_KEYS - set(job.keys())
         self.assertEqual(
-            set(), missing,
+            set(),
+            missing,
             f"job_finished event missing required keys: {missing}",
         )
 
-        self.assertGreaterEqual(len(folder_events), 1, "expected at least one folder_finished event")
+        self.assertGreaterEqual(
+            len(folder_events), 1, "expected at least one folder_finished event"
+        )
         folder = folder_events[0]
         missing_f = self._REQUIRED_FOLDER_FINISHED_KEYS - set(folder.keys())
         self.assertEqual(
-            set(), missing_f,
+            set(),
+            missing_f,
             f"folder_finished event missing required keys: {missing_f}",
         )
 
-    def test_run_stage1_parallel_and_run_parallel_emit_same_job_finished_keys(self) -> None:
+    def test_run_stage1_parallel_and_run_parallel_emit_same_job_finished_keys(
+        self,
+    ) -> None:
         """Parity contract: both loops must emit an identical set of job_finished keys.
 
         This is the core guard for PR6: centralizing the worker loop must not silently
@@ -2384,7 +3457,10 @@ class TestParallelLoopEventParity(unittest.TestCase):
             manifest1, _ = self._make_manifest_and_video(td1)
 
             with (
-                patch("vid_to_sub_app.cli.main.run_stage1", side_effect=self._fake_run_stage1),
+                patch(
+                    "vid_to_sub_app.cli.main.run_stage1",
+                    side_effect=self._fake_run_stage1,
+                ),
                 patch("vid_to_sub_app.cli.manifest.persist_folder_manifest_state"),
             ):
                 job_events_s1, _ = self._capture_events(
@@ -2398,14 +3474,19 @@ class TestParallelLoopEventParity(unittest.TestCase):
             manifest2, _ = self._make_manifest_and_video(td2)
 
             with (
-                patch("vid_to_sub_app.cli.runner.process_one", side_effect=self._fake_process_one),
+                patch(
+                    "vid_to_sub_app.cli.runner.process_one",
+                    side_effect=self._fake_process_one,
+                ),
                 patch("vid_to_sub_app.cli.manifest.persist_folder_manifest_state"),
             ):
                 job_events_par, _ = self._capture_events(
                     self._run_parallel_via_import, args2, manifest2
                 )
 
-        self.assertTrue(job_events_s1, "_run_stage1_parallel emitted no job_finished events")
+        self.assertTrue(
+            job_events_s1, "_run_stage1_parallel emitted no job_finished events"
+        )
         self.assertTrue(job_events_par, "run_parallel emitted no job_finished events")
 
         keys_s1 = set(job_events_s1[0].keys())
