@@ -223,12 +223,14 @@ class RunConfig:
     model: str
     device: str
     language: str | None
+    content_type: str
     compute_type: str | None
     beam_size: str
     local_workers: int
     whisper_cpp_model_path: str | None
     translate_enabled: bool
     translate_to: str | None
+    force_translate: bool
     translation_model: str | None
     translation_base_url: str | None
     translation_api_key: str | None

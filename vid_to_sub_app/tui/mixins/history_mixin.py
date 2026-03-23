@@ -49,6 +49,9 @@ class _HistoryApp(Protocol):
     def _refresh_recent_paths(self) -> None: ...
     def _refresh_sel_paths(self) -> None: ...
     def _trigger(self, dry_run: bool) -> None: ...
+    def _trigger_translate_from_artifact(
+        self, artifact_path: str, target_lang_override: str | None = None
+    ) -> None: ...
     def _val(self, wid: str) -> str: ...
 
 
@@ -57,7 +60,7 @@ def _history_app(instance: object) -> _HistoryApp:
 
 
 class HistoryMixin:
-    # -- History tab -----------------------------------------------------------
+    """History-tab mixin."""
 
     def _update_history_count(self, total_jobs: int | None = None) -> None:
         app = _history_app(self)
@@ -358,6 +361,18 @@ class HistoryMixin:
             app._log("[red]No subtitle files exist on disk — cannot translate.[/]")
             return
 
+        srt_paths = [
+            subtitle_path
+            for subtitle_path in existing_paths
+            if Path(subtitle_path).suffix.lower() == ".srt"
+        ]
+        skipped_non_srt = len(existing_paths) - len(srt_paths)
+        if not srt_paths:
+            app._log(
+                "[yellow]History translate currently supports SRT outputs only.[/]"
+            )
+            return
+
         target_lang = (
             job.get("target_lang") or app._val("inp-translate-to") or ""
         ).strip()
@@ -365,18 +380,43 @@ class HistoryMixin:
             app._log("[red]No target language is configured for this job.[/]")
             return
 
+        artifact_metadata = job.get("artifact_metadata")
+        if not isinstance(artifact_metadata, dict):
+            artifact_metadata = {}
+        stage_artifact_path = (
+            str(job.get("artifact_path") or artifact_metadata.get("path") or "").strip()
+            or None
+        )
+        if stage_artifact_path and Path(stage_artifact_path).exists():
+            app._log(
+                f"[bold cyan]History translate[/] using artifact {Path(stage_artifact_path).name}"
+            )
+            app._trigger_translate_from_artifact(
+                stage_artifact_path,
+                target_lang_override=target_lang,
+            )
+            return
+
         if missing_paths:
             app._log(f"[yellow]Skipped {len(missing_paths)} missing file(s).[/]")
-        self._trigger_translate_from_paths(existing_paths, target_lang)
+        if skipped_non_srt:
+            app._log(
+                f"[yellow]Skipped {skipped_non_srt} non-SRT subtitle file(s).[/]"
+            )
+        if stage_artifact_path:
+            app._log(
+                "[yellow]Stage artifact is not available on disk; falling back to direct SRT translation.[/]"
+            )
+        self._trigger_translate_from_paths(srt_paths, target_lang)
 
     @work(thread=True, exclusive=True, exit_on_error=False, name="history-translate")
     def _trigger_translate_from_paths(
         self, subtitle_paths: list[str], target_lang: str
     ) -> None:
         app = _history_app(self)
-        translation_base_url = _db.get(ENV_TRANS_URL) or None
-        translation_api_key = _db.get(ENV_TRANS_KEY) or None
-        translation_model = _db.get(ENV_TRANS_MOD) or None
+        translation_base_url = app._val("inp-trans-url") or _db.get(ENV_TRANS_URL) or None
+        translation_api_key = app._val("inp-trans-key") or _db.get(ENV_TRANS_KEY) or None
+        translation_model = app._val("inp-trans-model") or _db.get(ENV_TRANS_MOD) or None
         translated_count = 0
 
         for subtitle_path in subtitle_paths:

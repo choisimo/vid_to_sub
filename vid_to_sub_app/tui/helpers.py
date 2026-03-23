@@ -37,6 +37,7 @@ from vid_to_sub_app.shared.constants import (
     PIP_REQUIREMENT_FILES,
     ROOT_DIR,
     SEARCH_RESULT_LIMIT,
+    SUBTITLE_OUTPUT_EXTENSIONS,
     SYSTEM_PACKAGE_MAP,
     VIDEO_EXTENSIONS,
 )
@@ -167,13 +168,12 @@ def _mask(cmd: list[str]) -> list[str]:
 
 
 def filter_subtitle_paths(output_paths: list[str]) -> list[str]:
-    allowed_suffixes = {".srt", ".vtt", ".txt", ".tsv", ".json"}
     subtitle_paths: list[str] = []
     for path_str in output_paths:
         path = Path(path_str)
         if path.name.lower().endswith(".stage1.json"):
             continue
-        if path.suffix.lower() in allowed_suffixes:
+        if path.suffix.lower() in SUBTITLE_OUTPUT_EXTENSIONS:
             subtitle_paths.append(path_str)
     return subtitle_paths
 

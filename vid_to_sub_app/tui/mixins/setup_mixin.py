@@ -37,7 +37,46 @@ SCRIPT_DIR = ROOT_DIR
 
 
 class SetupMixin:
-    # ── Setup tab ─────────────────────────────────────────────────────────
+    """Setup-tab mixin — dependency detection, build, and install.
+
+    Requires (must be provided by the host class):
+        - self._detected_ggml_models: dict[str, str]
+        - self._detect_results: DetectResult
+        - self._val(wid: str) -> str
+        - self._sel(wid: str, fallback: str) -> str
+        - self.query_one(selector, type) — Textual widget accessor
+        - self.call_from_thread(fn, *args) — Textual thread-safe callback
+
+    Provides:
+        - _load_setup_inputs() -> None
+        - _save_setup_build_fields() -> None
+        - _save_setup_model_fields() -> None
+        - _setup_log(text: str) -> None
+        - _run_cmd(cmd: list[str]) -> bool
+        - _capture_detection_state() -> DetectResult
+        - _refresh_detection_from_worker() -> DetectResult
+        - _run_detection() -> None
+        - _update_detect_ui(results: DetectResult) -> None
+        - _resolved_wcpp_model_path() -> str
+        - _update_wcpp_model_status() -> None
+        - _set_setup_status(message: str) -> None
+        - _system_install_tools(tools, reason) -> bool
+        - _install_requirement_target(target: str) -> bool
+        - _build_whisper_cpp_sync() -> bool
+        - _build_whisper_cpp() -> None
+        - _download_model_sync(model_name: str) -> bool
+        - _download_model(model_name: str) -> None
+        - _pip_install(package: str) -> None
+        - _auto_setup_sync(...) -> None
+        - _action_auto_setup() -> None
+        - _action_full_setup() -> None
+        - _action_build_whisper() -> None
+        - _action_download_model() -> None
+        - _action_pip_fw() -> None
+        - _action_pip_whisper() -> None
+        - _action_pip_wx() -> None
+    """
+    # ── Setup tab ────────────────────────────────────────────────────────────────────────────────
 
     def _load_setup_inputs(self) -> None:
         pairs = [

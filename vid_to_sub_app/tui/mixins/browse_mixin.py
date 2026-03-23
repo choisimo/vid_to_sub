@@ -12,6 +12,34 @@ from ..state import db as _db
 
 
 class BrowseMixin:
+    """Browse-tab mixin.
+
+    Requires (must be provided by the host class):
+        - self._selected_paths: list[str]
+        - self._search_results: list[str]
+        - self._search_preview_path: str | None
+        - self._val(wid: str) -> str
+        - self._update_cmd_preview() -> None
+        - self.query_one(selector, type) — Textual widget accessor
+
+    Provides:
+        - _goto_tree(raw: str) -> None
+        - _add_path(path: str) -> None
+        - _refresh_sel_paths() -> None
+        - _refresh_recent_paths() -> None
+        - _clear_path_search(status: str) -> None
+        - _refresh_search_results() -> None
+        - _refresh_search_preview() -> None
+        - _set_search_preview(path: str | None) -> None
+        - _start_path_search() -> None
+        - _search_input_paths(root: str, query: str) -> None
+        - _apply_path_search_results(results: list[str], status: str) -> None
+        - _action_tree_go() -> None
+        - _action_add_sel() -> None
+        - _action_manual_add() -> None
+        - _action_clear_paths() -> None
+        - _action_clear_search() -> None
+    """
     # ── Browse tab ────────────────────────────────────────────────────────
 
     def _goto_tree(self, raw: str) -> None:
