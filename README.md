@@ -200,6 +200,10 @@ python vid_to_sub.py /path/to/videos --stage1-only --translate-to ko
 ```
 
 This writes `movie.srt` and a sidecar `movie.stage1.json` next to each source file.
+If the artifact already records `target_lang`, you can replay stage 2 later without
+passing `--translate-to` again. When the artifact does not include a saved target,
+pass `--translate-to <lang>` during replay.
+
 When a translation API becomes available, replay stage 2 on the artifact without
 re-transcribing:
 
@@ -252,7 +256,16 @@ When these are blank in the TUI, the Agent tab falls back to the Translation API
 
 ## Distributed Execution
 
-The TUI supports a distributed mode backed by SSH resource profiles. Configure profiles in `Settings -> Remote Resources`, then switch `Execution -> Mode` to `distributed` in the Transcribe tab before starting a run.
+The TUI supports a distributed mode backed by SSH resource profiles. Use
+`Settings -> SSH Connections` as the primary source of remote executors. The legacy
+`Settings -> Remote Resources` JSON remains available as a fallback/import path, and
+duplicate names prefer the saved SSH connection entry.
+
+Switch `Execution -> Mode` to `distributed` in the Transcribe tab before starting a
+run. Automatic stage-2 follow-up only scans `.stage1.json` artifacts visible on the
+local filesystem. If a distributed stage-1 run leaves artifacts only on remote
+hosts, replay translation manually with `--translate-from-artifact` after syncing
+the artifact locally.
 
 Example profile JSON:
 
