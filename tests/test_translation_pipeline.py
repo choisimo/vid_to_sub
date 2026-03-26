@@ -17,7 +17,7 @@ from unittest.mock import ANY, patch
 import vid_to_sub_app.cli.translation as translation_module
 from vid_to_sub_app.cli.main import build_parser, main
 from vid_to_sub_app.cli.manifest import ProcessResult
-from vid_to_sub_app.cli.runner import process_one, run_stage1, run_stage2
+from vid_to_sub_app.cli.runner import _assess_stage1_quality, process_one, run_stage1, run_stage2
 from vid_to_sub_app.cli.stage_artifact import (
     ARTIFACT_FILENAME_SUFFIX,
     ARTIFACT_SCHEMA_VERSION,
@@ -2456,6 +2456,52 @@ class TestRunnerStageSplit(unittest.TestCase):
         translate.assert_not_called()
 
 
+    def test_assess_stage1_quality_zero_segments_reports_empty_transcript_not_high_repetition(
+        self,
+    ) -> None:
+        """Zero segments must not falsely trigger high_repetition.
+
+        unique_ratio = 0/1 = 0.0 → repeated_ratio = 1.0 when non_empty_texts is empty.
+        The guard introduced for this edge case should emit empty_transcript instead.
+        """
+        quality = _assess_stage1_quality([], {"language_probability": 1.0})
+        self.assertIn("empty_transcript", quality["reasons"])
+        self.assertNotIn("high_repetition", quality["reasons"])
+        self.assertTrue(quality["suspicious"])
+
+    def test_assess_stage1_quality_zero_segments_with_no_info_still_not_high_repetition(
+        self,
+    ) -> None:  
+        """Same guard applies when language_probability is absent from info."""
+        quality = _assess_stage1_quality([], {})
+        self.assertIn("empty_transcript", quality["reasons"])
+        self.assertNotIn("high_repetition", quality["reasons"])
+
+    def test_assess_stage1_quality_all_empty_text_segments_reports_empty_transcript(
+        self,
+    ) -> None:
+        """Segments whose text strips to empty string count as zero non-empty texts."""
+        segments = [
+            {"start": 0.0, "end": 1.0, "text": "  "},
+            {"start": 1.0, "end": 2.0, "text": ""},
+        ]
+        quality = _assess_stage1_quality(segments, {"language_probability": 1.0})
+        self.assertIn("empty_transcript", quality["reasons"])
+        self.assertNotIn("high_repetition", quality["reasons"])
+
+    def test_assess_stage1_quality_genuine_repetition_still_flagged(
+        self,
+    ) -> None:
+        """Real high-repetition content must still be caught after the guard."""
+        segments = [
+            {"start": float(i), "end": float(i + 1), "text": "Валерий Сюткин"}
+            for i in range(10)
+        ]
+        quality = _assess_stage1_quality(segments, {"language_probability": 1.0})
+        self.assertIn("high_repetition", quality["reasons"])
+        self.assertNotIn("empty_transcript", quality["reasons"])
+        self.assertTrue(quality["suspicious"])
+
 class TestRunStage2Idempotency(unittest.TestCase):
     """run_stage2 must skip translation when output files already exist."""
 
@@ -3998,3 +4044,610 @@ class TestParallelLoopEventParity(unittest.TestCase):
             only_in_parallel,
             f"Keys only in run_parallel job_finished (not in _run_stage1_parallel): {only_in_parallel}",
         )
+
+    def test_job_finished_payload_values_are_correct(self) -> None:
+        """job_finished event payload must contain correct, non-empty values (not just keys).
+
+        Guards against implementations that emit required keys but fill them with
+        placeholder values (None, empty string, 0) that the TUI would silently misrender.
+        Checks both _run_stage1_parallel and run_parallel for identical value semantics.
+        """
+        from vid_to_sub_app.cli import manifest as manifest_mod
+
+        # --- stage1 path ---
+        with tempfile.TemporaryDirectory() as tmpdir1:
+            td1 = Path(tmpdir1)
+            args1 = self._make_args(td1)
+            manifest1, video1 = self._make_manifest_and_video(td1)
+
+            with (
+                patch(
+                    "vid_to_sub_app.cli.main.run_stage1",
+                    side_effect=self._fake_run_stage1,
+                ),
+                patch("vid_to_sub_app.cli.manifest.persist_folder_manifest_state"),
+            ):
+                job_events_s1, _ = self._capture_events(
+                    self._run_stage1_parallel_via_import, args1, manifest1
+                )
+
+        self.assertEqual(1, len(job_events_s1))
+        job_s1 = job_events_s1[0]
+
+        # video_path must be the actual path of the queued video
+        self.assertEqual(str(video1), job_s1["video_path"],
+                         "stage1 job_finished: video_path must equal the input video")
+        # folder_hash must be the non-empty hash from the manifest fixture
+        self.assertEqual("abc123", job_s1["folder_hash"],
+                         "stage1 job_finished: folder_hash must match manifest")
+        # status on success must be 'done'
+        self.assertEqual("done", job_s1["status"],
+                         "stage1 job_finished: status must be 'done' on success")
+        # worker_id must be an integer (0-based index)
+        self.assertIsInstance(job_s1["worker_id"], int,
+                              "stage1 job_finished: worker_id must be an int")
+
+        # --- run_parallel path ---
+        with tempfile.TemporaryDirectory() as tmpdir2:
+            td2 = Path(tmpdir2)
+            args2 = self._make_args(td2)
+            args2.stage1_only = False
+            manifest2, video2 = self._make_manifest_and_video(td2)
+
+            with (
+                patch(
+                    "vid_to_sub_app.cli.runner.process_one",
+                    side_effect=self._fake_process_one,
+                ),
+                patch("vid_to_sub_app.cli.manifest.persist_folder_manifest_state"),
+            ):
+                job_events_par, _ = self._capture_events(
+                    self._run_parallel_via_import, args2, manifest2
+                )
+
+        self.assertEqual(1, len(job_events_par))
+        job_par = job_events_par[0]
+
+        self.assertEqual(str(video2), job_par["video_path"],
+                         "run_parallel job_finished: video_path must equal the input video")
+        self.assertEqual("abc123", job_par["folder_hash"],
+                         "run_parallel job_finished: folder_hash must match manifest")
+        self.assertEqual("done", job_par["status"],
+                         "run_parallel job_finished: status must be 'done' on success")
+        self.assertIsInstance(job_par["worker_id"], int,
+                              "run_parallel job_finished: worker_id must be an int")
+
+    def test_error_path_emits_job_finished_with_error_fields(self) -> None:
+        """When the worker function raises, job_finished must fire with status='failed'.
+
+        Guards both loops: _run_stage1_parallel (via main.run_stage1 side_effect) and
+        run_parallel (via runner.process_one side_effect).  The error field must contain
+        the exception message; the keys must match the full required contract even on
+        the failure path.
+        """
+        from vid_to_sub_app.cli import manifest as manifest_mod
+
+        def _raise_stage1(task, args, formats, output_dir, backend_threads, worker_id):
+            raise RuntimeError("simulated_stage1_failure")
+
+        def _raise_process_one(task, args, formats, output_dir, backend_threads, worker_id):
+            raise RuntimeError("simulated_process_one_failure")
+
+        # --- stage1 error path ---
+        with tempfile.TemporaryDirectory() as tmpdir1:
+            td1 = Path(tmpdir1)
+            args1 = self._make_args(td1)
+            manifest1, video1 = self._make_manifest_and_video(td1)
+
+            with (
+                patch(
+                    "vid_to_sub_app.cli.main.run_stage1",
+                    side_effect=_raise_stage1,
+                ),
+                patch("vid_to_sub_app.cli.manifest.persist_folder_manifest_state"),
+            ):
+                job_events_s1, _ = self._capture_events(
+                    self._run_stage1_parallel_via_import, args1, manifest1
+                )
+
+        self.assertEqual(1, len(job_events_s1),
+                         "stage1 error path: expected exactly one job_finished event")
+        err_s1 = job_events_s1[0]
+
+        # All required keys must be present on the error path too
+        missing_s1 = self._REQUIRED_JOB_FINISHED_KEYS - set(err_s1.keys())
+        self.assertEqual(set(), missing_s1,
+                         f"stage1 error path: missing keys {missing_s1}")
+        self.assertEqual("failed", err_s1["status"],
+                         "stage1 error path: status must be 'failed'")
+        self.assertIn("simulated_stage1_failure", str(err_s1["error"]),
+                      "stage1 error path: error field must contain the exception message")
+        self.assertIsInstance(err_s1["worker_id"], int,
+                              "stage1 error path: worker_id must be an int")
+
+        # --- run_parallel error path ---
+        with tempfile.TemporaryDirectory() as tmpdir2:
+            td2 = Path(tmpdir2)
+            args2 = self._make_args(td2)
+            args2.stage1_only = False
+            manifest2, video2 = self._make_manifest_and_video(td2)
+
+            with (
+                patch(
+                    "vid_to_sub_app.cli.runner.process_one",
+                    side_effect=_raise_process_one,
+                ),
+                patch("vid_to_sub_app.cli.manifest.persist_folder_manifest_state"),
+            ):
+                job_events_par, _ = self._capture_events(
+                    self._run_parallel_via_import, args2, manifest2
+                )
+
+        self.assertEqual(1, len(job_events_par),
+                         "run_parallel error path: expected exactly one job_finished event")
+        err_par = job_events_par[0]
+
+        missing_par = self._REQUIRED_JOB_FINISHED_KEYS - set(err_par.keys())
+        self.assertEqual(set(), missing_par,
+                         f"run_parallel error path: missing keys {missing_par}")
+        self.assertEqual("failed", err_par["status"],
+                         "run_parallel error path: status must be 'failed'")
+        self.assertIn("simulated_process_one_failure", str(err_par["error"]),
+                      "run_parallel error path: error field must contain the exception message")
+        self.assertIsInstance(err_par["worker_id"], int,
+                              "run_parallel error path: worker_id must be an int")
+
+        # Parity: both loops must emit the same set of keys on the error path
+        self.assertEqual(
+            set(err_s1.keys()),
+            set(err_par.keys()),
+            "Error-path parity: both loops must emit an identical set of job_finished keys",
+        )
+
+
+class TestWarnModelMemory(unittest.TestCase):
+    """_warn_model_memory_if_needed must warn iff faster-whisper + multiple workers."""
+
+    def _make_args(self, backend: str, model: str, workers: int) -> argparse.Namespace:
+        return argparse.Namespace(backend=backend, model=model, workers=workers)
+
+    def _run(
+        self, backend: str, model: str, workers: int, available_vram: float | None = None
+    ) -> str:
+        from vid_to_sub_app.cli.runner import _warn_model_memory_if_needed
+        import io
+        buf = io.StringIO()
+        with unittest.mock.patch("sys.stderr", buf):
+            with unittest.mock.patch(
+                "vid_to_sub_app.shared.env.detect_cuda_total_memory_gb",
+                return_value=available_vram,
+            ):
+                try:
+                    _warn_model_memory_if_needed(self._make_args(backend, model, workers), workers)
+                except Exception:
+                    pass
+        return buf.getvalue()
+
+    def test_no_warning_for_single_worker(self) -> None:
+        out = self._run("faster-whisper", "large-v3", 1)
+        self.assertEqual("", out)
+
+    def test_no_warning_for_non_faster_whisper_backend(self) -> None:
+        out = self._run("whisper-cpp", "large-v3", 4)
+        self.assertEqual("", out)
+
+    def test_generic_warning_when_no_vram_data(self) -> None:
+        out = self._run("faster-whisper", "unknown-model", 2, available_vram=None)
+        self.assertIn("[WARN]", out)
+        self.assertIn("2 workers", out)
+
+    def test_oom_warning_when_workers_exceed_vram(self) -> None:
+        # large-v3 needs 10 GiB; 3 workers = 30 GiB > 8 GiB available
+        out = self._run("faster-whisper", "large-v3", 3, available_vram=8.0)
+        self.assertIn("[WARN]", out)
+        self.assertIn("OOM", out)
+
+    def test_no_oom_warning_when_workers_fit_in_vram(self) -> None:
+        # tiny needs 1 GiB; 2 workers = 2 GiB < 16 GiB available → no VRAM OOM warn
+        # (may still emit generic multi-worker warning; we just check no OOM msg)
+        out = self._run("faster-whisper", "tiny", 2, available_vram=16.0)
+        self.assertNotIn("OOM", out)
+
+
+class TestRemoteCommandSecretExclusion(unittest.TestCase):
+    """_build_remote_command must not include SECRET_ENV_KEYS in the shell env prefix.
+
+    API keys passed via CLI args (--translation-api-key etc.) must NOT also appear
+    as inline shell variable assignments where they are visible in process listings.
+    """
+
+    def _make_run_mixin_with_env(
+        self,
+        run_env: dict[str, str],
+    ):
+        """Return a minimal RunMixin-like object with a patched _build_run_env."""
+        from vid_to_sub_app.tui.mixins.run_mixin import RunMixin
+        from vid_to_sub_app.tui.models import RemoteResourceProfile
+
+        class _Stub(RunMixin):
+            # Satisfy the minimum mixin contract for _build_cli_args + _build_remote_command
+            _selected_paths: list[str] = []
+            _run_last_shell: str = ""
+            _run_shell_collapsed: bool = False
+            _detected_ggml_models: dict[str, str] = {}
+
+            def _val(self, wid: str) -> str:
+                return ""
+
+            def _sel(self, wid: str, fallback: str = "") -> str:
+                return fallback
+
+            def _chk(self, wid: str) -> bool:
+                return False
+
+            def _sw(self, wid: str) -> bool:
+                return False
+
+            def _resolved_wcpp_model_path(self) -> str:
+                return ""
+
+            def _build_run_env(self, config=None) -> dict[str, str]:
+                return dict(run_env)
+
+            def _refresh_live_panels(self) -> None:
+                pass
+
+            def _log(self, text: str) -> None:
+                pass
+
+        return _Stub()
+
+    def _get_remote_cmd_str(
+        self,
+        run_env: dict[str, str],
+    ) -> str:
+        from vid_to_sub_app.tui.models import RemoteResourceProfile
+
+        stub = self._make_run_mixin_with_env(run_env)
+        profile = RemoteResourceProfile(
+            name="test-remote",
+            ssh_target="user@host",
+            remote_workdir="/srv/vid_to_sub",
+            slots=1,
+            path_map={},
+            env={},
+            python_bin="python3",
+            script_path="vid_to_sub.py",
+        )
+        parts = stub._build_remote_command(profile, None, dry_run=False)
+        # The last element is the full remote shell command string
+        return parts[-1]
+
+    def test_translation_api_key_not_in_env_prefix(self) -> None:
+        from vid_to_sub_app.shared.constants import ENV_TRANSLATION_API_KEY
+        run_env = {
+            "VID_TO_SUB_TRANSLATION_BASE_URL": "https://api.example.com/v1",
+            ENV_TRANSLATION_API_KEY: "super-secret-key",
+        }
+        cmd_str = self._get_remote_cmd_str(run_env)
+        # The secret MUST NOT appear as an inline env var assignment
+        self.assertNotIn("super-secret-key", cmd_str.split("python3")[0],
+            "API key leaked into shell env prefix (visible in ps / shell history)")
+
+    def test_non_secret_vars_remain_in_env_prefix(self) -> None:
+        run_env = {
+            "VID_TO_SUB_TRANSLATION_BASE_URL": "https://api.example.com/v1",
+            "VID_TO_SUB_TRANSLATION_API_KEY": "secret",
+        }
+        cmd_str = self._get_remote_cmd_str(run_env)
+        self.assertIn("VID_TO_SUB_TRANSLATION_BASE_URL", cmd_str)
+
+    def test_postprocess_api_key_not_in_env_prefix(self) -> None:
+        from vid_to_sub_app.shared.constants import ENV_POSTPROCESS_API_KEY
+        run_env = {
+            "VID_TO_SUB_POSTPROCESS_BASE_URL": "https://post.example.com/v1",
+            ENV_POSTPROCESS_API_KEY: "post-secret-key",
+        }
+        cmd_str = self._get_remote_cmd_str(run_env)
+        self.assertNotIn("post-secret-key", cmd_str.split("python3")[0])
+
+    def test_agent_api_key_not_in_env_prefix(self) -> None:
+        from vid_to_sub_app.shared.constants import ENV_AGENT_API_KEY
+        run_env = {
+            "VID_TO_SUB_AGENT_BASE_URL": "https://agent.example.com/v1",
+            ENV_AGENT_API_KEY: "agent-secret-key",
+        }
+        cmd_str = self._get_remote_cmd_str(run_env)
+        self.assertNotIn("agent-secret-key", cmd_str.split("python3")[0])
+
+
+class TestRemoteArtifactProvenance(unittest.TestCase):
+    """_materialize_remote_stage1_artifact must preserve remote provenance and
+    emit a warning when local fingerprint differs from remote.
+    """
+
+    def _make_stub_mixin(self, log_sink: list):
+        from vid_to_sub_app.tui.mixins.run_mixin import RunMixin
+
+        _captured = log_sink
+
+        class _Stub(RunMixin):
+            _selected_paths: list = []
+            _run_last_shell: str = ""
+            _run_shell_collapsed: bool = False
+            _detected_ggml_models: dict = {}
+            _run_output_dir: str = ""
+
+            def _val(self, wid):
+                return ""
+
+            def _sel(self, wid, fallback=""):
+                return fallback
+
+            def _chk(self, wid):
+                return False
+
+            def _sw(self, wid):
+                return False
+
+            def _resolved_wcpp_model_path(self):
+                return ""
+
+            def _build_run_env(self, config=None):
+                return {}
+
+            def _refresh_live_panels(self):
+                pass
+
+            def _log(self, text):
+                _captured.append(text)
+
+            def call_from_thread(self, fn, *args, **kwargs):
+                fn(*args, **kwargs)
+
+        stub = _Stub()
+        stub._run_output_dir = ""
+        return stub
+
+    def _make_profile(self):
+        from vid_to_sub_app.tui.models import RemoteResourceProfile
+        return RemoteResourceProfile(
+            name="test-box",
+            ssh_target="user@host",
+            remote_workdir="/srv/vid_to_sub",
+            slots=1,
+            path_map={},
+            env={},
+            python_bin="python3",
+            script_path="vid_to_sub.py",
+        )
+
+    def _make_artifact_json(self, source_path, source_fingerprint):
+        import json
+        return json.dumps({
+            "schema_version": "1",
+            "source_path": source_path,
+            "output_base": "/remote/out",
+            "source_fingerprint": source_fingerprint,
+            "backend": "faster-whisper",
+            "device": "cuda",
+            "model": "large-v3",
+            "content_type": None,
+            "language": "en",
+            "language_probability": 0.99,
+            "duration": 60.0,
+            "quality": {},
+            "target_lang": None,
+            "formats": ["srt"],
+            "primary_outputs": [],
+            "segments": [],
+            "stage_status": {"transcription_complete": True},
+        })
+
+    def test_provenance_fields_saved_in_quality(self):
+        """After remap, quality must contain remote_source_path + remote_source_fingerprint."""
+        import tempfile, json, subprocess as _sp
+        from pathlib import Path
+
+        log = []
+        stub = self._make_stub_mixin(log)
+        profile = self._make_profile()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            source = Path(tmpdir) / "movie.mp4"
+            source.write_bytes(b"fake-video-content")
+
+            remote_fp = "9999:1700000000"
+            artifact_json = self._make_artifact_json("/remote/media/movie.mp4", remote_fp)
+
+            def _fake_scp(cmd, *, check, stdout, stderr, text):
+                Path(cmd[-1]).write_text(artifact_json, encoding="utf-8")
+                return _sp.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+            with unittest.mock.patch("subprocess.run", side_effect=_fake_scp):
+                stub._run_output_dir = ""
+                result = stub._materialize_remote_stage1_artifact(profile, str(source))
+
+            self.assertIsNotNone(result, "Materialization should succeed")
+            data = json.loads(Path(result).read_text())
+            quality = data["quality"]
+            self.assertEqual(quality["remote_source_path"], "/remote/media/movie.mp4")
+            self.assertEqual(quality["remote_source_fingerprint"], remote_fp)
+            self.assertIn("local_source_fingerprint", quality)
+            self.assertTrue(quality["artifact_fetched_from_remote"])
+
+    def test_provenance_mismatch_emits_warning(self):
+        """When remote and local fingerprints differ, a yellow warning must be logged."""
+        import tempfile, subprocess as _sp
+        from pathlib import Path
+
+        log = []
+        stub = self._make_stub_mixin(log)
+        profile = self._make_profile()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            source = Path(tmpdir) / "movie.mp4"
+            source.write_bytes(b"different-local-content")
+
+            remote_fp = "99999:9999999999"
+            artifact_json = self._make_artifact_json("/remote/media/movie.mp4", remote_fp)
+
+            def _fake_scp(cmd, *, check, stdout, stderr, text):
+                Path(cmd[-1]).write_text(artifact_json, encoding="utf-8")
+                return _sp.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+            with unittest.mock.patch("subprocess.run", side_effect=_fake_scp):
+                stub._materialize_remote_stage1_artifact(profile, str(source))
+
+            all_logs = " ".join(log)
+            self.assertIn("remote provenance mismatch", all_logs.lower())
+            self.assertIn("test-box", all_logs)
+
+    def test_matching_fingerprints_no_mismatch_warning(self):
+        """When fingerprints match (same file), no mismatch warning is emitted."""
+        import tempfile, subprocess as _sp
+        from pathlib import Path
+        from vid_to_sub_app.cli.stage_artifact import fingerprint_source_path
+
+        log = []
+        stub = self._make_stub_mixin(log)
+        profile = self._make_profile()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            source = Path(tmpdir) / "movie.mp4"
+            source.write_bytes(b"real-video-bytes")
+            local_fp = fingerprint_source_path(source)
+
+            artifact_json = self._make_artifact_json("/remote/media/movie.mp4", local_fp)
+
+            def _fake_scp(cmd, *, check, stdout, stderr, text):
+                Path(cmd[-1]).write_text(artifact_json, encoding="utf-8")
+                return _sp.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+            with unittest.mock.patch("subprocess.run", side_effect=_fake_scp):
+                stub._materialize_remote_stage1_artifact(profile, str(source))
+
+            all_logs = " ".join(log)
+            self.assertNotIn("provenance mismatch", all_logs.lower())
+
+    def test_scp_failure_returns_none_and_logs(self):
+        """When scp fails, the method returns None and logs a failure message."""
+        import tempfile, subprocess as _sp
+        from pathlib import Path
+
+        log = []
+        stub = self._make_stub_mixin(log)
+        profile = self._make_profile()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            source = Path(tmpdir) / "movie.mp4"
+            source.write_bytes(b"video")
+
+            def _failing_scp(cmd, *, check, stdout, stderr, text):
+                return _sp.CompletedProcess(cmd, 1, stdout="connection refused")
+
+            with unittest.mock.patch("subprocess.run", side_effect=_failing_scp):
+                result = stub._materialize_remote_stage1_artifact(profile, str(source))
+
+            self.assertIsNone(result)
+            all_logs = " ".join(log)
+            self.assertIn("failed to fetch", all_logs.lower())
+
+
+
+class TestDiscoveryMetric(unittest.TestCase):
+    """[METRIC] stage=discovery must be emitted to stderr after video discovery."""
+
+    def _run_main(self, paths: list[str], extra_args: list[str] | None = None) -> str:
+        """Run main() with the given paths and return stderr output."""
+        import io
+        from unittest.mock import patch
+        from vid_to_sub_app.cli.main import main
+
+        extra = extra_args or []
+        argv = paths + extra
+        buf = io.StringIO()
+        with patch("sys.stderr", buf):
+            try:
+                main(argv)
+            except SystemExit:
+                pass
+        return buf.getvalue()
+
+    def test_discovery_metric_emitted_to_stderr(self) -> None:
+        """After video discovery, [METRIC] stage=discovery must appear on stderr."""
+        import tempfile
+        from pathlib import Path
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            # Create one fake video so discovery finds something
+            fake_video = Path(tmpdir) / "clip.mp4"
+            fake_video.write_bytes(b"fake")
+
+            # Patch the actual transcription to avoid running whisper
+            with unittest.mock.patch(
+                "vid_to_sub_app.cli.main.run_parallel",
+                return_value=(1, 0),
+            ), unittest.mock.patch(
+                "vid_to_sub_app.cli.manifest.persist_folder_manifest_state",
+            ):
+                stderr_output = self._run_main([tmpdir])
+
+        self.assertIn(
+            "[METRIC] stage=discovery",
+            stderr_output,
+            "Expected [METRIC] stage=discovery in stderr after video discovery",
+        )
+        self.assertIn(
+            "files_found=",
+            stderr_output,
+            "Expected files_found= in discovery metric",
+        )
+        self.assertIn(
+            "elapsed_ms=",
+            stderr_output,
+            "Expected elapsed_ms= in discovery metric",
+        )
+
+    def test_discovery_metric_not_emitted_for_manifest_stdin(self) -> None:
+        """When --manifest-stdin is used, no discovery occurs so no discovery metric."""
+        import io
+        import json
+        import tempfile
+        from pathlib import Path
+        from unittest.mock import patch
+        from vid_to_sub_app.cli.main import main
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            fake_video = Path(tmpdir) / "clip.mp4"
+            fake_video.write_bytes(b"fake")
+            manifest = {
+                "version": 1,
+                "entries": [{
+                    "video_path": str(fake_video),
+                    "folder_path": tmpdir,
+                    "folder_hash": "abc123",
+                }],
+            }
+            stdin_data = json.dumps(manifest)
+
+            stderr_buf = io.StringIO()
+            with patch("sys.stdin", io.StringIO(stdin_data)), \
+                 patch("sys.stderr", stderr_buf), \
+                 patch("vid_to_sub_app.cli.main.run_parallel", return_value=(1, 0)), \
+                 patch("vid_to_sub_app.cli.manifest.persist_folder_manifest_state"):
+                try:
+                    main(["--manifest-stdin"])
+                except SystemExit:
+                    pass
+
+        stderr_output = stderr_buf.getvalue()
+        self.assertNotIn(
+            "stage=discovery",
+            stderr_output,
+            "No discovery metric expected when using --manifest-stdin",
+        )
+
+
+if __name__ == "__main__":
+    unittest.main()
