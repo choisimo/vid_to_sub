@@ -70,6 +70,9 @@ pip install -r requirements-whisper.txt
 pip install -r requirements-whisperx.txt
 ```
 
+The declared Textual support floor is `0.80.x`. CI verifies both `textual==0.80.1`
+and the latest version allowed by `requirements.txt`.
+
 ## Quick Start
 
 ### 1. Default local transcription
@@ -201,8 +204,10 @@ python vid_to_sub.py /path/to/videos --stage1-only --translate-to ko
 
 This writes `movie.srt` and a sidecar `movie.stage1.json` next to each source file.
 If the artifact already records `target_lang`, you can replay stage 2 later without
-passing `--translate-to` again. When the artifact does not include a saved target,
-pass `--translate-to <lang>` during replay.
+passing `--translate-to` again, or override the saved target with
+`--translate-to <lang>`. Replay verifies the current source file against the
+artifact `source_fingerprint`; use `--force-translate` only when you
+intentionally want to bypass suspicious/mismatch checks.
 
 When a translation API becomes available, replay stage 2 on the artifact without
 re-transcribing:
@@ -254,6 +259,19 @@ If `VID_TO_SUB_WHISPER_CPP_MODEL` is not set, the project searches common model 
 
 When these are blank in the TUI, the Agent tab falls back to the Translation API settings.
 
+### Database state
+
+- `VID_TO_SUB_DB_PATH`
+  Override the SQLite database path for saved settings, SSH profiles, and job history.
+
+Default database location policy:
+
+- New installs use `$XDG_STATE_HOME/vid_to_sub/vid_to_sub.db` when `XDG_STATE_HOME` is set.
+- Otherwise they use `~/.local/state/vid_to_sub/vid_to_sub.db`.
+- If an existing legacy database is already present at the project root as `./vid_to_sub.db`, that path is kept for backward compatibility.
+
+The parent directory is created automatically when the configured database path points to a nested location.
+
 ## Distributed Execution
 
 The TUI supports a distributed mode backed by SSH resource profiles. Use
@@ -262,10 +280,11 @@ The TUI supports a distributed mode backed by SSH resource profiles. Use
 duplicate names prefer the saved SSH connection entry.
 
 Switch `Execution -> Mode` to `distributed` in the Transcribe tab before starting a
-run. Automatic stage-2 follow-up only scans `.stage1.json` artifacts visible on the
-local filesystem. If a distributed stage-1 run leaves artifacts only on remote
-hosts, replay translation manually with `--translate-from-artifact` after syncing
-the artifact locally.
+run. When distributed stage-1 finishes on remote hosts, the TUI now tries to fetch
+their `.stage1.json` artifacts back onto the local filesystem and then launches the
+existing local stage-2 follow-up automatically. If that fetch/remap step fails,
+review the saved SSH connection and `path_map`, or replay translation manually with
+`--translate-from-artifact` after copying the artifact locally.
 
 Example profile JSON:
 
@@ -329,4 +348,4 @@ Use `tui.py` when you want setup assistance, persistent settings, queue visibili
 - The CLI and TUI share the same runtime backend/device detection, so GPU-capable hosts preselect a matching backend when the optional package is installed.
 - `whisperX` diarization needs `--hf-token`; without it, the run continues without diarization.
 - Primary outputs are considered existing by filename and format only, so `--skip-existing` checks for files such as `movie.srt` in the target output directory.
-- The Settings tab can export the current configuration into `.env`.
+- The Settings tab can export the current non-secret configuration into `.env`; API keys stay session/environment-only and are omitted from export.
