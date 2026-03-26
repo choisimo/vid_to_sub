@@ -10,22 +10,23 @@ from typing import Optional
 from vid_to_sub_app.shared.constants import (
     DEFAULT_FORMAT,
     DEFAULT_MODEL,
-    POSTPROCESS_MODES,
     ENV_TRANSLATION_API_KEY,
     ENV_TRANSLATION_BASE_URL,
     ENV_TRANSLATION_MODEL,
-    TRANSLATION_MODES,
     ENV_WHISPER_CPP_MODEL,
     KNOWN_MODELS,
+    POSTPROCESS_MODES,
     SUPPORTED_FORMATS,
+    TRANSLATION_MODES,
 )
 from vid_to_sub_app.shared.env import (
     load_env_from_sqlite,
     load_project_env_fallback,
-    resolve_runtime_model,
     resolve_runtime_backend_and_device,
     resolve_runtime_backend_threads,
+    resolve_runtime_model,
 )
+from vid_to_sub_app.shared.secrets import hydrate_secret_env
 
 from .discovery import discover_videos, hash_video_folder
 from .manifest import (
@@ -37,7 +38,10 @@ from .manifest import (
 )
 from .output import fmt_seconds
 from .runner import (
+    emit_legacy_inline_warning_once,
     emit_progress_event,
+    legacy_inline_block_reason,
+    legacy_inline_requested,
     primary_output_exists,
     run_parallel,
     run_stage1,
@@ -158,7 +162,9 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Audio content hint for transcription. Use 'music' for lyric-heavy or "
             "music-dominant inputs; this enables safer decoding on supported backends "
-            "and requires --language."
+            "and requires --language. 'auto' now retries suspicious Stage 1 outputs "
+            "with the music preset when possible and withholds canonical outputs if "
+            "the result still looks unsafe."
         ),
     )
     parser.add_argument(
@@ -333,7 +339,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--force-translate",
         action="store_true",
         default=False,
-        help="Allow Stage 2 translation to run even when the Stage 1 artifact is flagged as suspicious.",
+        help="Allow Stage 2 translation to run even when the Stage 1 artifact is flagged as suspicious or its source fingerprint cannot be verified.",
     )
     parser.add_argument(
         "--overwrite-translation",
@@ -435,10 +441,10 @@ def _run_stage1_parallel(
                 )
 
             with counter_lock:
+                if result.artifact_path:
+                    artifact_paths.append(result.artifact_path)
                 if result.success:
                     ok += 1
-                    if result.artifact_path:
-                        artifact_paths.append(result.artifact_path)
                 else:
                     err += 1
 
@@ -477,10 +483,13 @@ def main(argv: Optional[list[str]] = None) -> int:
         from vid_to_sub_app.db import Database
 
         bootstrap_env_db = Database()
-        load_env_from_sqlite(bootstrap_env_db.get_all, override=True)
         load_project_env_fallback(override=False)
+        hydrate_secret_env()
+        bootstrap_env_db.migrate_secret_settings_to_env()
+        load_env_from_sqlite(bootstrap_env_db.get_all, override=True)
     except Exception:
         load_project_env_fallback(override=False)
+        hydrate_secret_env()
     finally:
         if bootstrap_env_db is not None:
             bootstrap_env_db.close()
@@ -523,6 +532,17 @@ def main(argv: Optional[list[str]] = None) -> int:
             )
 
     effective_translate_to = args.translate_to or artifact_target_lang
+    if (
+        legacy_inline_requested()
+        and not args.stage1_only
+        and not args.translate_from_artifact
+    ):
+        legacy_inline_error = legacy_inline_block_reason(args)
+        if legacy_inline_error:
+            print(f"[ERROR] {legacy_inline_error}", file=sys.stderr)
+            return 2
+        emit_legacy_inline_warning_once()
+
     if (
         not args.stage1_only
         and args.postprocess_translation

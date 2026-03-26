@@ -1,14 +1,14 @@
 from __future__ import annotations
 
 import argparse
-from email.message import Message
 import io
 import json
 import os
 import tempfile
-import urllib.error
 import unittest
+import urllib.error
 from contextlib import redirect_stderr, redirect_stdout
+from email.message import Message
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Any
@@ -973,18 +973,13 @@ class TranslationPipelineTests(unittest.TestCase):
                 chunk_size=3,
             )
 
-        self.assertEqual([[1, 2, 3]] * 4, request_segment_numbers[:4])
-        self.assertEqual([[1], [2], [3]], request_segment_numbers[4:])
+        self.assertEqual([[1, 2, 3], [1], [2], [3]], request_segment_numbers)
         self.assertEqual(
             ["ok-1", "ok-2", "ok-3"], [s["text"] for s in translated_segments]
         )
-        self.assertEqual(3, sleep.call_count)
+        self.assertEqual(0, sleep.call_count)
         self.assertTrue(all(client_request_ids))
-        self.assertEqual(1, len(set(client_request_ids[:4])))
-        self.assertEqual(3, len(set(client_request_ids[4:])))
-        self.assertTrue(
-            set(client_request_ids[:4]).isdisjoint(set(client_request_ids[4:]))
-        )
+        self.assertEqual(4, len(set(client_request_ids)))
         transport_event = next(
             event
             for event in _event_payloads(stderr_buffer)
@@ -994,6 +989,51 @@ class TranslationPipelineTests(unittest.TestCase):
         self.assertEqual(429, transport_event["http_status"])
         self.assertEqual(1, transport_event["next_retry_size"])
         self.assertGreater(transport_event["payload_chars"], 0)
+
+    def test_translation_single_item_transport_errors_keep_http_retries(self) -> None:
+        segments = [{"start": 0.0, "end": 1.0, "text": "one"}]
+        request_attempts = 0
+
+        def fake_urlopen(request):
+            nonlocal request_attempts
+            request_attempts += 1
+            if request_attempts < 4:
+                raise urllib.error.HTTPError(
+                    url=request.full_url,
+                    code=429,
+                    msg="rate limited",
+                    hdrs=Message(),
+                    fp=io.BytesIO(b'{"error":"rate limited"}'),
+                )
+            return _FakeHTTPResponse(
+                _chat_payload(
+                    json.dumps(
+                        [{"segment_number": 1, "text": "ok-1"}], ensure_ascii=False
+                    )
+                )
+            )
+
+        with (
+            patch(
+                "vid_to_sub_app.cli.translation.urllib.request.urlopen",
+                side_effect=fake_urlopen,
+            ),
+            patch("vid_to_sub_app.cli.translation.time.sleep") as sleep,
+            redirect_stdout(io.StringIO()),
+        ):
+            translated_segments, _ = translate_segments_openai_compatible(
+                segments=segments,
+                target_language="ko",
+                translation_model="gpt-4.1-mini",
+                translation_base_url="https://translation.example/v1",
+                translation_api_key="secret",
+                source_language="en",
+                chunk_size=3,
+            )
+
+        self.assertEqual(4, request_attempts)
+        self.assertEqual(3, sleep.call_count)
+        self.assertEqual(["ok-1"], [segment["text"] for segment in translated_segments])
 
     def test_translation_retries_after_json_parse_failure(self) -> None:
         segments = [
@@ -2128,6 +2168,188 @@ class TestRunnerStageSplit(unittest.TestCase):
         self.assertTrue(result.success)
         self.assertEqual("music", mock_transcribe.call_args.kwargs["content_type"])
 
+    def test_stage1_auto_retries_with_music_preset_when_initial_quality_is_suspicious(
+        self,
+    ) -> None:
+        with TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            video_path = (temp_path / "movie.mp4").resolve()
+            video_path.write_bytes(b"video")
+            output_dir = (temp_path / "out").resolve()
+            task = {
+                "video_path": str(video_path),
+                "folder_hash": "folder-hash",
+                "folder_path": str(video_path.parent),
+            }
+            args = self._make_args(
+                content_type="auto", language=None, translate_to=None
+            )
+            initial_segments = [
+                {"start": 0.0, "end": 1.0, "text": "la la"},
+                {"start": 1.0, "end": 2.0, "text": "la la"},
+            ]
+            initial_info = {
+                "language": "ja",
+                "language_probability": 0.41,
+                "duration": 2.0,
+                "content_type": "auto",
+            }
+            retried_segments = [
+                {"start": 0.0, "end": 1.0, "text": "青い風"},
+                {"start": 1.0, "end": 2.0, "text": "光る海"},
+            ]
+            retried_info = {
+                "language": "ja",
+                "language_probability": 0.98,
+                "duration": 2.0,
+                "content_type": "music",
+            }
+            written_paths = [output_dir / "movie.srt"]
+            artifact_path = output_dir / f"movie{ARTIFACT_FILENAME_SUFFIX}"
+
+            with (
+                patch(
+                    "vid_to_sub_app.cli.runner.transcribe",
+                    side_effect=[
+                        (initial_segments, initial_info),
+                        (retried_segments, retried_info),
+                    ],
+                ) as mock_transcribe,
+                patch(
+                    "vid_to_sub_app.cli.runner.write_outputs",
+                    return_value=written_paths,
+                ),
+                patch(
+                    "vid_to_sub_app.cli.runner.write_stage_artifact",
+                    return_value=artifact_path,
+                ),
+            ):
+                result = run_stage1(task, args, frozenset({"srt"}), output_dir, 2, 0)
+
+        self.assertTrue(result.success, result.error)
+        self.assertEqual(2, mock_transcribe.call_count)
+        self.assertEqual(
+            "auto", mock_transcribe.call_args_list[0].kwargs["content_type"]
+        )
+        self.assertEqual(
+            "music", mock_transcribe.call_args_list[1].kwargs["content_type"]
+        )
+        self.assertEqual("ja", mock_transcribe.call_args_list[1].kwargs["language"])
+
+    def test_stage1_holds_suspicious_outputs_and_keeps_canonical_primary_names(
+        self,
+    ) -> None:
+        with TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            video_path = (temp_path / "movie.mp4").resolve()
+            video_path.write_bytes(b"video")
+            output_dir = (temp_path / "out").resolve()
+            task = {
+                "video_path": str(video_path),
+                "folder_hash": "folder-hash",
+                "folder_path": str(video_path.parent),
+            }
+            args = self._make_args(
+                content_type="speech",
+                language="en",
+                translate_to=None,
+            )
+            suspicious_segments = [
+                {"start": 0.0, "end": 1.0, "text": "uh"},
+                {"start": 1.0, "end": 2.0, "text": "uh"},
+            ]
+            suspicious_info = {
+                "language": "en",
+                "language_probability": 0.31,
+                "duration": 2.0,
+                "content_type": "speech",
+            }
+
+            with patch(
+                "vid_to_sub_app.cli.runner.transcribe",
+                return_value=(suspicious_segments, suspicious_info),
+            ):
+                result = run_stage1(
+                    task,
+                    args,
+                    frozenset({"json", "srt"}),
+                    output_dir,
+                    2,
+                    0,
+                )
+
+            assert result.artifact_path is not None
+            artifact = load_stage_artifact(Path(result.artifact_path))
+            self.assertFalse(result.success)
+            self.assertEqual("quality_hold", result.stage)
+            self.assertIn("withheld", result.error or "")
+            self.assertFalse((output_dir / "movie.srt").exists())
+            self.assertFalse((output_dir / "movie.json").exists())
+            self.assertTrue((output_dir / "movie.stage1.suspicious.srt").exists())
+            self.assertTrue((output_dir / "movie.stage1.suspicious.json").exists())
+            self.assertEqual(
+                [
+                    str(output_dir / "movie.srt"),
+                    str(output_dir / "movie.json"),
+                ],
+                artifact["primary_outputs"],
+            )
+            self.assertTrue(artifact["quality"]["output_held"])
+            assert result.artifact_metadata is not None
+            self.assertTrue(result.artifact_metadata.get("stage1_output_held"))
+
+    def test_process_one_continues_to_stage2_after_quality_hold_when_translation_requested(
+        self,
+    ) -> None:
+        task = {
+            "video_path": "/tmp/movie.mp4",
+            "folder_hash": "folder-hash",
+            "folder_path": "/tmp",
+        }
+        args = self._make_args(translate_to="ko", force_translate=True)
+        stage1_result = ProcessResult(
+            success=False,
+            video_path="/tmp/movie.mp4",
+            folder_hash="folder-hash",
+            folder_path="/tmp",
+            worker_id=0,
+            language="en",
+            video_duration=1.0,
+            output_paths=["/tmp/movie.stage1.suspicious.srt"],
+            segments=1,
+            elapsed_sec=0.1,
+            error="held",
+            stage="quality_hold",
+            artifact_path="/tmp/movie.stage1.json",
+        )
+        stage2_result = ProcessResult(
+            success=True,
+            video_path="/tmp/movie.mp4",
+            folder_hash="folder-hash",
+            folder_path="/tmp",
+            worker_id=0,
+            language="en",
+            output_paths=["/tmp/movie.ko.srt"],
+            segments=1,
+            elapsed_sec=0.2,
+            artifact_path="/tmp/movie.stage1.json",
+        )
+
+        with (
+            patch("vid_to_sub_app.cli.runner.run_stage1", return_value=stage1_result),
+            patch(
+                "vid_to_sub_app.cli.runner.run_stage2", return_value=stage2_result
+            ) as run_stage2_mock,
+        ):
+            result = process_one(task, args, frozenset({"srt"}), None, 2, 0)
+
+        run_stage2_mock.assert_called_once_with(Path("/tmp/movie.stage1.json"), args)
+        self.assertTrue(result.success)
+        self.assertEqual(
+            ["/tmp/movie.stage1.suspicious.srt", "/tmp/movie.ko.srt"],
+            result.output_paths,
+        )
+
     def test_stage2_does_not_call_transcribe(self) -> None:
         with TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)
@@ -2247,12 +2469,18 @@ class TestRunStage2Idempotency(unittest.TestCase):
         args.force_translate = False
         return args
 
+    def _write_source(self, source: Path, payload: bytes = b"video") -> str:
+        source.write_bytes(payload)
+        source_stat = source.stat()
+        return f"{source_stat.st_size}:{int(source_stat.st_mtime)}"
+
     def test_run_stage2_blocks_suspicious_artifact_without_force_translate(
         self,
     ) -> None:
         with TemporaryDirectory() as tmp:
             tmpdir = Path(tmp)
             source = tmpdir / "movie.mp4"
+            source_fingerprint = self._write_source(source)
             srt = tmpdir / "movie.srt"
             srt.write_text("1\n00:00:00,000 --> 00:00:01,000\nHello")
 
@@ -2260,7 +2488,7 @@ class TestRunStage2Idempotency(unittest.TestCase):
                 "schema_version": ARTIFACT_SCHEMA_VERSION,
                 "source_path": str(source),
                 "output_base": str(tmpdir),
-                "source_fingerprint": "1024:1700000000",
+                "source_fingerprint": source_fingerprint,
                 "backend": "whisper-cpp",
                 "device": "cpu",
                 "model": "large-v3",
@@ -2309,6 +2537,7 @@ class TestRunStage2Idempotency(unittest.TestCase):
         with TemporaryDirectory() as tmp:
             tmpdir = Path(tmp)
             source = tmpdir / "movie.mp4"
+            source_fingerprint = self._write_source(source)
             srt = tmpdir / "movie.srt"
             srt.write_text("1\n00:00:00,000 --> 00:00:01,000\nHello")
 
@@ -2316,7 +2545,7 @@ class TestRunStage2Idempotency(unittest.TestCase):
                 "schema_version": ARTIFACT_SCHEMA_VERSION,
                 "source_path": str(source),
                 "output_base": str(tmpdir),
-                "source_fingerprint": "1024:1700000000",
+                "source_fingerprint": source_fingerprint,
                 "backend": "whisper-cpp",
                 "device": "cpu",
                 "model": "large-v3",
@@ -2361,13 +2590,14 @@ class TestRunStage2Idempotency(unittest.TestCase):
         translation_complete=True and the translated file already exists on disk."""
         import argparse
         from unittest.mock import patch
+
         from vid_to_sub_app.cli.runner import run_stage2
         from vid_to_sub_app.cli.stage_artifact import write_stage_artifact
 
         with TemporaryDirectory() as tmp:
             tmpdir = Path(tmp)
-            # Write a fake source video path (no need for it to exist)
             source = tmpdir / "movie.mp4"
+            source_fingerprint = self._write_source(source)
             srt = tmpdir / "movie.srt"
             srt.write_text("1\n00:00:00,000 --> 00:00:01,000\nHello")
             # Translated file already exists
@@ -2378,7 +2608,7 @@ class TestRunStage2Idempotency(unittest.TestCase):
                 "schema_version": ARTIFACT_SCHEMA_VERSION,
                 "source_path": str(source),
                 "output_base": str(tmpdir),
-                "source_fingerprint": "1024:1700000000",
+                "source_fingerprint": source_fingerprint,
                 "backend": "whisper-cpp",
                 "device": "cpu",
                 "model": "large-v3",
@@ -2421,12 +2651,14 @@ class TestRunStage2Idempotency(unittest.TestCase):
         the translated file does not exist on disk."""
         import argparse
         from unittest.mock import patch
+
         from vid_to_sub_app.cli.runner import run_stage2
         from vid_to_sub_app.cli.stage_artifact import write_stage_artifact
 
         with TemporaryDirectory() as tmp:
             tmpdir = Path(tmp)
             source = tmpdir / "movie.mp4"
+            source_fingerprint = self._write_source(source)
             srt = tmpdir / "movie.srt"
             srt.write_text("1\n00:00:00,000 --> 00:00:01,000\nHello")
             # Translated file does NOT exist — should NOT be idempotent-skipped
@@ -2435,7 +2667,7 @@ class TestRunStage2Idempotency(unittest.TestCase):
                 "schema_version": ARTIFACT_SCHEMA_VERSION,
                 "source_path": str(source),
                 "output_base": str(tmpdir),
-                "source_fingerprint": "1024:1700000000",
+                "source_fingerprint": source_fingerprint,
                 "backend": "whisper-cpp",
                 "device": "cpu",
                 "model": "large-v3",
@@ -2478,13 +2710,14 @@ class TestRunStage2Idempotency(unittest.TestCase):
         with TemporaryDirectory() as tmp:
             tmpdir = Path(tmp)
             source = tmpdir / "movie.mp4"
+            source_fingerprint = self._write_source(source)
             srt = tmpdir / "movie.srt"
             srt.write_text("1\n00:00:00,000 --> 00:00:01,000\nHello")
             artifact: StageArtifact = {
                 "schema_version": ARTIFACT_SCHEMA_VERSION,
                 "source_path": str(source),
                 "output_base": str(tmpdir),
-                "source_fingerprint": "1024:1700000000",
+                "source_fingerprint": source_fingerprint,
                 "backend": "whisper-cpp",
                 "device": "cpu",
                 "model": "large-v3",
@@ -2546,13 +2779,14 @@ class TestRunStage2Idempotency(unittest.TestCase):
         with TemporaryDirectory() as tmp:
             tmpdir = Path(tmp)
             source = tmpdir / "movie.mp4"
+            source_fingerprint = self._write_source(source)
             srt = tmpdir / "movie.srt"
             srt.write_text("1\n00:00:00,000 --> 00:00:01,000\nHello")
             artifact: StageArtifact = {
                 "schema_version": ARTIFACT_SCHEMA_VERSION,
                 "source_path": str(source),
                 "output_base": str(tmpdir),
-                "source_fingerprint": "1024:1700000000",
+                "source_fingerprint": source_fingerprint,
                 "backend": "whisper-cpp",
                 "device": "cpu",
                 "model": "large-v3",
@@ -2654,6 +2888,164 @@ class TestRunStage2Idempotency(unittest.TestCase):
             loaded_artifact = load_stage_artifact(artifact_path)
             self.assertTrue(loaded_artifact["stage_status"]["translation_complete"])
             self.assertFalse(loaded_artifact["stage_status"]["translation_failed"])
+
+    def test_run_stage2_prefers_cli_translate_to_over_artifact_target(self) -> None:
+        with TemporaryDirectory() as tmp:
+            tmpdir = Path(tmp)
+            source = tmpdir / "movie.mp4"
+            source_fingerprint = self._write_source(source)
+            srt = tmpdir / "movie.srt"
+            srt.write_text("1\n00:00:00,000 --> 00:00:01,000\nHello")
+
+            artifact: StageArtifact = {
+                "schema_version": ARTIFACT_SCHEMA_VERSION,
+                "source_path": str(source),
+                "output_base": str(tmpdir),
+                "source_fingerprint": source_fingerprint,
+                "backend": "whisper-cpp",
+                "device": "cpu",
+                "model": "large-v3",
+                "language": "en",
+                "language_probability": 0.99,
+                "duration": 1.0,
+                "quality": {"suspicious": False, "reasons": []},
+                "target_lang": "ko",
+                "formats": ["srt"],
+                "segments": [{"start": 0.0, "end": 1.0, "text": "Hello"}],
+                "primary_outputs": [str(srt)],
+                "stage_status": {
+                    "transcription_complete": True,
+                    "translation_pending": True,
+                    "translation_complete": False,
+                    "translation_failed": False,
+                    "translation_error": None,
+                },
+            }
+            artifact_path = tmpdir / "movie.stage1.json"
+            write_stage_artifact(artifact, tmpdir, source)
+
+            args = self._make_args(tmpdir)
+            args.translate_to = "ja"
+            translated_segs = [{"start": 0.0, "end": 1.0, "text": "こんにちは"}]
+            with (
+                patch(
+                    "vid_to_sub_app.cli.runner.translate_segments_openai_compatible",
+                    return_value=(translated_segs, {}),
+                ) as mock_translate,
+                patch(
+                    "vid_to_sub_app.cli.runner.write_outputs",
+                    return_value=[tmpdir / "movie.ja.srt"],
+                ) as mock_write_outputs,
+            ):
+                result = run_stage2(artifact_path, args)
+
+            loaded_artifact = load_stage_artifact(artifact_path)
+
+        self.assertTrue(result.success, result.error)
+        self.assertEqual("ja", mock_translate.call_args.kwargs["target_language"])
+        self.assertEqual(".ja", mock_write_outputs.call_args.kwargs["name_suffix"])
+        self.assertEqual("ja", loaded_artifact["target_lang"])
+
+    def test_run_stage2_blocks_source_fingerprint_mismatch_without_force_translate(
+        self,
+    ) -> None:
+        with TemporaryDirectory() as tmp:
+            tmpdir = Path(tmp)
+            source = tmpdir / "movie.mp4"
+            _ = self._write_source(source)
+            srt = tmpdir / "movie.srt"
+            srt.write_text("1\n00:00:00,000 --> 00:00:01,000\nHello")
+
+            artifact: StageArtifact = {
+                "schema_version": ARTIFACT_SCHEMA_VERSION,
+                "source_path": str(source),
+                "output_base": str(tmpdir),
+                "source_fingerprint": "0:0",
+                "backend": "whisper-cpp",
+                "device": "cpu",
+                "model": "large-v3",
+                "language": "en",
+                "language_probability": 0.99,
+                "duration": 1.0,
+                "quality": {"suspicious": False, "reasons": []},
+                "target_lang": "ko",
+                "formats": ["srt"],
+                "segments": [{"start": 0.0, "end": 1.0, "text": "Hello"}],
+                "primary_outputs": [str(srt)],
+                "stage_status": {
+                    "transcription_complete": True,
+                    "translation_pending": True,
+                    "translation_complete": False,
+                    "translation_failed": False,
+                    "translation_error": None,
+                },
+            }
+            artifact_path = tmpdir / "movie.stage1.json"
+            write_stage_artifact(artifact, tmpdir, source)
+
+            args = self._make_args(tmpdir)
+            with patch(
+                "vid_to_sub_app.cli.runner.translate_segments_openai_compatible"
+            ) as mock_translate:
+                result = run_stage2(artifact_path, args)
+
+            loaded_artifact = load_stage_artifact(artifact_path)
+
+        self.assertFalse(result.success)
+        self.assertIn("source fingerprint mismatch", (result.error or "").lower())
+        self.assertIn("--force-translate", result.error or "")
+        mock_translate.assert_not_called()
+        self.assertTrue(loaded_artifact["stage_status"]["translation_failed"])
+        self.assertFalse(loaded_artifact["stage_status"]["translation_complete"])
+
+    def test_run_stage2_allows_source_fingerprint_mismatch_with_force_translate(
+        self,
+    ) -> None:
+        with TemporaryDirectory() as tmp:
+            tmpdir = Path(tmp)
+            source = tmpdir / "movie.mp4"
+            _ = self._write_source(source)
+            srt = tmpdir / "movie.srt"
+            srt.write_text("1\n00:00:00,000 --> 00:00:01,000\nHello")
+
+            artifact: StageArtifact = {
+                "schema_version": ARTIFACT_SCHEMA_VERSION,
+                "source_path": str(source),
+                "output_base": str(tmpdir),
+                "source_fingerprint": "0:0",
+                "backend": "whisper-cpp",
+                "device": "cpu",
+                "model": "large-v3",
+                "language": "en",
+                "language_probability": 0.99,
+                "duration": 1.0,
+                "quality": {"suspicious": False, "reasons": []},
+                "target_lang": "ko",
+                "formats": ["srt"],
+                "segments": [{"start": 0.0, "end": 1.0, "text": "Hello"}],
+                "primary_outputs": [str(srt)],
+                "stage_status": {
+                    "transcription_complete": True,
+                    "translation_pending": True,
+                    "translation_complete": False,
+                    "translation_failed": False,
+                    "translation_error": None,
+                },
+            }
+            artifact_path = tmpdir / "movie.stage1.json"
+            write_stage_artifact(artifact, tmpdir, source)
+
+            args = self._make_args(tmpdir)
+            args.force_translate = True
+            translated_segs = [{"start": 0.0, "end": 1.0, "text": "안녕"}]
+            with patch(
+                "vid_to_sub_app.cli.runner.translate_segments_openai_compatible",
+                return_value=(translated_segs, {}),
+            ) as mock_translate:
+                result = run_stage2(artifact_path, args)
+
+        mock_translate.assert_called_once()
+        self.assertTrue(result.success, result.error)
 
     def test_fingerprint_emits_all_required_fields(self) -> None:
         segments = [{"start": 0.0, "end": 1.0, "text": "Hello"}]
@@ -3048,11 +3440,16 @@ class TestOverwriteTranslationFlag(unittest.TestCase):
             overwrite_translation=True,
         )
 
+    def _write_source(self, source: Path, payload: bytes = b"video") -> str:
+        source.write_bytes(payload)
+        source_stat = source.stat()
+        return f"{source_stat.st_size}:{int(source_stat.st_mtime)}"
+
     def test_overwrite_translation_reruns_despite_translation_complete(self) -> None:
         with TemporaryDirectory() as tmp:
             tmpdir = Path(tmp)
             source = tmpdir / "movie.mp4"
-            source.write_bytes(b"video")
+            source_fingerprint = self._write_source(source)
             srt = tmpdir / "movie.srt"
             srt.write_text(
                 "1\n00:00:00,000 --> 00:00:01,000\nHello\n", encoding="utf-8"
@@ -3066,7 +3463,7 @@ class TestOverwriteTranslationFlag(unittest.TestCase):
                 "schema_version": ARTIFACT_SCHEMA_VERSION,
                 "source_path": str(source),
                 "output_base": str(tmpdir),
-                "source_fingerprint": "0:0",
+                "source_fingerprint": source_fingerprint,
                 "backend": "faster-whisper",
                 "device": "cpu",
                 "model": "large-v3",
@@ -3141,6 +3538,7 @@ class TestLegacyInlineRollback(unittest.TestCase):
                 model="large-v3",
                 device="cpu",
                 language=None,
+                content_type="speech",
                 beam_size=5,
                 compute_type=None,
                 hf_token=None,
@@ -3195,6 +3593,100 @@ class TestLegacyInlineRollback(unittest.TestCase):
                 result.artifact_path, "Legacy inline result must have no artifact_path"
             )
 
+    def test_legacy_inline_rejects_translation_requests(self) -> None:
+        with TemporaryDirectory() as tmp:
+            tmpdir = Path(tmp)
+            video = tmpdir / "movie.mp4"
+            video.write_bytes(b"video")
+            task = {
+                "video_path": str(video),
+                "folder_hash": "folder-hash",
+                "folder_path": str(tmpdir),
+            }
+            args = argparse.Namespace(
+                backend="faster-whisper",
+                model="large-v3",
+                device="cpu",
+                language="en",
+                content_type="speech",
+                beam_size=5,
+                compute_type=None,
+                hf_token=None,
+                diarize=False,
+                whisper_cpp_model_path=None,
+                translate_to="ko",
+                translation_model="gpt-4.1-mini",
+                translation_base_url="https://translation.example/v1",
+                translation_api_key="secret",
+                postprocess_translation=False,
+                postprocess_mode="auto",
+                postprocess_model=None,
+                postprocess_base_url=None,
+                postprocess_api_key=None,
+                workers=1,
+                verbose=False,
+            )
+
+            with (
+                patch("vid_to_sub_app.cli.runner._LEGACY_INLINE", True),
+                patch(
+                    "vid_to_sub_app.cli.runner._process_one_inline",
+                    side_effect=AssertionError("inline path must be blocked"),
+                ),
+            ):
+                result = process_one(task, args, frozenset({"srt"}), tmpdir, 2, 0)
+
+        self.assertFalse(result.success)
+        self.assertEqual("legacy_inline", result.stage)
+        self.assertIn("--translate-to", result.error or "")
+
+    def test_legacy_inline_rejects_auto_content_type(self) -> None:
+        with TemporaryDirectory() as tmp:
+            tmpdir = Path(tmp)
+            video = tmpdir / "movie.mp4"
+            video.write_bytes(b"video")
+            task = {
+                "video_path": str(video),
+                "folder_hash": "folder-hash",
+                "folder_path": str(tmpdir),
+            }
+            args = argparse.Namespace(
+                backend="faster-whisper",
+                model="large-v3",
+                device="cpu",
+                language=None,
+                content_type="auto",
+                beam_size=5,
+                compute_type=None,
+                hf_token=None,
+                diarize=False,
+                whisper_cpp_model_path=None,
+                translate_to=None,
+                translation_model=None,
+                translation_base_url=None,
+                translation_api_key=None,
+                postprocess_translation=False,
+                postprocess_mode="auto",
+                postprocess_model=None,
+                postprocess_base_url=None,
+                postprocess_api_key=None,
+                workers=1,
+                verbose=False,
+            )
+
+            with (
+                patch("vid_to_sub_app.cli.runner._LEGACY_INLINE", True),
+                patch(
+                    "vid_to_sub_app.cli.runner._process_one_inline",
+                    side_effect=AssertionError("inline path must be blocked"),
+                ),
+            ):
+                result = process_one(task, args, frozenset({"srt"}), tmpdir, 2, 0)
+
+        self.assertFalse(result.success)
+        self.assertEqual("legacy_inline", result.stage)
+        self.assertIn("--content-type auto", result.error or "")
+
 
 class TestParallelLoopEventParity(unittest.TestCase):
     """PR0 characterization tests: freeze job_finished/folder_finished event payloads.
@@ -3247,8 +3739,9 @@ class TestParallelLoopEventParity(unittest.TestCase):
         manifest: dict[str, Any],
     ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
         """Run run_fn and collect emitted events, returning (job_events, folder_events)."""
-        from vid_to_sub_app.shared.constants import EVENT_PREFIX
         import sys
+
+        from vid_to_sub_app.shared.constants import EVENT_PREFIX
 
         job_events: list[dict[str, Any]] = []
         folder_events: list[dict[str, Any]] = []

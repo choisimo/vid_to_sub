@@ -17,6 +17,7 @@ class StageArtifact(TypedDict):
     backend: str
     device: str
     model: str
+    content_type: str | None
     language: str | None
     language_probability: float | None
     duration: float | None
@@ -32,6 +33,9 @@ class StageArtifactMetadata(TypedDict, total=False):
     path: str
     schema_version: str
     target_lang: str | None
+    content_type: str | None
+    stage1_output_held: bool
+    stage1_output_warning: str | None
     transcription_complete: bool
     translation_pending: bool
     translation_complete: bool
@@ -44,12 +48,50 @@ def artifact_path_for(source_path: Path, output_dir: Path | None) -> Path:
     return artifact_dir / f"{source_path.stem}{ARTIFACT_FILENAME_SUFFIX}"
 
 
+def fingerprint_source_path(source_path: Path) -> str:
+    source_stat = source_path.stat()
+    return f"{source_stat.st_size}:{int(source_stat.st_mtime)}"
+
+
+def verify_artifact_source(artifact: StageArtifact) -> str | None:
+    source_raw = str(artifact.get("source_path") or "").strip()
+    if not source_raw:
+        return "Stage artifact is missing source_path."
+
+    expected_fingerprint = str(artifact.get("source_fingerprint") or "").strip()
+    if not expected_fingerprint:
+        return "Stage artifact is missing source_fingerprint."
+
+    source_path = Path(source_raw).expanduser()
+    try:
+        actual_fingerprint = fingerprint_source_path(source_path)
+    except FileNotFoundError:
+        return (
+            "Stage artifact source file is missing, so source_fingerprint cannot "
+            f"be verified: {source_path}"
+        )
+    except OSError as exc:
+        return (
+            "Stage artifact source file could not be fingerprinted, so replay "
+            f"cannot be verified: {source_path} ({exc})"
+        )
+
+    if actual_fingerprint != expected_fingerprint:
+        return (
+            "Stage artifact source fingerprint mismatch. "
+            f"Expected {expected_fingerprint}, found {actual_fingerprint} for "
+            f"{source_path}"
+        )
+    return None
+
+
 def write_stage_artifact(
     artifact: StageArtifact,
     output_dir: Path | None,
     source_path: Path,
 ) -> Path:
     artifact_path = artifact_path_for(source_path, output_dir)
+    artifact_path.parent.mkdir(parents=True, exist_ok=True)
     artifact_path.write_text(json.dumps(artifact, indent=2), encoding="utf-8")
     return artifact_path
 
@@ -75,10 +117,19 @@ def build_stage_artifact_metadata(
         return metadata
 
     stage_status = artifact.get("stage_status") or {}
+    quality = artifact.get("quality") or {}
     metadata.update(
         {
             "schema_version": str(artifact.get("schema_version") or ""),
             "target_lang": cast(str | None, artifact.get("target_lang")),
+            "content_type": cast(str | None, artifact.get("content_type")),
+            "stage1_output_held": bool(
+                stage_status.get("stage1_output_held") or quality.get("output_held")
+            ),
+            "stage1_output_warning": cast(
+                str | None,
+                stage_status.get("stage1_output_warning") or quality.get("warning"),
+            ),
             "transcription_complete": bool(stage_status.get("transcription_complete")),
             "translation_pending": bool(stage_status.get("translation_pending")),
             "translation_complete": bool(stage_status.get("translation_complete")),

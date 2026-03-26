@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-import subprocess
 import importlib
 import re
+import subprocess
 import sys
 import tempfile
 import threading
@@ -16,8 +16,8 @@ from vid_to_sub_app.shared.constants import (
     ROOT_DIR,
 )
 from vid_to_sub_app.shared.env import (
-    detect_cuda_total_memory_gb,
     detect_best_device,
+    detect_cuda_total_memory_gb,
     detect_torch_device,
     faster_whisper_model_candidates,
     find_whisper_cpp_bin,
@@ -64,10 +64,16 @@ def _music_safe_backend_options(
         return {
             "condition_on_previous_text": False,
             "vad_filter": True,
+            "compression_ratio_threshold": 2.2,
+            "log_prob_threshold": -0.5,
+            "no_speech_threshold": 0.45,
         }
     if backend == "whisper":
         return {
             "condition_on_previous_text": False,
+            "compression_ratio_threshold": 2.2,
+            "logprob_threshold": -0.5,
+            "no_speech_threshold": 0.45,
         }
     raise RuntimeError(
         f"--content-type music is not supported for backend '{backend}'. "
@@ -838,9 +844,10 @@ def transcribe(
     threads: int,
     progress_callback: Optional[Callable[[float], None]] = None,
 ) -> tuple[list[TranscriptSegment], dict[str, object]]:
+    normalized_content_type = _normalize_content_type(content_type)
     if backend == "whisper-cpp":
         _transcribe_options_for_content_type("whisper-cpp", content_type, language)
-        return transcribe_whisper_cpp(
+        segments, info = transcribe_whisper_cpp(
             video,
             model_name,
             device,
@@ -849,8 +856,8 @@ def transcribe(
             whisper_cpp_model_path,
             progress_callback=progress_callback,
         )
-    if backend == "faster-whisper":
-        return transcribe_faster_whisper(
+    elif backend == "faster-whisper":
+        segments, info = transcribe_faster_whisper(
             video,
             model_name,
             device,
@@ -860,8 +867,8 @@ def transcribe(
             compute_type,
             threads,
         )
-    if backend == "whisper":
-        return transcribe_openai_whisper(
+    elif backend == "whisper":
+        segments, info = transcribe_openai_whisper(
             video,
             model_name,
             device,
@@ -870,9 +877,9 @@ def transcribe(
             beam_size,
             threads,
         )
-    if backend == "whisperx":
+    elif backend == "whisperx":
         _transcribe_options_for_content_type("whisperx", content_type, language)
-        return transcribe_whisperx(
+        segments, info = transcribe_whisperx(
             video,
             model_name,
             device,
@@ -883,5 +890,9 @@ def transcribe(
             diarize,
             threads,
         )
-    _normalize_content_type(content_type)
-    raise ValueError(f"Unknown backend: {backend!r}")
+    else:
+        raise ValueError(f"Unknown backend: {backend!r}")
+
+    info = dict(info)
+    info.setdefault("content_type", normalized_content_type)
+    return segments, info

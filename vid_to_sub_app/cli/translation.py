@@ -35,7 +35,6 @@ from vid_to_sub_app.shared.constants import (
     TRANSLATION_RETRY_SCHEDULE,
 )
 
-
 _BATCH_COUNTER = count(1)
 
 
@@ -287,6 +286,7 @@ def _request_chat_completion(
     attempt: int,
     stage: str,
     payload_chars: int,
+    max_http_attempts: int | None = None,
 ) -> ProviderResponse:
     payload_json = json.dumps(payload, ensure_ascii=False)
     request = urllib.request.Request(
@@ -303,9 +303,16 @@ def _request_chat_completion(
     response_payload: Any = None
     http_status: int | None = None
     headers: Any = None
-    max_http_attempts = max(1, int(TRANSLATION_HTTP_RETRY_ATTEMPTS))
+    resolved_http_attempts = max(
+        1,
+        int(
+            TRANSLATION_HTTP_RETRY_ATTEMPTS
+            if max_http_attempts is None
+            else max_http_attempts
+        ),
+    )
     with _TRANSLATION_SEMAPHORE:
-        for http_attempt in range(1, max_http_attempts + 1):
+        for http_attempt in range(1, resolved_http_attempts + 1):
             try:
                 with _urlopen_with_timeout(
                     request, TRANSLATION_HTTP_TIMEOUT_SEC
@@ -325,7 +332,9 @@ def _request_chat_completion(
                         status_code=exc.code,
                     ) from exc
                 if _should_retry_http_request(
-                    status_code=exc.code, http_attempt=http_attempt
+                    status_code=exc.code,
+                    http_attempt=http_attempt,
+                    max_http_attempts=resolved_http_attempts,
                 ):
                     _emit_http_retry_log(
                         batch_id=batch_id,
@@ -349,7 +358,9 @@ def _request_chat_completion(
             except (urllib.error.URLError, TimeoutError, socket.timeout) as exc:
                 reason = getattr(exc, "reason", exc)
                 if _should_retry_http_request(
-                    status_code=None, http_attempt=http_attempt
+                    status_code=None,
+                    http_attempt=http_attempt,
+                    max_http_attempts=resolved_http_attempts,
                 ):
                     _emit_http_retry_log(
                         batch_id=batch_id,
@@ -431,8 +442,9 @@ def _should_retry_http_request(
     *,
     status_code: int | None,
     http_attempt: int,
+    max_http_attempts: int,
 ) -> bool:
-    if http_attempt >= max(1, int(TRANSLATION_HTTP_RETRY_ATTEMPTS)):
+    if http_attempt >= max(1, int(max_http_attempts)):
         return False
     if status_code is None:
         return True
@@ -813,6 +825,9 @@ def _translate_batch(
     )
     payload_chars = len(json.dumps(payload, ensure_ascii=False))
     actual_batch_size = len(batch)
+    max_http_attempts = (
+        max(1, int(TRANSLATION_HTTP_RETRY_ATTEMPTS)) if actual_batch_size <= 1 else 1
+    )
     batch_requested_count = (
         actual_batch_size
         if requested_count is None
@@ -831,6 +846,7 @@ def _translate_batch(
                 attempt=attempt,
                 stage=stage,
                 payload_chars=payload_chars,
+                max_http_attempts=max_http_attempts,
             )
         except StructuredOutputFallbackRequired as exc:
             policy.enabled = False
@@ -874,6 +890,7 @@ def _translate_batch(
                 attempt=attempt,
                 stage=stage,
                 payload_chars=payload_chars,
+                max_http_attempts=max_http_attempts,
             )
         parsed = _parse_translation_payload(
             message=provider_response.message,

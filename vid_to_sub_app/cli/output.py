@@ -5,7 +5,7 @@ import re
 import subprocess
 from datetime import timedelta
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 from vid_to_sub_app.shared.constants import FORMATS
 
@@ -74,6 +74,34 @@ def probe_media_duration(video: Path) -> Optional[float]:
         return float(value)
     except ValueError:
         return None
+
+
+def probe_media_metadata(video: Path) -> dict[str, Any] | None:
+    command = [
+        "ffprobe",
+        "-v",
+        "error",
+        "-show_entries",
+        "format_tags:stream_tags:chapter_tags",
+        "-of",
+        "json",
+        str(video),
+    ]
+    try:
+        result = subprocess.run(command, check=True, capture_output=True, text=True)
+    except (FileNotFoundError, subprocess.CalledProcessError):
+        return None
+
+    raw = result.stdout.strip()
+    if not raw:
+        return None
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    return payload
 
 
 def parse_srt(text: str) -> list[dict]:
@@ -146,6 +174,29 @@ def segments_to_json(segments, info: dict | None = None) -> str:
     return json.dumps(payload, ensure_ascii=False, indent=2)
 
 
+def planned_output_paths(
+    video_path: Path,
+    formats: frozenset[str],
+    output_dir: Optional[Path],
+    name_suffix: str = "",
+) -> list[Path]:
+    base_dir = output_dir if output_dir else video_path.parent
+    stem = video_path.stem
+    active = set(FORMATS) if "all" in formats else (formats & set(FORMATS))
+    extensions = {
+        "srt": "srt",
+        "vtt": "vtt",
+        "txt": "txt",
+        "tsv": "tsv",
+        "json": "json",
+    }
+    return [
+        base_dir / f"{stem}{name_suffix}.{extensions[fmt]}"
+        for fmt in FORMATS
+        if fmt in active
+    ]
+
+
 def write_outputs(
     video_path: Path,
     segments: list[dict],
@@ -156,7 +207,6 @@ def write_outputs(
 ) -> list[Path]:
     base_dir = output_dir if output_dir else video_path.parent
     base_dir.mkdir(parents=True, exist_ok=True)
-    stem = video_path.stem
     written: list[Path] = []
 
     writers = {
@@ -166,12 +216,14 @@ def write_outputs(
         "tsv": ("tsv", segments_to_tsv),
         "json": ("json", lambda s: segments_to_json(s, info)),
     }
-    active = set(FORMATS) if "all" in formats else (formats & set(FORMATS))
-
-    for fmt, (ext, writer) in writers.items():
-        if fmt not in active:
-            continue
-        out_path = base_dir / f"{stem}{name_suffix}.{ext}"
+    for out_path in planned_output_paths(
+        video_path,
+        formats,
+        output_dir,
+        name_suffix=name_suffix,
+    ):
+        fmt = out_path.suffix.lstrip(".")
+        _ext, writer = writers[fmt]
         out_path.write_text(writer(segments), encoding="utf-8")
         written.append(out_path)
 
