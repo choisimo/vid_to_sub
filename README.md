@@ -286,6 +286,11 @@ existing local stage-2 follow-up automatically. If that fetch/remap step fails,
 review the saved SSH connection and `path_map`, or replay translation manually with
 `--translate-from-artifact` after copying the artifact locally.
 
+> **Distributed mode scope**: remote execution covers **stage-1 (transcription) only**.
+> Stage-2 (translation/post-processing) always runs locally on the machine that started
+> the TUI, immediately after all stage-1 artifacts have been fetched. If you see no
+> automatic stage-2 launch, check the log for fetch/remap errors.
+
 Example profile JSON:
 
 ```json
