@@ -37,17 +37,14 @@ __all__ = PUBLIC_EXPORTS
 def _load_public_module():
     return import_module("vid_to_sub_app.tui")
 
-
-if __name__ != "__main__":
-    _public = _load_public_module()
-    for _name in PUBLIC_EXPORTS:
-        globals()[_name] = getattr(_public, _name)
-
-
 def __getattr__(name: str):
     if name in PUBLIC_EXPORTS:
         return getattr(_load_public_module(), name)
     raise AttributeError(name)
+
+
+def __dir__() -> list[str]:
+    return sorted(set(globals()) | set(PUBLIC_EXPORTS))
 
 
 def main() -> int:

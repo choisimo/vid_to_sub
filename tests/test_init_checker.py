@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import importlib
 import os
 import subprocess
 import sys
@@ -13,6 +14,46 @@ import tui
 
 
 class InitCheckerTests(unittest.TestCase):
+    def test_importing_tui_does_not_eagerly_import_tui_package(self) -> None:
+        saved_modules = {
+            name: sys.modules.get(name)
+            for name in ("tui", "vid_to_sub_app.tui", "vid_to_sub_app.tui.app")
+        }
+        for name in saved_modules:
+            sys.modules.pop(name, None)
+
+        try:
+            module = importlib.import_module("tui")
+            self.assertNotIn("vid_to_sub_app.tui", sys.modules)
+            self.assertNotIn("vid_to_sub_app.tui.app", sys.modules)
+            self.assertIn("VidToSubApp", module.__all__)
+        finally:
+            sys.modules.pop("tui", None)
+            sys.modules.pop("vid_to_sub_app.tui", None)
+            sys.modules.pop("vid_to_sub_app.tui.app", None)
+            for name, module in saved_modules.items():
+                if module is not None:
+                    sys.modules[name] = module
+
+    def test_importing_tui_package_does_not_eagerly_import_app_module(self) -> None:
+        saved_modules = {
+            name: sys.modules.get(name)
+            for name in ("vid_to_sub_app.tui", "vid_to_sub_app.tui.app")
+        }
+        for name in saved_modules:
+            sys.modules.pop(name, None)
+
+        try:
+            module = importlib.import_module("vid_to_sub_app.tui")
+            self.assertNotIn("vid_to_sub_app.tui.app", sys.modules)
+            self.assertIn("VidToSubApp", module.__all__)
+        finally:
+            sys.modules.pop("vid_to_sub_app.tui", None)
+            sys.modules.pop("vid_to_sub_app.tui.app", None)
+            for name, module in saved_modules.items():
+                if module is not None:
+                    sys.modules[name] = module
+
     def test_tui_main_bootstraps_base_group_only(self) -> None:
         with (
             patch("init_checker.bootstrap_runtime") as bootstrap_runtime,
