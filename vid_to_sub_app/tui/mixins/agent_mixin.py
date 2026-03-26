@@ -11,6 +11,8 @@ from textual import work
 from textual.css.query import NoMatches
 from textual.widgets import Button, RichLog, Static, TextArea
 
+from vid_to_sub_app.shared.secrets import read_secret_value
+
 from ..helpers import (
     DEFAULT_MODEL,
     ENV_AGENT_KEY,
@@ -75,6 +77,7 @@ class AgentMixin:
         - _action_agent_apply() -> None
         - _action_agent_clear() -> None
     """
+
     def _effective_agent_config(self) -> tuple[str, str, str]:
         model = (
             _db.get(ENV_AGENT_MOD)
@@ -88,12 +91,7 @@ class AgentMixin:
             or os.environ.get(ENV_AGENT_URL, "")
             or os.environ.get(ENV_TRANS_URL, "")
         )
-        api_key = (
-            _db.get(ENV_AGENT_KEY)
-            or _db.get(ENV_TRANS_KEY)
-            or os.environ.get(ENV_AGENT_KEY, "")
-            or os.environ.get(ENV_TRANS_KEY, "")
-        )
+        api_key = read_secret_value(ENV_AGENT_KEY) or read_secret_value(ENV_TRANS_KEY)
         return model, base_url, api_key
 
     def _update_agent_config_status(self) -> None:

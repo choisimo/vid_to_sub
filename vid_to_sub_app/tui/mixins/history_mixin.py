@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import shutil
 from pathlib import Path
@@ -13,6 +14,7 @@ from textual.widgets import DataTable, Input, Select, Static, Switch
 from vid_to_sub_app.cli.output import parse_srt_timestamp, srt_timestamp
 from vid_to_sub_app.cli.stage_artifact import load_stage_artifact
 from vid_to_sub_app.cli.translation import translate_segments_openai_compatible
+from vid_to_sub_app.shared.secrets import read_secret_value
 
 from ..helpers import (
     DEFAULT_BACKEND,
@@ -27,7 +29,6 @@ from ..helpers import (
     resolve_copy_dest,
 )
 from ..state import db as _db
-
 
 SRT_BLOCK_RE = re.compile(
     r"(?ms)^\s*\d+\s*\n\s*"
@@ -400,9 +401,7 @@ class HistoryMixin:
         if missing_paths:
             app._log(f"[yellow]Skipped {len(missing_paths)} missing file(s).[/]")
         if skipped_non_srt:
-            app._log(
-                f"[yellow]Skipped {skipped_non_srt} non-SRT subtitle file(s).[/]"
-            )
+            app._log(f"[yellow]Skipped {skipped_non_srt} non-SRT subtitle file(s).[/]")
         if stage_artifact_path:
             app._log(
                 "[yellow]Stage artifact is not available on disk; falling back to direct SRT translation.[/]"
@@ -414,9 +413,21 @@ class HistoryMixin:
         self, subtitle_paths: list[str], target_lang: str
     ) -> None:
         app = _history_app(self)
-        translation_base_url = app._val("inp-trans-url") or _db.get(ENV_TRANS_URL) or None
-        translation_api_key = app._val("inp-trans-key") or _db.get(ENV_TRANS_KEY) or None
-        translation_model = app._val("inp-trans-model") or _db.get(ENV_TRANS_MOD) or None
+        translation_base_url = (
+            app._val("inp-trans-url")
+            or _db.get(ENV_TRANS_URL)
+            or os.environ.get(ENV_TRANS_URL)
+            or None
+        )
+        translation_api_key = (
+            app._val("inp-trans-key") or read_secret_value(ENV_TRANS_KEY) or None
+        )
+        translation_model = (
+            app._val("inp-trans-model")
+            or _db.get(ENV_TRANS_MOD)
+            or os.environ.get(ENV_TRANS_MOD)
+            or None
+        )
         translated_count = 0
 
         for subtitle_path in subtitle_paths:

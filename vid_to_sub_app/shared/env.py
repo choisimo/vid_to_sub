@@ -17,15 +17,15 @@ from .constants import (
     DEFAULT_DEVICE,
     DEFAULT_MODEL,
     ENV_FILE,
-    FASTER_WHISPER_MODEL_FALLBACKS,
-    FASTER_WHISPER_MODEL_MIN_VRAM_GB,
     ENV_WHISPER_CPP_BIN,
     ENV_WHISPER_CPP_MODEL,
+    FASTER_WHISPER_MODEL_FALLBACKS,
+    FASTER_WHISPER_MODEL_MIN_VRAM_GB,
     MODEL_SEARCH_DIRS,
     ROOT_DIR,
+    SECRET_ENV_KEYS,
     WHISPER_CLI_CANDIDATES,
 )
-
 
 # ---------------------------------------------------------------------------
 # SQLite-first env loading
@@ -66,6 +66,8 @@ def load_env_from_sqlite(
     count = 0
     for key, value in settings.items():
         if not key.startswith("VID_TO_SUB_"):
+            continue
+        if key in SECRET_ENV_KEYS:
             continue
         if value:
             if override or key not in os.environ:
@@ -119,6 +121,8 @@ def import_env_file_to_sqlite(
     existing = get_all() if not overwrite else {}
     to_write: dict[str, str] = {}
     for key, value in parsed.items():
+        if key in SECRET_ENV_KEYS:
+            continue
         if overwrite or not (existing.get(key) or "").strip():
             to_write[key] = value
 
@@ -332,7 +336,7 @@ def detect_cuda_free_memory_gb() -> float | None:
                 for index in range(device_count):
                     try:
                         free_bytes, _total_bytes = torch.cuda.mem_get_info(index)
-                        free_values.append(float(free_bytes) / (1024 ** 3))
+                        free_values.append(float(free_bytes) / (1024**3))
                     except Exception:
                         pass
                 if free_values:

@@ -30,9 +30,7 @@ VIDEO_EXTENSIONS: frozenset[str] = frozenset(
 
 FORMATS: list[str] = ["srt", "vtt", "txt", "tsv", "json"]
 SUPPORTED_FORMATS: frozenset[str] = frozenset({*FORMATS, "all"})
-SUBTITLE_OUTPUT_EXTENSIONS: frozenset[str] = frozenset(
-    {".srt", ".vtt", ".txt", ".tsv"}
-)
+SUBTITLE_OUTPUT_EXTENSIONS: frozenset[str] = frozenset({".srt", ".vtt", ".txt", ".tsv"})
 POSTPROCESS_MODES: tuple[str, ...] = ("auto", "web_lookup", "context_polish")
 
 KNOWN_MODELS: tuple[str, ...] = (
@@ -120,7 +118,15 @@ FASTER_WHISPER_MODEL_FALLBACKS: dict[str, tuple[str, ...]] = {
         "base",
         "tiny",
     ),
-    "distil-small.en": ("distil-small.en", "small.en", "small", "base.en", "base", "tiny.en", "tiny"),
+    "distil-small.en": (
+        "distil-small.en",
+        "small.en",
+        "small",
+        "base.en",
+        "base",
+        "tiny.en",
+        "tiny",
+    ),
     "distil-medium.en": (
         "distil-medium.en",
         "medium.en",
@@ -186,6 +192,13 @@ ENV_WHISPER_CPP_MODEL = "VID_TO_SUB_WHISPER_CPP_MODEL"
 ENV_AGENT_BASE_URL = "VID_TO_SUB_AGENT_BASE_URL"
 ENV_AGENT_API_KEY = "VID_TO_SUB_AGENT_API_KEY"
 ENV_AGENT_MODEL = "VID_TO_SUB_AGENT_MODEL"
+SECRET_ENV_KEYS: frozenset[str] = frozenset(
+    {
+        ENV_TRANSLATION_API_KEY,
+        ENV_POSTPROCESS_API_KEY,
+        ENV_AGENT_API_KEY,
+    }
+)
 ENV_TRANSLATION_DEBUG = "VID_TO_SUB_TRANSLATION_DEBUG"
 TRANSLATION_MODES: tuple[str, ...] = ("strict", "best-effort")
 TRANSLATION_RETRY_SCHEDULE: tuple[int, ...] = (100, 50, 20, 10, 5, 1)

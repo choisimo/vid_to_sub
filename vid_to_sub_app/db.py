@@ -13,11 +13,15 @@ from __future__ import annotations
 
 import atexit
 import json
+import os
 import sqlite3
 import threading
 from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
+
+from vid_to_sub_app.shared.constants import SECRET_ENV_KEYS
+from vid_to_sub_app.shared.secrets import persist_secret_value
 
 if TYPE_CHECKING:
     from vid_to_sub_app.cli.stage_artifact import StageArtifactMetadata
@@ -25,7 +29,29 @@ else:
     StageArtifactMetadata = dict[str, Any]
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
-DB_PATH = ROOT_DIR / "vid_to_sub.db"
+DB_PATH_ENV = "VID_TO_SUB_DB_PATH"
+
+
+def _default_state_dir() -> Path:
+    xdg_state_home = os.environ.get("XDG_STATE_HOME", "").strip()
+    if xdg_state_home:
+        return Path(xdg_state_home).expanduser() / "vid_to_sub"
+    return Path.home() / ".local" / "state" / "vid_to_sub"
+
+
+def _resolve_default_db_path() -> Path:
+    configured = os.environ.get(DB_PATH_ENV, "").strip()
+    if configured:
+        return Path(configured).expanduser()
+
+    legacy_project_db = ROOT_DIR / "vid_to_sub.db"
+    if legacy_project_db.exists():
+        return legacy_project_db
+
+    return _default_state_dir() / "vid_to_sub.db"
+
+
+DB_PATH = _resolve_default_db_path()
 
 _SCHEMA = """\
 PRAGMA journal_mode = WAL;
@@ -156,7 +182,8 @@ class Database:
     """Thread-safe SQLite wrapper using per-thread connections."""
 
     def __init__(self, path: Path = DB_PATH) -> None:
-        self._path = path
+        self._path = Path(path).expanduser()
+        self._path.parent.mkdir(parents=True, exist_ok=True)
         self._local = threading.local()
         self._connections: dict[int, sqlite3.Connection] = {}
         self._connections_lock = threading.Lock()
@@ -295,9 +322,41 @@ class Database:
             self.set_many(missing)
 
     def get_env_dict(self) -> dict[str, str]:
-        """Return only the VID_TO_SUB_ settings with non-empty values."""
+        """Return only non-secret VID_TO_SUB_ settings with non-empty values."""
         all_s = self.get_all()
-        return {k: v for k, v in all_s.items() if k in ENV_KEYS and v}
+        return {
+            k: v
+            for k, v in all_s.items()
+            if k in ENV_KEYS and k not in SECRET_ENV_KEYS and v
+        }
+
+    def migrate_secret_settings_to_env(
+        self,
+        *,
+        override: bool = False,
+    ) -> dict[str, str]:
+        """Move persisted secret settings into runtime secret storage once.
+
+        API keys are no longer kept in SQLite by default. This helper preserves
+        existing users' current session by copying any legacy plaintext secret
+        values into session env and, when available, the OS keyring, then blanks
+        the SQLite rows.
+        """
+        settings = self.get_all()
+        migrated: dict[str, str] = {}
+        for key in SECRET_ENV_KEYS:
+            value = str(settings.get(key) or "").strip()
+            if not value:
+                continue
+            existing_value = os.environ.get(key, "").strip()
+            persist_secret_value(key, value)
+            if existing_value and not override:
+                os.environ[key] = existing_value
+            migrated[key] = value
+
+        if migrated:
+            self.set_many({key: "" for key in migrated})
+        return migrated
 
     # ── Jobs ──────────────────────────────────────────────────────────────
 

@@ -15,6 +15,8 @@ from vid_to_sub_app.db import (
     TUI_DEFAULT_FORCE_TRANSLATE_KEY,
     TUI_DEFAULT_TRANSLATE_ENABLED_KEY,
 )
+from vid_to_sub_app.shared.constants import SECRET_ENV_KEYS
+from vid_to_sub_app.shared.secrets import persist_secret_value, read_secret_value
 
 from ..helpers import (
     ENV_AGENT_KEY,
@@ -30,13 +32,13 @@ from ..helpers import (
     ENV_WCPP_BIN,
     ENV_WCPP_MODEL,
     _mask,
+    merge_remote_resource_profiles,
     parse_remote_resources,
-    summarize_remote_resources,
     summarize_ggml_models,
+    summarize_remote_resources,
 )
 from ..models import RemoteResourceProfile, ssh_connection_from_row
 from ..state import db as _db
-
 
 _MISSING = object()
 
@@ -87,31 +89,33 @@ class SettingsMixin:
         except NoMatches:
             return ""
 
+    def _persisted_or_env_value(self, key: str) -> str:
+        if key in SECRET_ENV_KEYS:
+            return read_secret_value(key)
+        return _db.get(key)
+
+    def _apply_secret_values_to_session_env(
+        self, data: Mapping[str, str]
+    ) -> dict[str, str]:
+        storage_modes: dict[str, str] = {}
+        for key, value in data.items():
+            if key not in SECRET_ENV_KEYS:
+                continue
+            storage_modes[key] = persist_secret_value(key, value)
+        return storage_modes
+
     def _load_remote_resources(self) -> None:
-        profiles: list[RemoteResourceProfile] = []
-        warnings: list[str] = []
+        primary_profiles: list[RemoteResourceProfile] = []
+        legacy_profiles: list[RemoteResourceProfile] = []
 
         for row in _db.get_ssh_connections(enabled_only=True):
             conn = ssh_connection_from_row(row)
-            profiles.append(conn.to_remote_resource_profile())
+            primary_profiles.append(conn.to_remote_resource_profile())
 
         raw = _db.get("tui.remote_resources")
         if raw and raw.strip() not in ("", "[]"):
             try:
-                legacy = parse_remote_resources(raw)
-                existing_names = {profile.name for profile in profiles}
-                shadowed_legacy_names: list[str] = []
-                for profile in legacy:
-                    if profile.name in existing_names:
-                        shadowed_legacy_names.append(profile.name)
-                        continue
-                    profiles.append(profile)
-                if shadowed_legacy_names:
-                    names = ", ".join(sorted(set(shadowed_legacy_names)))
-                    warnings.append(
-                        "SSH connections override legacy remote JSON for duplicate "
-                        f"name(s): {names}."
-                    )
+                legacy_profiles = parse_remote_resources(raw)
             except ValueError as exc:
                 try:
                     self.query_one("#stg-status", Static).update(
@@ -120,30 +124,10 @@ class SettingsMixin:
                 except NoMatches:
                     pass
 
-        duplicate_targets: dict[tuple[str, str], set[str]] = {}
-        for profile in profiles:
-            signature = (
-                profile.ssh_target.strip(),
-                profile.remote_workdir.strip(),
-            )
-            duplicate_targets.setdefault(signature, set()).add(profile.name)
-        colliding_target_names = sorted(
-            names
-            for names in (
-                sorted(profile_names)
-                for profile_names in duplicate_targets.values()
-                if len(profile_names) > 1
-            )
+        profiles, warnings = merge_remote_resource_profiles(
+            primary_profiles,
+            legacy_profiles,
         )
-        if colliding_target_names:
-            rendered = "; ".join(
-                ", ".join(profile_names) for profile_names in colliding_target_names
-            )
-            warnings.append(
-                "Remote profiles share the same ssh target/workdir under different "
-                f"names: {rendered}. Distributed assignment still keys off profile names."
-            )
-
         self._remote_resources = profiles
         self._remote_resource_warnings = warnings
 
@@ -236,11 +220,8 @@ class SettingsMixin:
                 or os.environ.get(ENV_AGENT_URL, "")
                 or os.environ.get(ENV_TRANS_URL, "")
             )
-            api_key = (
-                _db.get(ENV_AGENT_KEY)
-                or _db.get(ENV_TRANS_KEY)
-                or os.environ.get(ENV_AGENT_KEY, "")
-                or os.environ.get(ENV_TRANS_KEY, "")
+            api_key = read_secret_value(ENV_AGENT_KEY) or read_secret_value(
+                ENV_TRANS_KEY
             )
 
         status = (
@@ -315,7 +296,9 @@ class SettingsMixin:
         ]
         for wid, key in pairs:
             try:
-                self.query_one(f"#{wid}", Input).value = _db.get(key)
+                self.query_one(f"#{wid}", Input).value = self._persisted_or_env_value(
+                    key
+                )
             except NoMatches:
                 pass
         try:
@@ -360,7 +343,7 @@ class SettingsMixin:
             ("inp-wcpp-bin", ENV_WCPP_BIN),
         ]:
             try:
-                val = _db.get(key) or os.environ.get(key, "")
+                val = self._persisted_or_env_value(key) or os.environ.get(key, "")
                 if val:
                     self.query_one(f"#{wid}", Input).value = val
             except NoMatches:
@@ -479,17 +462,14 @@ class SettingsMixin:
             )
 
     def _save_settings(self) -> None:
-        pairs = [
+        persisted_pairs = [
             ("stg-wcpp-bin", ENV_WCPP_BIN),
             ("stg-wcpp-model", ENV_WCPP_MODEL),
             ("stg-trans-url", ENV_TRANS_URL),
-            ("stg-trans-key", ENV_TRANS_KEY),
             ("stg-trans-model", ENV_TRANS_MOD),
             ("stg-post-url", ENV_POST_URL),
-            ("stg-post-key", ENV_POST_KEY),
             ("stg-post-model", ENV_POST_MOD),
             ("stg-agent-url", ENV_AGENT_URL),
-            ("stg-agent-key", ENV_AGENT_KEY),
             ("stg-agent-model", ENV_AGENT_MOD),
             ("stg-build-dir", "tui.build_dir"),
             ("stg-install-dir", "tui.install_dir"),
@@ -498,10 +478,21 @@ class SettingsMixin:
             ("stg-default-output-dir", "tui.default_output_dir"),
             ("stg-default-translate-to", "tui.default_translate_to"),
         ]
+        secret_pairs = [
+            ("stg-trans-key", ENV_TRANS_KEY),
+            ("stg-post-key", ENV_POST_KEY),
+            ("stg-agent-key", ENV_AGENT_KEY),
+        ]
         data: dict[str, str] = {}
-        for wid, key in pairs:
+        for wid, key in persisted_pairs:
             try:
                 data[key] = self.query_one(f"#{wid}", Input).value.strip()
+            except NoMatches:
+                pass
+        secret_values: dict[str, str] = {}
+        for wid, key in secret_pairs:
+            try:
+                secret_values[key] = self.query_one(f"#{wid}", Input).value.strip()
             except NoMatches:
                 pass
         try:
@@ -536,7 +527,12 @@ class SettingsMixin:
             except NoMatches:
                 pass
             return
-        previous_values = {key: _db.get(key) for _, key in pairs}
+        previous_values = {
+            key: self._persisted_or_env_value(key) for _, key in persisted_pairs
+        }
+        previous_values.update(
+            {key: os.environ.get(key, "") for _, key in secret_pairs}
+        )
         previous_values[TUI_DEFAULT_TRANSLATE_ENABLED_KEY] = _db.get(
             TUI_DEFAULT_TRANSLATE_ENABLED_KEY
         )
@@ -548,7 +544,10 @@ class SettingsMixin:
         )
         _db.set_many(data)
         self._apply_db_to_env()
-        self._sync_transcribe_overrides_from_settings(previous_values, data)
+        secret_storage = self._apply_secret_values_to_session_env(secret_values)
+        session_values = dict(data)
+        session_values.update(secret_values)
+        self._sync_transcribe_overrides_from_settings(previous_values, session_values)
         self._sync_run_defaults_from_settings(previous_values, data)
         self._load_remote_resources()
         self._run_detection()
@@ -557,7 +556,13 @@ class SettingsMixin:
         self._update_agent_config_status()
         self._update_cmd_preview()
         try:
-            self.query_one("#stg-status", Static).update("[green]✓ Saved to SQLite[/]")
+            if any(mode == "keyring" for mode in secret_storage.values()):
+                status = "[green]✓ Saved to SQLite + OS keyring[/]"
+            else:
+                status = (
+                    "[green]✓ Saved to SQLite (API keys kept in session env only)[/]"
+                )
+            self.query_one("#stg-status", Static).update(status)
         except NoMatches:
             pass
 
@@ -567,13 +572,10 @@ class SettingsMixin:
             ENV_WCPP_BIN: "stg-wcpp-bin",
             ENV_WCPP_MODEL: "stg-wcpp-model",
             ENV_TRANS_URL: "stg-trans-url",
-            ENV_TRANS_KEY: "stg-trans-key",
             ENV_TRANS_MOD: "stg-trans-model",
             ENV_POST_URL: "stg-post-url",
-            ENV_POST_KEY: "stg-post-key",
             ENV_POST_MOD: "stg-post-model",
             ENV_AGENT_URL: "stg-agent-url",
-            ENV_AGENT_KEY: "stg-agent-key",
             ENV_AGENT_MOD: "stg-agent-model",
         }
         lines: list[str] = []
@@ -588,7 +590,7 @@ class SettingsMixin:
             ENV_FILE.write_text("".join(lines), encoding="utf-8")
             try:
                 self.query_one("#stg-status", Static).update(
-                    f"[green]✓ Exported to {ENV_FILE}[/]"
+                    f"[green]✓ Exported non-secret settings to {ENV_FILE}[/]"
                 )
             except NoMatches:
                 pass
@@ -615,10 +617,14 @@ class SettingsMixin:
 
         Uses import_env_file_to_sqlite (overwrite=False) so it only fills keys
         that have no value in DB yet.  After this, SQLite is the source of truth
-        and .env is no longer automatically consulted.
+        for non-secret values, while API keys remain environment/session-only.
         """
-        from vid_to_sub_app.shared.env import import_env_file_to_sqlite
+        from vid_to_sub_app.shared.env import (
+            import_env_file_to_sqlite,
+            load_project_env_fallback,
+        )
 
+        load_project_env_fallback(override=False)
         import_env_file_to_sqlite(
             ENV_FILE,
             _db.set_many,
@@ -630,9 +636,12 @@ class SettingsMixin:
         """Import .env file into SQLite (overwrite=False: only fills blank keys).
 
         This is how users can 'use' their .env: after import, SQLite becomes the
-        source of truth and .env is no longer consulted automatically.
+        source of truth for non-secret settings; API keys stay in the environment.
         """
-        from vid_to_sub_app.shared.env import import_env_file_to_sqlite
+        from vid_to_sub_app.shared.env import (
+            import_env_file_to_sqlite,
+            load_project_env_fallback,
+        )
 
         if not ENV_FILE.exists():
             try:
@@ -642,6 +651,7 @@ class SettingsMixin:
             except NoMatches:
                 pass
             return
+        load_project_env_fallback(override=False)
         written = import_env_file_to_sqlite(
             ENV_FILE,
             _db.set_many,

@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from db import Database
+from vid_to_sub_app import db as db_module
 from vid_to_sub_app.cli.output import segments_to_tsv
 from vid_to_sub_app.cli.subtitle_copy import (
     is_subtitle_output_path,
@@ -66,6 +69,41 @@ class OutputRegressionTests(unittest.TestCase):
 
             second_conn = db._conn()
             self.assertIsNot(first_conn, second_conn)
+            self.assertEqual("value", db.get("sample"))
+            db.close()
+
+    def test_default_db_path_prefers_explicit_env_override(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            configured_path = Path(tmpdir) / "custom" / "state.db"
+            with patch.dict(
+                os.environ,
+                {db_module.DB_PATH_ENV: str(configured_path)},
+                clear=False,
+            ):
+                self.assertEqual(configured_path, db_module._resolve_default_db_path())
+
+    def test_default_db_path_keeps_legacy_project_local_database_when_present(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            legacy_root = Path(tmpdir)
+            legacy_db = legacy_root / "vid_to_sub.db"
+            legacy_db.write_text("", encoding="utf-8")
+
+            with (
+                patch.dict(os.environ, {}, clear=True),
+                patch.object(db_module, "ROOT_DIR", legacy_root),
+            ):
+                self.assertEqual(legacy_db, db_module._resolve_default_db_path())
+
+    def test_database_creates_parent_directories_for_nested_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "nested" / "deeper" / "state.db"
+
+            db = Database(db_path)
+
+            self.assertTrue(db_path.parent.exists())
+            db.set("sample", "value")
             self.assertEqual("value", db.get("sample"))
             db.close()
 
