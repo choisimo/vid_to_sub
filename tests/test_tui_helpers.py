@@ -11,45 +11,9 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from db import Database
 from textual.css.query import NoMatches
-from vid_to_sub import (
-    ENV_WHISPER_CPP_BIN,
-    ENV_WHISPER_CPP_MODEL,
-    EVENT_PREFIX,
-    build_parser,
-    build_run_manifest,
-    find_whisper_cpp_model_path,
-    find_whisper_cpp_bin,
-    hash_video_folder,
-    load_project_env,
-    parse_whisper_cpp_progress_seconds,
-    transcribe_whisper_cpp,
-)
-from vid_to_sub_app.cli import translation_capable
-from vid_to_sub_app.cli.stage_artifact import (
-    build_stage_artifact_metadata,
-    write_stage_artifact,
-)
-from vid_to_sub_app.cli.transcription import (
-    resolve_device_fw,
-    transcribe,
-    transcribe_faster_whisper,
-    transcribe_openai_whisper,
-)
-from vid_to_sub_app.cli.translation import translate_segments_openai_compatible
-from vid_to_sub_app.db import (
-    TUI_DEFAULT_CONTENT_TYPE_KEY,
-    TUI_DEFAULT_FORCE_TRANSLATE_KEY,
-    TUI_DEFAULT_TRANSLATE_ENABLED_KEY,
-)
-from vid_to_sub_app.tui.models import ExecutorPlan
-from vid_to_sub_app.shared.env import (
-    faster_whisper_model_candidates,
-    resolve_runtime_backend_and_device,
-    resolve_runtime_model,
-    resolve_runtime_backend_threads,
-)
+
+from db import Database
 from tui import (
     ENV_POST_KEY,
     ENV_POST_MOD,
@@ -65,17 +29,73 @@ from tui import (
     discover_ggml_models,
     discover_input_matches,
     extract_json_payload,
+    group_paths_by_video_folder,
     map_path_for_remote,
     normalize_chat_endpoint,
+    packages_for_manager,
     parse_progress_event,
     parse_remote_resources,
     partition_folder_groups_by_capacity,
     partition_paths_by_capacity,
-    packages_for_manager,
-    group_paths_by_video_folder,
     summarize_ggml_models,
 )
+from vid_to_sub import (
+    ENV_WHISPER_CPP_BIN,
+    ENV_WHISPER_CPP_MODEL,
+    EVENT_PREFIX,
+    build_parser,
+    build_run_manifest,
+    find_whisper_cpp_bin,
+    find_whisper_cpp_model_path,
+    hash_video_folder,
+    load_project_env,
+    parse_whisper_cpp_progress_seconds,
+    transcribe_whisper_cpp,
+)
+from vid_to_sub_app.cli import translation_capable
+from vid_to_sub_app.cli.stage_artifact import (
+    build_stage_artifact_metadata,
+    load_stage_artifact,
+    write_stage_artifact,
+)
+from vid_to_sub_app.cli.transcription import (
+    resolve_device_fw,
+    transcribe,
+    transcribe_faster_whisper,
+    transcribe_openai_whisper,
+)
+from vid_to_sub_app.cli.translation import translate_segments_openai_compatible
+from vid_to_sub_app.db import (
+    TUI_DEFAULT_CONTENT_TYPE_KEY,
+    TUI_DEFAULT_FORCE_TRANSLATE_KEY,
+    TUI_DEFAULT_TRANSLATE_ENABLED_KEY,
+)
+from vid_to_sub_app.shared import secrets as secret_store
+from vid_to_sub_app.shared.env import (
+    faster_whisper_model_candidates,
+    import_env_file_to_sqlite,
+    load_env_from_sqlite,
+    resolve_runtime_backend_and_device,
+    resolve_runtime_backend_threads,
+    resolve_runtime_model,
+)
+from vid_to_sub_app.tui.helpers import ENV_AGENT_KEY
 from vid_to_sub_app.tui.mixins import run_mixin, settings_mixin
+from vid_to_sub_app.tui.models import ExecutorPlan, RemoteResourceProfile
+
+
+class FakeKeyring:
+    def __init__(self) -> None:
+        self._values: dict[tuple[str, str], str] = {}
+
+    def get_password(self, service: str, username: str) -> str | None:
+        return self._values.get((service, username))
+
+    def set_password(self, service: str, username: str, password: str) -> None:
+        self._values[(service, username)] = password
+
+    def delete_password(self, service: str, username: str) -> None:
+        self._values.pop((service, username), None)
 
 
 class TuiHelperTests(unittest.TestCase):
@@ -553,6 +573,75 @@ class TuiHelperTests(unittest.TestCase):
                 "Local plan command must include --stage1-only",
             )
 
+    def test_build_executor_plans_disambiguates_duplicate_remote_display_names(
+        self,
+    ) -> None:
+        app = VidToSubApp()
+        profiles = [
+            RemoteResourceProfile(
+                name="gpu-box",
+                ssh_target="user@gpu-a",
+                remote_workdir="/srv/vid_to_sub/a",
+                slots=1,
+            ),
+            RemoteResourceProfile(
+                name="gpu-box",
+                ssh_target="user@gpu-b",
+                remote_workdir="/srv/vid_to_sub/b",
+                slots=1,
+            ),
+        ]
+        config = RunConfig(
+            request_id=9,
+            selected_paths=["/tmp/a.mp4"],
+            output_dir=None,
+            formats=frozenset({"srt"}),
+            no_recurse=False,
+            skip_existing=False,
+            dry_run=False,
+            verbose=False,
+            backend="faster-whisper",
+            model="large-v3",
+            device="cpu",
+            language=None,
+            content_type="auto",
+            compute_type=None,
+            beam_size="5",
+            local_workers=1,
+            whisper_cpp_model_path=None,
+            translate_enabled=False,
+            translate_to=None,
+            force_translate=False,
+            translation_model=None,
+            translation_base_url=None,
+            translation_api_key=None,
+            translation_chunk_size=100,
+            translation_mode="strict",
+            postprocess_enabled=False,
+            postprocess_mode="auto",
+            postprocess_model=None,
+            postprocess_base_url=None,
+            postprocess_api_key=None,
+            diarize=False,
+            hf_token=None,
+            execution_mode="distributed",
+            remote_resources=profiles,
+            run_env={},
+        )
+
+        plans = app._build_executor_plans(
+            ["/tmp/a/1.mp4", "/tmp/b/1.mp4", "/tmp/c/1.mp4"],
+            dry_run=False,
+            config=config,
+        )
+
+        remote_plans = [plan for plan in plans if plan.kind == "remote"]
+        self.assertEqual(2, len(remote_plans))
+        self.assertEqual(2, len({plan.name for plan in remote_plans}))
+        for plan in remote_plans:
+            self.assertTrue(plan.name.startswith("remote:"))
+            self.assertIn("gpu-box [user@", plan.label)
+
     def test_sync_transcribe_overrides_updates_inherited_values_only(self) -> None:
         app = VidToSubApp()
         widgets = {
@@ -832,7 +921,9 @@ class TestTranslationDefaultSetting(unittest.TestCase):
         self.assertEqual("music", widgets["#sel-content-type"].value)
         self.assertTrue(widgets["#sw-force-translate"].value)
 
-    def test_prefill_transcribe_reads_sqlite_settings(self) -> None:
+    def test_prefill_transcribe_reads_non_secret_settings_from_sqlite_and_secrets_from_env(
+        self,
+    ) -> None:
         app = VidToSubApp()
         widgets = {
             "#inp-trans-url": SimpleNamespace(value=""),
@@ -859,10 +950,8 @@ class TestTranslationDefaultSetting(unittest.TestCase):
             temp_db.set_many(
                 {
                     ENV_TRANS_URL: "https://sqlite.example/v1",
-                    ENV_TRANS_KEY: "sqlite-key",
                     ENV_TRANS_MOD: "sqlite-model",
                     ENV_POST_URL: "https://sqlite-post.example/v1",
-                    ENV_POST_KEY: "sqlite-post-key",
                     ENV_POST_MOD: "sqlite-post-model",
                     ENV_WHISPER_CPP_BIN: "/sqlite/bin/whisper-cli",
                     "tui.default_output_dir": "/sqlite/output",
@@ -875,16 +964,24 @@ class TestTranslationDefaultSetting(unittest.TestCase):
             with (
                 patch.object(settings_mixin, "_db", temp_db),
                 patch.object(app, "query_one", side_effect=query_one),
+                patch.dict(
+                    os.environ,
+                    {
+                        ENV_TRANS_KEY: "env-trans-key",
+                        ENV_POST_KEY: "env-post-key",
+                    },
+                    clear=False,
+                ),
             ):
                 app._prefill_transcribe()
 
         self.assertEqual("https://sqlite.example/v1", widgets["#inp-trans-url"].value)
-        self.assertEqual("sqlite-key", widgets["#inp-trans-key"].value)
+        self.assertEqual("env-trans-key", widgets["#inp-trans-key"].value)
         self.assertEqual("sqlite-model", widgets["#inp-trans-model"].value)
         self.assertEqual(
             "https://sqlite-post.example/v1", widgets["#inp-post-url"].value
         )
-        self.assertEqual("sqlite-post-key", widgets["#inp-post-key"].value)
+        self.assertEqual("env-post-key", widgets["#inp-post-key"].value)
         self.assertEqual("sqlite-post-model", widgets["#inp-post-model"].value)
         self.assertEqual("/sqlite/bin/whisper-cli", widgets["#inp-wcpp-bin"].value)
         self.assertEqual("/sqlite/output", widgets["#inp-output-dir"].value)
@@ -893,7 +990,9 @@ class TestTranslationDefaultSetting(unittest.TestCase):
         self.assertTrue(widgets["#sw-translate"].value)
         self.assertTrue(widgets["#sw-force-translate"].value)
 
-    def test_build_run_env_reads_sqlite_settings(self) -> None:
+    def test_build_run_env_reads_non_secret_settings_from_sqlite_and_secrets_from_env(
+        self,
+    ) -> None:
         app = VidToSubApp()
 
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -901,10 +1000,8 @@ class TestTranslationDefaultSetting(unittest.TestCase):
             temp_db.set_many(
                 {
                     ENV_TRANS_URL: "https://sqlite.example/v1",
-                    ENV_TRANS_KEY: "sqlite-key",
                     ENV_TRANS_MOD: "sqlite-model",
                     ENV_POST_URL: "https://sqlite-post.example/v1",
-                    ENV_POST_KEY: "sqlite-post-key",
                     ENV_POST_MOD: "sqlite-post-model",
                     ENV_WHISPER_CPP_BIN: "/sqlite/bin/whisper-cli",
                 }
@@ -924,16 +1021,110 @@ class TestTranslationDefaultSetting(unittest.TestCase):
                 patch.object(app, "_val", side_effect=lambda wid: values.get(wid, "")),
                 patch.object(app, "_sel", return_value="faster-whisper"),
                 patch.object(app, "_resolved_wcpp_model_path", return_value=None),
+                patch.dict(
+                    os.environ,
+                    {
+                        ENV_TRANS_KEY: "env-trans-key",
+                        ENV_POST_KEY: "env-post-key",
+                    },
+                    clear=False,
+                ),
             ):
                 env = app._build_run_env()
 
         self.assertEqual("https://sqlite.example/v1", env[ENV_TRANS_URL])
-        self.assertEqual("sqlite-key", env[ENV_TRANS_KEY])
+        self.assertEqual("env-trans-key", env[ENV_TRANS_KEY])
         self.assertEqual("sqlite-model", env[ENV_TRANS_MOD])
         self.assertEqual("https://sqlite-post.example/v1", env[ENV_POST_URL])
-        self.assertEqual("sqlite-post-key", env[ENV_POST_KEY])
+        self.assertEqual("env-post-key", env[ENV_POST_KEY])
         self.assertEqual("sqlite-post-model", env[ENV_POST_MOD])
         self.assertEqual("/sqlite/bin/whisper-cli", env[ENV_WHISPER_CPP_BIN])
+
+    def test_load_env_from_sqlite_skips_secret_keys(self) -> None:
+        with patch.dict(os.environ, {}, clear=True):
+            injected = load_env_from_sqlite(
+                lambda: {
+                    ENV_TRANS_URL: "https://sqlite.example/v1",
+                    ENV_TRANS_KEY: "sqlite-key",
+                    ENV_POST_KEY: "sqlite-post-key",
+                }
+            )
+            self.assertEqual(1, injected)
+            self.assertEqual("https://sqlite.example/v1", os.environ.get(ENV_TRANS_URL))
+            self.assertNotIn(ENV_TRANS_KEY, os.environ)
+            self.assertNotIn(ENV_POST_KEY, os.environ)
+
+    def test_import_env_file_to_sqlite_skips_secret_keys(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            env_file = Path(tmpdir) / ".env"
+            env_file.write_text(
+                "\n".join(
+                    [
+                        f'{ENV_TRANS_URL}="https://dotenv.example/v1"',
+                        f'{ENV_TRANS_KEY}="dotenv-secret"',
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            temp_db = Database(Path(tmpdir) / "state.db")
+
+            written = import_env_file_to_sqlite(
+                env_file,
+                temp_db.set_many,
+                temp_db.get_all,
+                overwrite=False,
+            )
+            self.assertEqual({ENV_TRANS_URL: "https://dotenv.example/v1"}, written)
+            self.assertEqual("", temp_db.get(ENV_TRANS_KEY))
+
+    def test_database_secret_migration_moves_plaintext_keys_into_session_env(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            temp_db = Database(Path(tmpdir) / "state.db")
+            temp_db.set_many(
+                {
+                    ENV_TRANS_KEY: "legacy-secret",
+                    ENV_TRANS_URL: "https://sqlite.example/v1",
+                }
+            )
+
+            with patch.dict(os.environ, {}, clear=True):
+                migrated = temp_db.migrate_secret_settings_to_env()
+                self.assertEqual("legacy-secret", os.environ.get(ENV_TRANS_KEY))
+            self.assertEqual({ENV_TRANS_KEY: "legacy-secret"}, migrated)
+            self.assertEqual("", temp_db.get(ENV_TRANS_KEY))
+
+    def test_database_secret_migration_stores_legacy_plaintext_keys_in_keyring(
+        self,
+    ) -> None:
+        fake_keyring = FakeKeyring()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            temp_db = Database(Path(tmpdir) / "state.db")
+            temp_db.set_many({ENV_TRANS_KEY: "legacy-secret"})
+
+            with (
+                patch.object(
+                    secret_store,
+                    "_resolve_keyring_client",
+                    return_value=(fake_keyring, None),
+                ),
+                patch.dict(os.environ, {}, clear=True),
+            ):
+                migrated = temp_db.migrate_secret_settings_to_env()
+                os.environ.pop(ENV_TRANS_KEY, None)
+                hydrated = secret_store.hydrate_secret_env([ENV_TRANS_KEY])
+
+            self.assertEqual({ENV_TRANS_KEY: "legacy-secret"}, migrated)
+            self.assertEqual(
+                "legacy-secret",
+                fake_keyring.get_password(
+                    secret_store.KEYRING_SERVICE_NAME,
+                    ENV_TRANS_KEY,
+                ),
+            )
+            self.assertEqual({ENV_TRANS_KEY: "legacy-secret"}, hydrated)
 
     def test_refresh_history_shows_progress_for_running_job(self) -> None:
         app = VidToSubApp()
@@ -1404,10 +1595,12 @@ class TestTranslationDefaultSetting(unittest.TestCase):
                 return {"segments": [], "language": "en"}
 
         fake_whisper = SimpleNamespace(
-            load_model=lambda model_name, device: loaded.update(  # type: ignore[arg-type]
-                {"model": model_name, "device": device}
+            load_model=lambda model_name, device: (
+                loaded.update(  # type: ignore[arg-type]
+                    {"model": model_name, "device": device}
+                )
+                or FakeModel()
             )
-            or FakeModel()
         )
 
         with (
@@ -1793,6 +1986,9 @@ class TestTranslationDefaultSetting(unittest.TestCase):
 
         self.assertFalse(captured["condition_on_previous_text"])
         self.assertTrue(captured["vad_filter"])
+        self.assertEqual(2.2, captured["compression_ratio_threshold"])
+        self.assertEqual(-0.5, captured["log_prob_threshold"])
+        self.assertEqual(0.45, captured["no_speech_threshold"])
         self.assertEqual("music", info["content_type"])
 
     def test_transcribe_music_mode_requires_explicit_language(self) -> None:
@@ -2409,6 +2605,15 @@ class TestTranslationDefaultSetting(unittest.TestCase):
     ) -> None:
         app = VidToSubApp()
         logs: list[str] = []
+        app._run_output_dir = "/tmp/out"
+        app._remote_resources = [
+            RemoteResourceProfile(
+                name="gpu-box",
+                ssh_target="user@gpu-box",
+                remote_workdir="/srv/vid_to_sub",
+                path_map={"/tmp": "/remote"},
+            )
+        ]
 
         class FakeProc:
             def __init__(self) -> None:
@@ -2444,9 +2649,12 @@ class TestTranslationDefaultSetting(unittest.TestCase):
                 "call_from_thread",
                 side_effect=lambda callback, *args: callback(*args),
             ),
+            patch(
+                "vid_to_sub_app.tui.app.subprocess.run",
+                return_value=SimpleNamespace(returncode=1, stdout="scp failed"),
+            ),
             patch.object(app, "_log", side_effect=logs.append),
             patch.object(app, "_apply_progress_event", return_value=None),
-            patch.object(app, "_collect_stage1_artifacts", return_value=[]),
             patch.object(app, "_schedule_stage2_from_artifacts") as schedule_mock,
         ):
             VidToSubApp._stream.__wrapped__(app, [plan])
@@ -2455,10 +2663,125 @@ class TestTranslationDefaultSetting(unittest.TestCase):
         self.assertIn("\n[bold green]✓ Completed (exit 0)[/]", logs)
         self.assertIn(
             "[yellow]Stage handoff: distributed stage-1 completed, but automatic "
-            "stage-2 only scans locally visible .stage1.json artifacts. Copy "
-            "artifacts locally or run --translate-from-artifact manually.[/]",
+            "stage-2 could not materialize any remote .stage1.json artifacts "
+            "locally. Review SSH/path_map settings or run --translate-from-artifact "
+            "manually after copying the artifact.[/]",
             logs,
         )
+
+    def test_stream_fetches_remote_stage1_artifact_and_schedules_local_stage2(
+        self,
+    ) -> None:
+        app = VidToSubApp()
+        logs: list[str] = []
+
+        class FakeProc:
+            def __init__(self) -> None:
+                self.stdout = io.StringIO("")
+                self.stdin = None
+                self.wait_calls = 0
+
+            def poll(self) -> int | None:
+                return 0
+
+            def wait(self, timeout: float | None = None) -> int:
+                self.wait_calls += 1
+                return 0
+
+            def terminate(self) -> None:
+                raise AssertionError("terminate should not be called")
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            source = root / "media" / "video.mp4"
+            source.parent.mkdir(parents=True)
+            source.write_bytes(b"video")
+            output_dir = root / "out"
+            app._run_output_dir = str(output_dir)
+            app._remote_resources = [
+                RemoteResourceProfile(
+                    name="gpu-box",
+                    ssh_target="user@gpu-box",
+                    remote_workdir="/srv/vid_to_sub",
+                    path_map={
+                        str(source.parent): "/remote/media",
+                        str(output_dir): "/remote/out",
+                    },
+                )
+            ]
+            plan = SimpleNamespace(
+                name="gpu-box",
+                label="gpu-box",
+                kind="remote",
+                cmd=["ssh", "gpu-box"],
+                env=None,
+                stdin_payload=None,
+                stage="stage1",
+                assigned_paths=[str(source)],
+            )
+            proc = FakeProc()
+            expected_artifact = output_dir / "video.stage1.json"
+            remote_artifact = {
+                "schema_version": "1",
+                "source_path": "/remote/media/video.mp4",
+                "output_base": "/remote/out",
+                "source_fingerprint": "99:1",
+                "backend": "faster-whisper",
+                "device": "cpu",
+                "model": "large-v3",
+                "content_type": "auto",
+                "language": "en",
+                "language_probability": 0.99,
+                "duration": 1.0,
+                "quality": {"suspicious": False, "reasons": []},
+                "target_lang": "ko",
+                "formats": ["srt"],
+                "primary_outputs": ["/remote/out/video.srt"],
+                "segments": [{"start": 0.0, "end": 1.0, "text": "Hello"}],
+                "stage_status": {
+                    "transcription_complete": True,
+                    "translation_pending": True,
+                    "translation_complete": False,
+                    "translation_failed": False,
+                    "translation_error": None,
+                },
+            }
+
+            def fake_run(cmd: list[str], **_kwargs):
+                Path(cmd[-1]).write_text(
+                    json.dumps(remote_artifact, indent=2),
+                    encoding="utf-8",
+                )
+                return SimpleNamespace(returncode=0, stdout="")
+
+            with (
+                patch("vid_to_sub_app.tui.app.subprocess.Popen", return_value=proc),
+                patch("vid_to_sub_app.tui.app.subprocess.run", side_effect=fake_run),
+                patch.object(
+                    app,
+                    "call_from_thread",
+                    side_effect=lambda callback, *args: callback(*args),
+                ),
+                patch.object(app, "_log", side_effect=logs.append),
+                patch.object(app, "_apply_progress_event", return_value=None),
+                patch.object(app, "_finalize_executor_failure", return_value=None),
+                patch.object(app, "_schedule_stage2_from_artifacts") as schedule_mock,
+            ):
+                VidToSubApp._stream.__wrapped__(app, [plan])
+
+            schedule_mock.assert_called_once_with([str(expected_artifact)])
+            loaded_artifact = load_stage_artifact(expected_artifact)
+            self.assertTrue(expected_artifact.exists())
+            self.assertEqual(str(source.resolve()), loaded_artifact["source_path"])
+            self.assertEqual(str(output_dir.resolve()), loaded_artifact["output_base"])
+            self.assertEqual(
+                f"{source.stat().st_size}:{int(source.stat().st_mtime)}",
+                loaded_artifact["source_fingerprint"],
+            )
+            self.assertTrue(loaded_artifact["quality"]["artifact_fetched_from_remote"])
+            self.assertEqual(
+                "gpu-box", loaded_artifact["quality"]["artifact_fetch_profile"]
+            )
 
 
 class TestSubtitleCopyHelper(unittest.TestCase):
@@ -2467,6 +2790,7 @@ class TestSubtitleCopyHelper(unittest.TestCase):
     def test_subtitle_paths_filters_to_subtitle_extensions(self) -> None:
         import json
         import tempfile
+
         from vid_to_sub_app.cli.subtitle_copy import subtitle_paths_from_output_paths
 
         with tempfile.TemporaryDirectory() as tmp:
@@ -2494,6 +2818,7 @@ class TestSubtitleCopyHelper(unittest.TestCase):
     def test_bulk_copy_writes_files(self) -> None:
         import json
         import tempfile
+
         from vid_to_sub_app.cli.subtitle_copy import bulk_copy_subtitles
 
         with tempfile.TemporaryDirectory() as tmp:
@@ -2515,6 +2840,7 @@ class TestSubtitleCopyHelper(unittest.TestCase):
     def test_bulk_copy_renames_duplicates(self) -> None:
         import json
         import tempfile
+
         from vid_to_sub_app.cli.subtitle_copy import bulk_copy_subtitles
 
         with tempfile.TemporaryDirectory() as tmp:
@@ -2543,6 +2869,7 @@ class TestSubtitleCopyHelper(unittest.TestCase):
     def test_bulk_copy_reports_missing_source(self) -> None:
         import json
         import tempfile
+
         from vid_to_sub_app.cli.subtitle_copy import bulk_copy_subtitles
 
         with tempfile.TemporaryDirectory() as tmp:
@@ -2558,8 +2885,9 @@ class TestSubtitleCopyHelper(unittest.TestCase):
             self.assertIsNone(results[0]["destination"])
 
     def test_bulk_copy_empty_output_paths(self) -> None:
-        from vid_to_sub_app.cli.subtitle_copy import bulk_copy_subtitles
         import tempfile
+
+        from vid_to_sub_app.cli.subtitle_copy import bulk_copy_subtitles
 
         with tempfile.TemporaryDirectory() as tmp:
             dst_dir = Path(tmp) / "dst"
@@ -2596,6 +2924,7 @@ class TestHistoryTranslateHelpers(unittest.TestCase):
 
     def test_resolve_copy_dest_no_collision(self) -> None:
         import tempfile
+
         from vid_to_sub_app.tui.helpers import resolve_copy_dest
 
         with tempfile.TemporaryDirectory() as tmp:
@@ -2608,6 +2937,7 @@ class TestHistoryTranslateHelpers(unittest.TestCase):
 
     def test_resolve_copy_dest_collision_appends_counter(self) -> None:
         import tempfile
+
         from vid_to_sub_app.tui.helpers import resolve_copy_dest
 
         with tempfile.TemporaryDirectory() as tmp:
@@ -2724,6 +3054,105 @@ class TestSaveSettingsCharacterization(unittest.TestCase):
         self.assertEqual("1", payload[TUI_DEFAULT_TRANSLATE_ENABLED_KEY])
         self.assertEqual("music", payload[TUI_DEFAULT_CONTENT_TYPE_KEY])
         self.assertEqual("1", payload[TUI_DEFAULT_FORCE_TRANSLATE_KEY])
+        self.assertNotIn(ENV_TRANS_KEY, payload)
+        self.assertNotIn(ENV_POST_KEY, payload)
+        self.assertNotIn(ENV_AGENT_KEY, payload)
+
+    def test_save_settings_keeps_api_keys_in_session_env_only(self) -> None:
+        from vid_to_sub_app.tui.mixins import settings_mixin
+
+        app = VidToSubApp()
+        widgets = self._make_widgets()
+
+        def query_one(selector: str, *_args):
+            if selector in widgets:
+                return widgets[selector]
+            raise NoMatches(selector)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            temp_db = Database(Path(tmpdir) / "state.db")
+
+            with (
+                patch.object(settings_mixin, "_db", temp_db),
+                patch.object(app, "query_one", side_effect=query_one),
+                patch.object(app, "_apply_db_to_env", return_value=None),
+                patch.object(
+                    app, "_sync_transcribe_overrides_from_settings", return_value=None
+                ),
+                patch.object(
+                    app, "_sync_run_defaults_from_settings", return_value=None
+                ),
+                patch.object(app, "_load_remote_resources", return_value=None),
+                patch.object(app, "_run_detection", return_value=None),
+                patch.object(app, "_update_wcpp_model_status", return_value=None),
+                patch.object(app, "_update_remote_status", return_value=None),
+                patch.object(app, "_update_agent_config_status", return_value=None),
+                patch.object(app, "_update_cmd_preview", return_value=None),
+                patch.dict(os.environ, {}, clear=False),
+            ):
+                app._save_settings()
+                saved_settings = temp_db.get_all()
+                self.assertEqual("tkey", os.environ.get(ENV_TRANS_KEY))
+
+        self.assertEqual("", saved_settings.get(ENV_TRANS_KEY, ""))
+        self.assertEqual("", saved_settings.get(ENV_POST_KEY, ""))
+        self.assertEqual("", saved_settings.get(ENV_AGENT_KEY, ""))
+
+    def test_save_settings_stores_api_keys_in_keyring_when_available(self) -> None:
+        from vid_to_sub_app.tui.mixins import settings_mixin
+
+        app = VidToSubApp()
+        widgets = self._make_widgets()
+        fake_keyring = FakeKeyring()
+
+        def query_one(selector: str, *_args):
+            if selector in widgets:
+                return widgets[selector]
+            raise NoMatches(selector)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            temp_db = Database(Path(tmpdir) / "state.db")
+
+            with (
+                patch.object(settings_mixin, "_db", temp_db),
+                patch.object(app, "query_one", side_effect=query_one),
+                patch.object(app, "_apply_db_to_env", return_value=None),
+                patch.object(
+                    app, "_sync_transcribe_overrides_from_settings", return_value=None
+                ),
+                patch.object(
+                    app, "_sync_run_defaults_from_settings", return_value=None
+                ),
+                patch.object(app, "_load_remote_resources", return_value=None),
+                patch.object(app, "_run_detection", return_value=None),
+                patch.object(app, "_update_wcpp_model_status", return_value=None),
+                patch.object(app, "_update_remote_status", return_value=None),
+                patch.object(app, "_update_agent_config_status", return_value=None),
+                patch.object(app, "_update_cmd_preview", return_value=None),
+                patch.object(
+                    secret_store,
+                    "_resolve_keyring_client",
+                    return_value=(fake_keyring, None),
+                ),
+                patch.dict(os.environ, {}, clear=False),
+            ):
+                app._save_settings()
+
+        self.assertEqual(
+            "tkey",
+            fake_keyring.get_password(
+                secret_store.KEYRING_SERVICE_NAME,
+                ENV_TRANS_KEY,
+            ),
+        )
+        self.assertEqual(
+            "tkey",
+            fake_keyring.get_password(
+                secret_store.KEYRING_SERVICE_NAME,
+                ENV_TRANS_KEY,
+            ),
+        )
+        self.assertEqual("", temp_db.get(ENV_TRANS_KEY))
 
     def test_save_settings_invalid_remote_json_aborts_before_db_write(self) -> None:
         """_save_settings() must reject invalid remote JSON without touching the DB."""
@@ -2762,7 +3191,7 @@ class TestSaveSettingsCharacterization(unittest.TestCase):
             0, write_count, "Invalid remote JSON must prevent any db write"
         )
 
-    def test_remote_status_warns_on_legacy_name_shadow_and_target_alias_drift(
+    def test_remote_status_collapses_aliases_and_disambiguates_duplicate_names(
         self,
     ) -> None:
         app = VidToSubApp()
@@ -2770,7 +3199,7 @@ class TestSaveSettingsCharacterization(unittest.TestCase):
             [
                 {
                     "name": "gpu-box",
-                    "ssh_target": "user@gpu-host",
+                    "ssh_target": "user@gpu-other",
                     "remote_workdir": "/srv/legacy-shadow",
                 },
                 {
@@ -2809,15 +3238,29 @@ class TestSaveSettingsCharacterization(unittest.TestCase):
                 app._load_remote_resources()
                 app._update_remote_status()
 
+        self.assertEqual(2, len(app._remote_resources))
         self.assertEqual(
-            ["gpu-box", "gpu-alias"], [p.name for p in app._remote_resources]
+            {
+                "user@gpu-host:/srv/vid_to_sub",
+                "user@gpu-other:/srv/legacy-shadow",
+            },
+            {profile.target_descriptor() for profile in app._remote_resources},
         )
         self.assertTrue(remote_status_updates)
         status = remote_status_updates[-1]
-        self.assertIn("SSH connections override legacy remote JSON", status)
+        self.assertIn(
+            "Remote executor aliases collapse onto the same ssh target/workdir",
+            status,
+        )
+        self.assertIn("gpu-alias", status)
         self.assertIn("gpu-box", status)
-        self.assertIn("gpu-alias, gpu-box", status)
-        self.assertIn("Distributed assignment still keys off profile names.", status)
+        self.assertIn(
+            "Remote profiles reuse the same display name across different executors",
+            status,
+        )
+        self.assertIn("Distributed scheduling now keys off executor identity", status)
+        self.assertIn("gpu-box [user@gpu-host:/srv/vid_to_sub]", status)
+        self.assertIn("gpu-box [user@gpu-other:/srv/legacy-shadow]", status)
 
     def test_save_settings_fan_out_order(self) -> None:
         """After a valid save, _save_settings() must call all six update helpers.

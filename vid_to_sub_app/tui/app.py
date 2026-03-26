@@ -37,9 +37,9 @@ from textual.widgets import (
     TabPane,
     TextArea,
 )
+from textual.timer import Timer
 from textual.worker import Worker, WorkerState
 
-from vid_to_sub_app.db import TUI_DEFAULT_TRANSLATE_ENABLED_KEY
 from vid_to_sub_app.cli import (
     apply_runtime_path_map_to_manifest,
     build_run_manifest,
@@ -47,42 +47,44 @@ from vid_to_sub_app.cli import (
     hash_video_folder,
 )
 from vid_to_sub_app.cli.runner import primary_output_exists as _primary_output_exists
+from vid_to_sub_app.db import TUI_DEFAULT_TRANSLATE_ENABLED_KEY
 from vid_to_sub_app.shared.constants import DEVICES, ROOT_DIR, TRANSLATION_MODES
-from vid_to_sub_app.shared.env import find_whisper_cpp_bin
+from vid_to_sub_app.shared.env import find_whisper_cpp_bin, load_project_env_fallback
+from vid_to_sub_app.shared.secrets import hydrate_secret_env
 
+from .button_actions import ALL_ACTIONS, ActionSpec, ButtonId
 from .helpers import (
     BACKENDS,
     DEFAULT_BACKEND,
     DEFAULT_DEVICE,
     DEFAULT_MODEL,
-    DetectResult,
     ENV_AGENT_KEY,
     ENV_AGENT_MOD,
     ENV_AGENT_URL,
+    ENV_FILE,
     ENV_POST_KEY,
     ENV_POST_MOD,
     ENV_POST_URL,
-    ENV_FILE,
     ENV_TRANS_KEY,
     ENV_TRANS_MOD,
     ENV_TRANS_URL,
     ENV_WCPP_BIN,
     ENV_WCPP_MODEL,
     EXECUTION_MODES,
-    ExecutorPlan,
     FORMATS,
     HF_MODEL_BASE,
     KNOWN_MODELS,
-    POSTPROCESS_MODES,
     PIP_REQUIREMENT_FILES,
+    POSTPROCESS_MODES,
+    SEARCH_RESULT_LIMIT,
+    DetectResult,
+    ExecutorPlan,
     RemoteResourceProfile,
     RunConfig,
     RunJobState,
     SSHConnection,
-    ssh_connection_from_row,
-    SEARCH_RESULT_LIMIT,
-    _colorize,
     _coerce_positive_int,
+    _colorize,
     _compact_progress_markup,
     _fmt_elapsed,
     _mask,
@@ -98,18 +100,17 @@ from .helpers import (
     extract_json_payload,
     group_paths_by_video_folder,
     map_path_for_remote,
+    merge_remote_resource_profiles,
     normalize_chat_endpoint,
     packages_for_manager,
     parse_progress_event,
     parse_remote_resources,
     partition_folder_groups_by_capacity,
+    resolve_runtime_backend_threads,
+    ssh_connection_from_row,
     summarize_ggml_models,
     summarize_remote_resources,
-    resolve_runtime_backend_threads,
 )
-from .state import db as _db
-from .styles import _CSS
-from .button_actions import ALL_ACTIONS, ButtonId, ActionSpec
 from .mixins import (
     AgentMixin,
     BrowseMixin,
@@ -118,6 +119,8 @@ from .mixins import (
     SettingsMixin,
     SetupMixin,
 )
+from .state import close_shared_db, db as _db
+from .styles import _CSS
 
 SCRIPT_DIR = ROOT_DIR
 SCRIPT_PATH = ROOT_DIR / "vid_to_sub.py"
@@ -166,6 +169,7 @@ class VidToSubApp(
         self._ssh_selected_id: int | None = None  # selected SSH connection id
         self._agent_plan: dict[str, Any] | None = None
         self._active_worker: Worker[None] | None = None
+        self._detection_worker: Worker[None] | None = None
         self._proc: subprocess.Popen[str] | None = None
         self._procs: dict[str, subprocess.Popen[str]] = {}
         self._run_row_widgets: dict[str, Static] = {}
@@ -180,6 +184,7 @@ class VidToSubApp(
         self._run_skipped = 0
         self._run_completed = 0
         self._run_failed = 0
+        self._live_refresh_timer: Timer | None = None
         self._run_backend = DEFAULT_BACKEND
         self._run_model = DEFAULT_MODEL
         self._run_language: str | None = None
@@ -249,7 +254,7 @@ class VidToSubApp(
                                     placeholder="Find directories or video files under root…",
                                     id="inp-path-search",
                                 )
-                                yield Button("Find",  id=ButtonId.SEARCH_PATHS)
+                                yield Button("Find", id=ButtonId.SEARCH_PATHS)
                                 yield Button("Reset", id=ButtonId.CLEAR_SEARCH)
                             yield Static(
                                 "[dim]Type at least 2 characters. Results stay inside the current root path.[/]",
@@ -309,7 +314,9 @@ class VidToSubApp(
                             )
 
                         with Horizontal(classes="crow"):
-                            yield Button("Detect", id=ButtonId.REDETECT, variant="default")
+                            yield Button(
+                                "Detect", id=ButtonId.REDETECT, variant="default"
+                            )
 
                         yield Static("Automatic Setup", classes="stitle")
                         with Horizontal(classes="crow"):
@@ -503,21 +510,21 @@ class VidToSubApp(
                             with Horizontal(classes="frow"):
                                 yield Label("Translation model", classes="flabel")
                                 yield Input(
-                                    placeholder="(from Settings)",
+                                    placeholder="(from Settings / env)",
                                     id="inp-trans-model",
                                     classes="fwidget",
                                 )
                             with Horizontal(classes="frow"):
                                 yield Label("Base URL", classes="flabel")
                                 yield Input(
-                                    placeholder="(from Settings)",
+                                    placeholder="(from Settings / env)",
                                     id="inp-trans-url",
                                     classes="fwidget",
                                 )
                             with Horizontal(classes="frow"):
                                 yield Label("API key", classes="flabel")
                                 yield Input(
-                                    placeholder="(from Settings)",
+                                    placeholder="(from session / env)",
                                     id="inp-trans-key",
                                     password=True,
                                     classes="fwidget",
@@ -556,21 +563,21 @@ class VidToSubApp(
                                 with Horizontal(classes="frow"):
                                     yield Label("Post-edit model", classes="flabel")
                                     yield Input(
-                                        placeholder="(from Settings / translation model)",
+                                        placeholder="(from Settings / env translation model)",
                                         id="inp-post-model",
                                         classes="fwidget",
                                     )
                                 with Horizontal(classes="frow"):
                                     yield Label("Base URL", classes="flabel")
                                     yield Input(
-                                        placeholder="(from Settings / translation URL)",
+                                        placeholder="(from Settings / env translation URL)",
                                         id="inp-post-url",
                                         classes="fwidget",
                                     )
                                 with Horizontal(classes="frow"):
                                     yield Label("API key", classes="flabel")
                                     yield Input(
-                                        placeholder="(from Settings / translation API key)",
+                                        placeholder="(from session / env translation API key)",
                                         id="inp-post-key",
                                         password=True,
                                         classes="fwidget",
@@ -816,18 +823,6 @@ class VidToSubApp(
                             id="stg-remote-resources",
                             soft_wrap=False,
                             language="json",
-                            placeholder=(
-                                "[\n"
-                                "  {\n"
-                                '    "name": "gpu-box",\n'
-                                '    "ssh_target": "user@gpu-host",\n'
-                                '    "remote_workdir": "/home/user/vid_to_sub",\n'
-                                '    "slots": 2,\n'
-                                '    "path_map": {"/mnt/media": "/srv/media"},\n'
-                                '    "env": {"VID_TO_SUB_WHISPER_CPP_MODEL": "/models/ggml-large-v3.bin"}\n'
-                                "  }\n"
-                                "]"
-                            ),
                         )
 
                         yield Static("SSH Connections", classes="stitle")
@@ -983,15 +978,11 @@ class VidToSubApp(
                         yield TextArea(
                             id="agent-prompt",
                             soft_wrap=True,
-                            placeholder=(
-                                "Ask for setup help, run analysis, or history control, for example:\n"
-                                "- Analyze the current run and elapsed time\n"
-                                "- Load the last failed job into the form\n"
-                                "- Rerun job 42 with the current settings after reviewing the plan"
-                            ),
                         )
                         with Horizontal(id="agent-actions"):
-                            yield Button("Ask", id=ButtonId.AGENT_PLAN, variant="primary")
+                            yield Button(
+                                "Ask", id=ButtonId.AGENT_PLAN, variant="primary"
+                            )
                             yield Button(
                                 "Apply",
                                 id=ButtonId.AGENT_APPLY,
@@ -1029,10 +1020,14 @@ class VidToSubApp(
         with Vertical(id="bottom"):
             with Horizontal(id="run-toolbar"):
                 with Horizontal(id="run-btns"):
-                    yield Button("Run",   id=ButtonId.RUN,              variant="success")
-                    yield Button("Dry",   id=ButtonId.DRY_RUN,          variant="warning")
-                    yield Button("Kill",  id=ButtonId.KILL,             variant="error", disabled=True)
-                    yield Button("Cmd ▸", id=ButtonId.TOGGLE_RUN_SHELL, variant="default")
+                    yield Button("Run", id=ButtonId.RUN, variant="success")
+                    yield Button("Dry", id=ButtonId.DRY_RUN, variant="warning")
+                    yield Button(
+                        "Kill", id=ButtonId.KILL, variant="error", disabled=True
+                    )
+                    yield Button(
+                        "Cmd ▸", id=ButtonId.TOGGLE_RUN_SHELL, variant="default"
+                    )
                 yield Static("", id="run-overview", markup=True)
             with Vertical(id="run-command-panel", classes="collapsed"):
                 yield Static(
@@ -1055,12 +1050,15 @@ class VidToSubApp(
                 max_lines=5000,
             )
 
-        yield Footer(compact=True, show_command_palette=False)
+        yield Footer()
 
     # ── Lifecycle ─────────────────────────────────────────────────────────
 
     def on_mount(self) -> None:
         self._validate_button_handlers()
+        load_project_env_fallback(override=False)
+        hydrate_secret_env()
+        _db.migrate_secret_settings_to_env()
         self._migrate_env_to_db()
         self._apply_db_to_env()
         self._load_settings_form()
@@ -1070,7 +1068,7 @@ class VidToSubApp(
         self._init_history_table()
         self._refresh_history()
         self._refresh_recent_paths()
-        self._run_detection()
+        self._detection_worker = self._run_detection()
         self._update_cmd_preview()
         self._init_ssh_table()
         self._refresh_ssh_table()
@@ -1087,7 +1085,16 @@ class VidToSubApp(
         self._update_agent_config_status()
         self._sync_run_command_panel()
         self._sync_bottom_visibility()
-        self.set_interval(1.0, self._refresh_live_panels)
+        self._live_refresh_timer = self.set_interval(1.0, self._refresh_live_panels)
+
+    def on_unmount(self) -> None:
+        if self._detection_worker is not None and self._detection_worker.is_running:
+            self._detection_worker.cancel()
+        self._detection_worker = None
+        if self._live_refresh_timer is not None:
+            self._live_refresh_timer.stop()
+            self._live_refresh_timer = None
+        close_shared_db()
 
     def _sync_translation_switch_state(self) -> None:
         try:
@@ -1469,9 +1476,14 @@ class VidToSubApp(
         model = self._sel("sel-dl-model", "large-v3")
         self._download_model(model)
 
-    def _action_pip_fw(self) -> None:      self._pip_install("faster-whisper")
-    def _action_pip_whisper(self) -> None: self._pip_install("whisper")
-    def _action_pip_wx(self) -> None:      self._pip_install("whisperx")
+    def _action_pip_fw(self) -> None:
+        self._pip_install("faster-whisper")
+
+    def _action_pip_whisper(self) -> None:
+        self._pip_install("whisper")
+
+    def _action_pip_wx(self) -> None:
+        self._pip_install("whisperx")
 
     # ── Run action helpers ─────────────────────────────────────────────
 
@@ -1755,32 +1767,19 @@ class VidToSubApp(
         Fallback/supplement: tui.remote_resources legacy JSON field.
         Both sources are merged; DB connections take priority.
         """
-        profiles: list[RemoteResourceProfile] = []
-        warnings: list[str] = []
+        primary_profiles: list[RemoteResourceProfile] = []
+        legacy_profiles: list[RemoteResourceProfile] = []
 
         # 1. Structured SSH connections from DB (primary source)
         for row in _db.get_ssh_connections(enabled_only=True):
             conn = ssh_connection_from_row(row)
-            profiles.append(conn.to_remote_resource_profile())
+            primary_profiles.append(conn.to_remote_resource_profile())
 
         # 2. Legacy raw JSON (tui.remote_resources) for backward compat
         raw = _db.get("tui.remote_resources")
         if raw and raw.strip() not in ("", "[]"):
             try:
-                legacy = parse_remote_resources(raw)
-                existing_names = {p.name for p in profiles}
-                shadowed_legacy_names: list[str] = []
-                for lp in legacy:
-                    if lp.name in existing_names:
-                        shadowed_legacy_names.append(lp.name)
-                        continue
-                    profiles.append(lp)
-                if shadowed_legacy_names:
-                    names = ", ".join(sorted(set(shadowed_legacy_names)))
-                    warnings.append(
-                        "SSH connections override legacy remote JSON for duplicate "
-                        f"name(s): {names}."
-                    )
+                legacy_profiles = parse_remote_resources(raw)
             except ValueError as exc:
                 try:
                     self.query_one("#stg-status", Static).update(
@@ -1789,29 +1788,10 @@ class VidToSubApp(
                 except NoMatches:
                     pass
 
-        duplicate_targets: dict[tuple[str, str], set[str]] = {}
-        for profile in profiles:
-            signature = (
-                profile.ssh_target.strip(),
-                profile.remote_workdir.strip(),
-            )
-            duplicate_targets.setdefault(signature, set()).add(profile.name)
-        colliding_target_names = sorted(
-            names
-            for names in (
-                sorted(profile_names)
-                for profile_names in duplicate_targets.values()
-                if len(profile_names) > 1
-            )
+        profiles, warnings = merge_remote_resource_profiles(
+            primary_profiles,
+            legacy_profiles,
         )
-        if colliding_target_names:
-            rendered = "; ".join(
-                ", ".join(profile_names) for profile_names in colliding_target_names
-            )
-            warnings.append(
-                "Remote profiles share the same ssh target/workdir under different "
-                f"names: {rendered}. Distributed assignment still keys off profile names."
-            )
         self._remote_resources = profiles
         self._remote_resource_warnings = warnings
 

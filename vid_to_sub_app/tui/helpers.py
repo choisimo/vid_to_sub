@@ -6,16 +6,14 @@ import os
 import re
 import shutil
 import time
-from pathlib import Path
+from collections import Counter
 from collections.abc import Sequence
+from pathlib import Path
 from typing import Any
 
 from vid_to_sub_app.cli.discovery import hash_video_folder
 from vid_to_sub_app.shared.constants import (
     BACKENDS,
-    DEFAULT_BACKEND as BASE_DEFAULT_BACKEND,
-    DEFAULT_DEVICE as BASE_DEFAULT_DEVICE,
-    DEFAULT_MODEL as BASE_DEFAULT_MODEL,
     ENV_AGENT_API_KEY,
     ENV_AGENT_BASE_URL,
     ENV_AGENT_MODEL,
@@ -33,24 +31,36 @@ from vid_to_sub_app.shared.constants import (
     HF_MODEL_BASE,
     KNOWN_MODELS,
     MODEL_SEARCH_DIRS,
-    POSTPROCESS_MODES,
     PIP_REQUIREMENT_FILES,
+    POSTPROCESS_MODES,
     ROOT_DIR,
     SEARCH_RESULT_LIMIT,
     SUBTITLE_OUTPUT_EXTENSIONS,
     SYSTEM_PACKAGE_MAP,
     VIDEO_EXTENSIONS,
 )
+from vid_to_sub_app.shared.constants import (
+    DEFAULT_BACKEND as BASE_DEFAULT_BACKEND,
+)
+from vid_to_sub_app.shared.constants import (
+    DEFAULT_DEVICE as BASE_DEFAULT_DEVICE,
+)
+from vid_to_sub_app.shared.constants import (
+    DEFAULT_MODEL as BASE_DEFAULT_MODEL,
+)
 from vid_to_sub_app.shared.env import (
     discover_ggml_models as shared_discover_ggml_models,
+)
+from vid_to_sub_app.shared.env import (
     find_whisper_cpp_bin,
-    preferred_ggml_model_path as shared_preferred_ggml_model_path,
     resolve_runtime_backend_and_device,
-    resolve_runtime_model,
     resolve_runtime_backend_threads,
+    resolve_runtime_model,
+)
+from vid_to_sub_app.shared.env import (
+    preferred_ggml_model_path as shared_preferred_ggml_model_path,
 )
 
-from .state import db as _db
 from .models import (
     ExecutorPlan,
     RemoteResourceProfile,
@@ -59,7 +69,7 @@ from .models import (
     SSHConnection,
     ssh_connection_from_row,
 )
-
+from .state import db as _db
 
 DetectResult = dict[str, tuple[bool, str]]
 SCRIPT_PATH = ROOT_DIR / "vid_to_sub.py"
@@ -571,11 +581,84 @@ def parse_remote_resources(raw: str) -> list[RemoteResourceProfile]:
     return profiles
 
 
+def build_remote_resource_labels(
+    resources: Sequence[RemoteResourceProfile],
+) -> dict[str, str]:
+    name_counts = Counter(profile.name for profile in resources)
+    return {
+        profile.executor_key: profile.rendered_name(
+            disambiguate=name_counts[profile.name] > 1
+        )
+        for profile in resources
+    }
+
+
+def merge_remote_resource_profiles(
+    primary_profiles: Sequence[RemoteResourceProfile],
+    legacy_profiles: Sequence[RemoteResourceProfile],
+) -> tuple[list[RemoteResourceProfile], list[str]]:
+    merged: list[RemoteResourceProfile] = []
+    kept_by_key: dict[str, RemoteResourceProfile] = {}
+    aliases_by_key: dict[str, list[tuple[str, RemoteResourceProfile]]] = {}
+
+    for source_label, profiles in (
+        ("SSH connections", primary_profiles),
+        ("legacy remote JSON", legacy_profiles),
+    ):
+        for profile in profiles:
+            key = profile.executor_key
+            aliases_by_key.setdefault(key, []).append((source_label, profile))
+            if key in kept_by_key:
+                continue
+            kept_by_key[key] = profile
+            merged.append(profile)
+
+    warnings: list[str] = []
+    for key, entries in sorted(aliases_by_key.items()):
+        if len(entries) < 2:
+            continue
+        kept_profile = kept_by_key[key]
+        alias_names = ", ".join(
+            sorted(
+                {
+                    profile.rendered_name()
+                    for _, profile in entries
+                    if profile.rendered_name()
+                }
+            )
+        )
+        warnings.append(
+            "Remote executor aliases collapse onto the same ssh target/workdir: "
+            f"{alias_names} -> {kept_profile.rendered_name(disambiguate=True)}."
+        )
+
+    name_groups: dict[str, list[RemoteResourceProfile]] = {}
+    for profile in merged:
+        name_groups.setdefault(profile.name, []).append(profile)
+    colliding_names = {
+        name: profiles for name, profiles in name_groups.items() if len(profiles) > 1
+    }
+    if colliding_names:
+        rendered = "; ".join(
+            f"{name}: "
+            + ", ".join(sorted(profile.target_descriptor() for profile in profiles))
+            for name, profiles in sorted(colliding_names.items())
+        )
+        warnings.append(
+            "Remote profiles reuse the same display name across different executors: "
+            f"{rendered}. Distributed scheduling now keys off executor identity, "
+            "and progress labels include target info when needed."
+        )
+
+    return merged, warnings
+
+
 def summarize_remote_resources(resources: Sequence[RemoteResourceProfile]) -> str:
     if not resources:
         return "Local execution only."
     total_slots = sum(profile.slots for profile in resources)
-    names = ", ".join(profile.name for profile in resources[:3])
+    labels = build_remote_resource_labels(resources)
+    names = ", ".join(labels[profile.executor_key] for profile in resources[:3])
     extra = len(resources) - 3
     suffix = f" (+{extra} more)" if extra > 0 else ""
     return (

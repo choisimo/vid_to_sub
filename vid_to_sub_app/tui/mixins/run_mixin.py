@@ -19,9 +19,18 @@ from vid_to_sub_app.cli import (
     build_run_manifest,
     discover_videos,
 )
+from vid_to_sub_app.cli.output import planned_output_paths
 from vid_to_sub_app.cli.runner import (
     primary_output_exists as _primary_output_exists,
+)
+from vid_to_sub_app.cli.runner import (
     translation_capable,
+)
+from vid_to_sub_app.cli.stage_artifact import (
+    artifact_path_for,
+    fingerprint_source_path,
+    load_stage_artifact,
+    write_stage_artifact,
 )
 from vid_to_sub_app.shared.constants import ROOT_DIR
 
@@ -38,17 +47,18 @@ from ..helpers import (
     ENV_WCPP_BIN,
     ENV_WCPP_MODEL,
     EXECUTION_MODES,
-    ExecutorPlan,
     FORMATS,
+    ExecutorPlan,
     RemoteResourceProfile,
     RunConfig,
     RunJobState,
     _clamp_ratio,
-    _colorize,
     _coerce_positive_int,
+    _colorize,
     _fmt_elapsed,
     _mask,
     _progress_bar_markup_ratio,
+    build_remote_resource_labels,
     group_paths_by_video_folder,
     map_path_for_remote,
     parse_progress_event,
@@ -56,7 +66,6 @@ from ..helpers import (
     resolve_runtime_backend_threads,
 )
 from ..state import db as _db
-
 
 SCRIPT_PATH = ROOT_DIR / "vid_to_sub.py"
 
@@ -99,6 +108,7 @@ class RunMixin:
         - _refresh_live_panels() -> None
         - _action_toggle_run_shell() -> None
     """
+
     # ── Command builder ───────────────────────────────────────────────────────────────────────
 
     def _build_cli_args(
@@ -667,14 +677,16 @@ class RunMixin:
                 )
             ]
 
-        capacities = ["local", local_capacity]
         capacities = [("local", local_capacity)]
-        capacities.extend((profile.name, profile.slots) for profile in remote_resources)
+        capacities.extend(
+            (profile.executor_key, profile.slots) for profile in remote_resources
+        )
         assignments = partition_folder_groups_by_capacity(
             group_paths_by_video_folder(videos),
             capacities,
         )
         plans: list[ExecutorPlan] = []
+        remote_labels = build_remote_resource_labels(remote_resources)
 
         local_videos = assignments.get("local") or []
         if local_videos:
@@ -705,7 +717,7 @@ class RunMixin:
             )
 
         for profile in remote_resources:
-            assigned = assignments.get(profile.name) or []
+            assigned = assignments.get(profile.executor_key) or []
             if not assigned:
                 continue
             base_manifest = build_run_manifest(assigned)
@@ -715,9 +727,11 @@ class RunMixin:
             )
             plans.append(
                 ExecutorPlan(
-                    name=profile.name,
+                    name=profile.executor_key,
                     kind="remote",
-                    label=profile.name,
+                    label=remote_labels.get(
+                        profile.executor_key, profile.rendered_name()
+                    ),
                     cmd=self._build_remote_command(
                         profile,
                         None,
@@ -955,8 +969,6 @@ class RunMixin:
         self._refresh_live_panels()
 
     def _resolve_stage1_artifact_path(self, source_path: str) -> Path:
-        from vid_to_sub_app.cli.stage_artifact import artifact_path_for
-
         source = Path(source_path)
         output_dir = (
             Path(self._run_output_dir).expanduser().resolve()
@@ -976,6 +988,158 @@ class RunMixin:
             return legacy
 
         return candidate
+
+    def _remote_profile_for_plan(
+        self,
+        plan: ExecutorPlan | Any,
+    ) -> RemoteResourceProfile | None:
+        plan_name = str(getattr(plan, "name", "")).strip()
+        plan_label = str(getattr(plan, "label", "")).strip()
+        for profile in self._remote_resources:
+            if plan_name and plan_name == profile.executor_key:
+                return profile
+            if plan_name and plan_name == profile.name:
+                return profile
+            if plan_label and plan_label == profile.name:
+                return profile
+        return None
+
+    def _remote_stage1_artifact_path(
+        self,
+        source_path: str,
+        profile: RemoteResourceProfile,
+    ) -> Path:
+        remote_source = Path(map_path_for_remote(source_path, profile.path_map))
+        remote_output_dir = (
+            Path(map_path_for_remote(self._run_output_dir, profile.path_map))
+            if self._run_output_dir
+            else None
+        )
+        return artifact_path_for(remote_source, remote_output_dir)
+
+    def _materialize_remote_stage1_artifact(
+        self,
+        profile: RemoteResourceProfile,
+        source_path: str,
+    ) -> str | None:
+        local_source = Path(source_path).expanduser().resolve()
+        local_output_dir = (
+            Path(self._run_output_dir).expanduser().resolve()
+            if self._run_output_dir
+            else None
+        )
+        local_artifact_path = artifact_path_for(local_source, local_output_dir)
+        remote_artifact_path = self._remote_stage1_artifact_path(source_path, profile)
+        download_path = local_artifact_path.with_name(
+            f"{local_artifact_path.name}.download"
+        )
+
+        local_artifact_path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            download_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+        copy_cmd = profile.scp_command_prefix() + [
+            f"{profile.ssh_target}:{remote_artifact_path}",
+            str(download_path),
+        ]
+        result = subprocess.run(
+            copy_cmd,
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+        if result.returncode != 0:
+            try:
+                download_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+            summary = (result.stdout or "").strip()
+            detail = f" {summary}" if summary else ""
+            self.call_from_thread(
+                self._log,
+                f"[yellow]Stage handoff: failed to fetch remote artifact {remote_artifact_path} "
+                f"from {profile.name}.{detail}[/]",
+            )
+            return None
+
+        try:
+            artifact = load_stage_artifact(download_path)
+            local_source_fingerprint = fingerprint_source_path(local_source)
+            quality = dict(artifact.get("quality") or {})
+            remote_source_path = str(artifact.get("source_path") or "").strip()
+            remote_source_fingerprint = str(
+                artifact.get("source_fingerprint") or ""
+            ).strip()
+            if remote_source_path:
+                quality["remote_source_path"] = remote_source_path
+            if remote_source_fingerprint:
+                quality["remote_source_fingerprint"] = remote_source_fingerprint
+            quality["artifact_fetched_from_remote"] = True
+            quality["artifact_fetch_profile"] = profile.name
+            quality["artifact_fetch_executor_key"] = profile.executor_key
+            quality["artifact_fetch_target"] = profile.target_descriptor()
+            artifact["quality"] = quality
+            artifact["source_path"] = str(local_source)
+            artifact["output_base"] = str(local_output_dir or local_source.parent)
+            artifact["source_fingerprint"] = local_source_fingerprint
+            artifact_formats = frozenset(
+                str(fmt) for fmt in artifact.get("formats") or []
+            )
+            if artifact_formats:
+                artifact["primary_outputs"] = [
+                    str(path)
+                    for path in planned_output_paths(
+                        local_source,
+                        artifact_formats,
+                        local_output_dir,
+                    )
+                ]
+            write_stage_artifact(artifact, local_output_dir, local_source)
+        except Exception as exc:
+            self.call_from_thread(
+                self._log,
+                f"[yellow]Stage handoff: fetched artifact for {local_source.name} but "
+                f"could not remap it locally ({exc}).[/]",
+            )
+            return None
+        finally:
+            try:
+                download_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+        return str(local_artifact_path)
+
+    def _materialize_remote_stage1_artifacts(
+        self,
+        plans: list[ExecutorPlan],
+    ) -> list[str]:
+        artifact_paths: list[str] = []
+        for plan in plans:
+            if getattr(plan, "kind", "local") == "local":
+                continue
+            if getattr(plan, "stage", "full") != "stage1":
+                continue
+            profile = self._remote_profile_for_plan(plan)
+            if profile is None:
+                self.call_from_thread(
+                    self._log,
+                    f"[yellow]Stage handoff: no remote profile matched executor "
+                    f"{getattr(plan, 'label', getattr(plan, 'name', 'remote'))}. "
+                    "Cannot fetch stage-1 artifacts.[/]",
+                )
+                continue
+            for source_path in getattr(plan, "assigned_paths", []) or []:
+                materialized = self._materialize_remote_stage1_artifact(
+                    profile,
+                    str(source_path),
+                )
+                if materialized:
+                    artifact_paths.append(materialized)
+        return sorted(set(artifact_paths))
 
     def _collect_stage1_artifacts(self, plans: list[ExecutorPlan]) -> list[str]:
         artifact_paths: list[str] = []
@@ -1373,10 +1537,23 @@ class RunMixin:
                 plan for plan in plans if getattr(plan, "stage", "full") == "stage1"
             ]
             if stage1_plans:
-                has_remote_stage1 = any(
-                    getattr(plan, "kind", "local") != "local" for plan in stage1_plans
+                local_stage1_plans = [
+                    plan
+                    for plan in stage1_plans
+                    if getattr(plan, "kind", "local") == "local"
+                ]
+                remote_stage1_plans = [
+                    plan
+                    for plan in stage1_plans
+                    if getattr(plan, "kind", "local") != "local"
+                ]
+                artifact_paths = self._collect_stage1_artifacts(local_stage1_plans)
+                fetched_remote_artifacts = self._materialize_remote_stage1_artifacts(
+                    remote_stage1_plans
                 )
-                artifact_paths = self._collect_stage1_artifacts(stage1_plans)
+                artifact_paths = sorted(
+                    set(artifact_paths).union(fetched_remote_artifacts)
+                )
                 if artifact_paths:
                     self.call_from_thread(
                         self._log,
@@ -1386,12 +1563,13 @@ class RunMixin:
                     self.call_from_thread(
                         self._schedule_stage2_from_artifacts, artifact_paths
                     )
-                elif has_remote_stage1:
+                elif remote_stage1_plans:
                     self.call_from_thread(
                         self._log,
                         "[yellow]Stage handoff: distributed stage-1 completed, but automatic "
-                        "stage-2 only scans locally visible .stage1.json artifacts. Copy "
-                        "artifacts locally or run --translate-from-artifact manually.[/]",
+                        "stage-2 could not materialize any remote .stage1.json artifacts "
+                        "locally. Review SSH/path_map settings or run --translate-from-artifact "
+                        "manually after copying the artifact.[/]",
                     )
                 else:
                     self.call_from_thread(
@@ -1410,7 +1588,9 @@ class RunMixin:
         that progress tracking works correctly.
         """
         from pathlib import Path as _Path
+
         from vid_to_sub_app.cli.stage_artifact import load_stage_artifact
+
         from ..helpers import ExecutorPlan
 
         plans: list[ExecutorPlan] = []

@@ -66,26 +66,26 @@ Button:focus {
 Button.-primary,
 Button.-primary:hover,
 Button.-primary:focus {
-    background: $primary-muted;
-    color: $text-primary;
+    background: $primary;
+    color: $text;
 }
 Button.-success,
 Button.-success:hover,
 Button.-success:focus {
-    background: $success-muted;
-    color: $text-success;
+    background: $success;
+    color: $text;
 }
 Button.-warning,
 Button.-warning:hover,
 Button.-warning:focus {
-    background: $warning-muted;
-    color: $text-warning;
+    background: $warning;
+    color: $text;
 }
 Button.-error,
 Button.-error:hover,
 Button.-error:focus {
-    background: $error-muted;
-    color: $text-error;
+    background: $error;
+    color: $text;
 }
 Input {
     height: 1;
@@ -388,7 +388,8 @@ DirectoryTree { height: 1fr; }
 #run-btns { height: auto; min-height: 1; margin-bottom: 0; align: left middle; }
 #run-btns Button { margin-right: 1; }
 #btn-toggle-run-shell { min-width: 8; }
-#log-full { height: 1fr; }
+#tab-logs { padding: 0; }
+#log-full { width: 1fr; height: 1fr; }
 #log { height: 1fr; min-height: 4; background: $surface-darken-1; }
 """
 

@@ -15,10 +15,10 @@ Design:
 
 from __future__ import annotations
 
+import hashlib
 import json
 from dataclasses import dataclass, field
 from typing import Any
-
 
 # ---------------------------------------------------------------------------
 # SSH connection profile (DB-backed)
@@ -143,6 +143,35 @@ class RemoteResourceProfile:
     ssh_port: int = 22
     connection_id: int | None = None
 
+    @property
+    def identity_signature(self) -> tuple[str, str, str]:
+        """Stable executor identity independent of user-facing labels."""
+        return (
+            self.ssh_target.strip().casefold(),
+            str(max(1, int(self.ssh_port or 22))),
+            self.remote_workdir.strip(),
+        )
+
+    @property
+    def executor_key(self) -> str:
+        """Short stable key used for scheduling and process bookkeeping."""
+        digest = hashlib.sha1(
+            "\x1f".join(self.identity_signature).encode("utf-8")
+        ).hexdigest()[:12]
+        return f"remote:{digest}"
+
+    def target_descriptor(self) -> str:
+        """Human-readable remote target summary."""
+        port_suffix = f":{self.ssh_port}" if self.ssh_port != 22 else ""
+        return f"{self.ssh_target}{port_suffix}:{self.remote_workdir}"
+
+    def rendered_name(self, *, disambiguate: bool = False) -> str:
+        """User-facing label, optionally expanded with the remote target."""
+        base = self.name or self.ssh_target
+        if not disambiguate:
+            return base
+        return f"{base} [{self.target_descriptor()}]"
+
     def ssh_command_prefix(self) -> list[str]:
         """Build the ``ssh [options] target`` prefix for subprocess calls."""
         cmd = ["ssh"]
@@ -151,6 +180,15 @@ class RemoteResourceProfile:
         if self.ssh_key_path:
             cmd += ["-i", self.ssh_key_path]
         cmd.append(self.ssh_target)
+        return cmd
+
+    def scp_command_prefix(self) -> list[str]:
+        """Build the ``scp [options]`` prefix matching :meth:`ssh_command_prefix`."""
+        cmd = ["scp"]
+        if self.ssh_port != 22:
+            cmd += ["-P", str(self.ssh_port)]
+        if self.ssh_key_path:
+            cmd += ["-i", self.ssh_key_path]
         return cmd
 
 
