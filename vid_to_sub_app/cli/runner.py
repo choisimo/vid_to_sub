@@ -1447,7 +1447,8 @@ def _run_worker_loop(
     work_fn: Callable[..., ProcessResult],
     *,
     collect_artifacts: bool = False,
-) -> tuple[int, int, list[str]]:
+    count_suspicious_holds_as_errors: bool = True,
+) -> tuple[int, int, int, list[str]]:
     """Unified parallel worker loop shared by run_parallel and _run_stage1_parallel.
 
     Parameters
@@ -1461,7 +1462,10 @@ def _run_worker_loop(
 
     Returns
     -------
-    (ok, err, artifact_paths)
+    (ok, err, suspicious_holds, artifact_paths)
+
+    ``err`` can exclude ``quality_hold`` results when
+    ``count_suspicious_holds_as_errors`` is ``False``.
     """
     from concurrent.futures import ThreadPoolExecutor
 
@@ -1472,10 +1476,11 @@ def _run_worker_loop(
     counter_lock = threading.Lock()
     ok = 0
     err = 0
+    suspicious_holds = 0
     artifact_paths: list[str] = []
 
     def worker_loop(worker_id: int) -> None:
-        nonlocal ok, err
+        nonlocal ok, err, suspicious_holds
         while True:
             task = scheduler.claim_next()
             if task is None:
@@ -1540,6 +1545,10 @@ def _run_worker_loop(
                     artifact_paths.append(result.artifact_path)
                 if result.success:
                     ok += 1
+                elif (
+                    result.stage == "quality_hold" and not count_suspicious_holds_as_errors
+                ):
+                    suspicious_holds += 1
                 else:
                     err += 1
 
@@ -1551,7 +1560,7 @@ def _run_worker_loop(
             future.result()
 
     artifact_paths.sort()
-    return ok, err, artifact_paths
+    return ok, err, suspicious_holds, artifact_paths
 
 
 def run_parallel(
@@ -1560,7 +1569,7 @@ def run_parallel(
     formats: frozenset[str],
     output_dir: Path | None,
 ) -> tuple[int, int]:
-    ok, err, _ = _run_worker_loop(
+    ok, err, _, _ = _run_worker_loop(
         manifest, args, formats, output_dir, process_one, collect_artifacts=False
     )
     return ok, err

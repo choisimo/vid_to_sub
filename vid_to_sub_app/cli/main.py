@@ -368,7 +368,7 @@ def _run_stage1_parallel(
     args: argparse.Namespace,
     formats: frozenset[str],
     output_dir: Path | None,
-) -> tuple[int, int, list[str]]:
+) -> tuple[int, int, int, list[str]]:
     """Stage-1-only parallel loop. Delegates to the shared _run_worker_loop.
 
     Uses run_stage1 as the work function and collects artifact paths.
@@ -380,6 +380,7 @@ def _run_stage1_parallel(
         output_dir,
         run_stage1,
         collect_artifacts=True,
+        count_suspicious_holds_as_errors=False,
     )
 
 def _print_dry_run_plan(
@@ -640,7 +641,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     started_at = time.monotonic()
     artifact_paths: list[str] = []
     if args.stage1_only:
-        ok, err, artifact_paths = _run_stage1_parallel(
+        ok, err, suspicious_holds, artifact_paths = _run_stage1_parallel(
             manifest, args, formats, output_dir
         )
     else:
@@ -657,9 +658,13 @@ def main(argv: Optional[list[str]] = None) -> int:
         print("\nStage 1 artifacts:", flush=True)
         for artifact_path in artifact_paths:
             print(f"  {artifact_path}", flush=True)
+    summary_parts = [f"{ok} succeeded", f"{err} failed"]
+    if args.stage1_only:
+        summary_parts.append(f"{suspicious_holds} quality-hold artifact(s) withheld")
     print(
-        f"\nDone. {ok} succeeded, {err} failed. "
-        f"Total wall time: {fmt_seconds(elapsed_total)}",
+        "\nDone. "
+        + ", ".join(summary_parts)
+        + f". Total wall time: {fmt_seconds(elapsed_total)}",
         flush=True,
     )
-    return 0 if err == 0 else 1
+    return 0 if (err == 0) else 1

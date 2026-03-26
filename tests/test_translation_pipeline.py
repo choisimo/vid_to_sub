@@ -1830,6 +1830,61 @@ class TranslationPipelineTests(unittest.TestCase):
         run_stage1_mock.assert_called_once()
         run_stage2_mock.assert_not_called()
 
+    def test_stage1_only_quality_hold_returns_success(self) -> None:
+        video_path = Path("/tmp/movie.mp4")
+        manifest = {
+            "found_total": 1,
+            "skipped": 0,
+            "folders": [
+                {
+                    "folder_hash": "folder-hash",
+                    "folder_path": str(video_path.parent),
+                    "total_files": 1,
+                    "completed_files": 0,
+                    "status": "queued",
+                    "is_completed": False,
+                }
+            ],
+            "entries": [
+                {
+                    "video_path": str(video_path),
+                    "folder_hash": "folder-hash",
+                    "folder_path": str(video_path.parent),
+                }
+            ],
+        }
+        stage1_result = ProcessResult(
+            success=False,
+            video_path=str(video_path),
+            folder_hash="folder-hash",
+            folder_path=str(video_path.parent),
+            worker_id=0,
+            stage="quality_hold",
+            elapsed_sec=0.1,
+            error="empty_transcript",
+            artifact_path="/tmp/movie.stage1.json",
+        )
+
+        with (
+            patch("vid_to_sub_app.cli.main.discover_videos", return_value=[video_path]),
+            patch(
+                "vid_to_sub_app.cli.main.build_run_manifest",
+                return_value=manifest,
+            ),
+            patch("vid_to_sub_app.cli.main.persist_folder_manifest_state"),
+            patch("vid_to_sub_app.cli.manifest.persist_folder_manifest_state"),
+            patch(
+                "vid_to_sub_app.cli.main.run_stage1",
+                return_value=stage1_result,
+            ) as run_stage1_mock,
+            patch("vid_to_sub_app.cli.main.run_stage2") as run_stage2_mock,
+        ):
+            exit_code = main([str(video_path), "--stage1-only"])
+
+        self.assertEqual(0, exit_code)
+        run_stage1_mock.assert_called_once()
+        run_stage2_mock.assert_not_called()
+
     def test_translate_from_artifact_flag_skips_transcription(self) -> None:
         artifact_path = Path("/tmp/movie.stage1.json")
         stage2_result = ProcessResult(
@@ -4044,6 +4099,41 @@ class TestParallelLoopEventParity(unittest.TestCase):
             only_in_parallel,
             f"Keys only in run_parallel job_finished (not in _run_stage1_parallel): {only_in_parallel}",
         )
+
+    def test_run_stage1_parallel_treats_quality_hold_as_withheld(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            td = Path(tmpdir)
+            args = self._make_args(td)
+            manifest, _ = self._make_manifest_and_video(td)
+            quality_hold_result = ProcessResult(
+                success=False,
+                video_path=str((td / "clip.mp4").resolve()),
+                folder_hash="abc123",
+                folder_path=str(td),
+                worker_id=0,
+                stage="quality_hold",
+                elapsed_sec=0.1,
+                error="empty_transcript",
+                artifact_path=str(td / "clip.stage1.json"),
+            )
+
+            with (
+                patch(
+                    "vid_to_sub_app.cli.main.run_stage1",
+                    return_value=quality_hold_result,
+                ),
+                patch("vid_to_sub_app.cli.manifest.persist_folder_manifest_state"),
+            ):
+                ok, err, suspicious_holds, artifact_paths = (
+                    self._run_stage1_parallel_via_import(
+                        manifest, args, frozenset({"srt"}), None
+                    )
+                )
+
+        self.assertEqual(0, ok)
+        self.assertEqual(0, err)
+        self.assertEqual(1, suspicious_holds)
+        self.assertEqual([str(td / "clip.stage1.json")], artifact_paths)
 
     def test_job_finished_payload_values_are_correct(self) -> None:
         """job_finished event payload must contain correct, non-empty values (not just keys).
