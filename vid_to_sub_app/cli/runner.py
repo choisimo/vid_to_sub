@@ -8,9 +8,12 @@ import sys
 import threading
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
-from vid_to_sub_app.shared.constants import EVENT_PREFIX
+from vid_to_sub_app.shared.constants import (
+    EVENT_PREFIX,
+    FASTER_WHISPER_MODEL_MIN_VRAM_GB,
+)
 
 from .discovery import hash_video_folder
 from .manifest import FolderAwareScheduler, ProcessResult
@@ -65,7 +68,9 @@ def _assess_stage1_quality(
     reasons: list[str] = []
     if isinstance(lang_prob, (int, float)) and float(lang_prob) < 0.80:
         reasons.append("low_language_probability")
-    if repeated_ratio > 0.35:
+    if not non_empty_texts:
+        reasons.append("empty_transcript")
+    elif repeated_ratio > 0.35:
         reasons.append("high_repetition")
     if noise_like_ratio > 0.20:
         reasons.append("noise_like_segments")
@@ -813,9 +818,15 @@ def run_stage1(
     folder_hash = str(task.get("folder_hash") or hash_video_folder(video.parent))
     folder_path = str(task.get("folder_path") or str(video.parent))
     prefix = f"[{worker_id}] " if args.workers > 1 else ""
-    print(f"{prefix}▶  {video}", flush=True)
+    print(f"{prefix}\u25b6  {video}", flush=True)
     started_at = time.monotonic()
     video_duration = probe_media_duration(video)
+    _probe_elapsed = time.monotonic() - started_at
+    print(
+        f"{prefix}[METRIC] stage=probe file={video.name} elapsed_ms={_probe_elapsed * 1000:.1f}",
+        file=sys.stderr,
+        flush=True,
+    )
     last_progress_seconds = -1.0
 
     def report_progress(progress_seconds: float) -> None:
@@ -877,6 +888,13 @@ def run_stage1(
             stage="transcribe",
             elapsed_sec=round(time.monotonic() - started_at, 3),
         )
+
+    _asr_elapsed = time.monotonic() - started_at
+    print(
+        f"{prefix}[METRIC] stage=asr file={video.name} elapsed_ms={_asr_elapsed * 1000:.1f}",
+        file=sys.stderr,
+        flush=True,
+    )
 
     if args.backend == "whisper-cpp" and video_duration is not None:
         report_progress(video_duration)
@@ -1264,6 +1282,13 @@ def run_stage2(artifact_path: Path, args: argparse.Namespace) -> ProcessResult:
             translated_info,
             name_suffix=f".{target_language}",
         )
+        _translation_elapsed = time.monotonic() - started_at
+        _video_name = source_path.name
+        print(
+            f"[METRIC] stage=translation file={_video_name} elapsed_ms={_translation_elapsed * 1000:.1f}",
+            file=sys.stderr,
+            flush=True,
+        )
     except Exception as exc:
         artifact["stage_status"]["translation_pending"] = False
         artifact["stage_status"]["translation_complete"] = False
@@ -1375,19 +1400,79 @@ def _finalize_process_result(
     )
 
 
-def run_parallel(
+def _warn_model_memory_if_needed(args: argparse.Namespace, worker_total: int) -> None:
+    """Print a warning when multiple workers may each load a separate model copy.
+
+    faster-whisper uses thread-local model caching, so every worker thread loads
+    its own model instance.  At worker_total > 1 the VRAM / RAM footprint
+    multiplies linearly, which can silently exhaust available memory.
+    """
+    if str(getattr(args, "backend", "") or "") != "faster-whisper":
+        return
+    if worker_total < 2:
+        return
+
+    model_name = str(getattr(args, "model", "") or "")
+    min_vram = FASTER_WHISPER_MODEL_MIN_VRAM_GB.get(model_name)
+    if min_vram is not None:
+        estimated_total = min_vram * worker_total
+        try:
+            from vid_to_sub_app.shared.env import detect_cuda_total_memory_gb
+            available = detect_cuda_total_memory_gb()
+        except Exception:
+            available = None
+        if available is not None and estimated_total > available:
+            print(
+                f"[WARN] faster-whisper: {worker_total} workers × ~{min_vram:.0f} GiB per model"
+                f" ≈ {estimated_total:.0f} GiB estimated; only {available:.1f} GiB total VRAM detected"
+                " (actual free VRAM will be less). Consider --workers 1 or a smaller --model to avoid OOM errors.",
+                file=sys.stderr,
+                flush=True,
+            )
+            return
+    # Generic warning when no VRAM data available
+    print(
+        f"[WARN] faster-whisper: {worker_total} workers will each load a separate model copy"
+        " (thread-local cache). Memory usage scales with worker count.",
+        file=sys.stderr,
+        flush=True,
+    )
+
+
+def _run_worker_loop(
     manifest: dict[str, Any],
     args: argparse.Namespace,
     formats: frozenset[str],
     output_dir: Path | None,
-) -> tuple[int, int]:
+    work_fn: Callable[..., ProcessResult],
+    *,
+    collect_artifacts: bool = False,
+) -> tuple[int, int, list[str]]:
+    """Unified parallel worker loop shared by run_parallel and _run_stage1_parallel.
+
+    Parameters
+    ----------
+    work_fn:
+        Callable with signature ``(task, args, formats, output_dir, backend_threads,
+        worker_id) -> ProcessResult``.  Typically ``process_one`` or ``run_stage1``.
+    collect_artifacts:
+        When True, ``result.artifact_path`` values are accumulated and returned
+        as the third element of the tuple (used by the stage-1-only path).
+
+    Returns
+    -------
+    (ok, err, artifact_paths)
+    """
     from concurrent.futures import ThreadPoolExecutor
 
     scheduler = FolderAwareScheduler(manifest)
     backend_threads = max(2, int(args.backend_threads))
+    worker_total = max(1, int(args.workers))
+    _warn_model_memory_if_needed(args, worker_total)
     counter_lock = threading.Lock()
     ok = 0
     err = 0
+    artifact_paths: list[str] = []
 
     def worker_loop(worker_id: int) -> None:
         nonlocal ok, err
@@ -1396,7 +1481,7 @@ def run_parallel(
             if task is None:
                 return
             try:
-                result = process_one(
+                result = work_fn(
                     task,
                     args,
                     formats,
@@ -1451,16 +1536,31 @@ def run_parallel(
                 )
 
             with counter_lock:
+                if collect_artifacts and result.artifact_path:
+                    artifact_paths.append(result.artifact_path)
                 if result.success:
                     ok += 1
                 else:
                     err += 1
 
-    worker_total = max(1, int(args.workers))
     with ThreadPoolExecutor(max_workers=worker_total) as pool:
         futures = [
             pool.submit(worker_loop, worker_id) for worker_id in range(worker_total)
         ]
         for future in futures:
             future.result()
+
+    artifact_paths.sort()
+    return ok, err, artifact_paths
+
+
+def run_parallel(
+    manifest: dict[str, Any],
+    args: argparse.Namespace,
+    formats: frozenset[str],
+    output_dir: Path | None,
+) -> tuple[int, int]:
+    ok, err, _ = _run_worker_loop(
+        manifest, args, formats, output_dir, process_one, collect_artifacts=False
+    )
     return ok, err

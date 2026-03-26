@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import argparse
 import sys
-import threading
 import time
 from pathlib import Path
 from typing import Optional
@@ -30,7 +29,6 @@ from vid_to_sub_app.shared.secrets import hydrate_secret_env
 
 from .discovery import discover_videos, hash_video_folder
 from .manifest import (
-    FolderAwareScheduler,
     ProcessResult,
     build_run_manifest,
     load_manifest_from_stdin,
@@ -38,6 +36,7 @@ from .manifest import (
 )
 from .output import fmt_seconds
 from .runner import (
+    _run_worker_loop,
     emit_legacy_inline_warning_once,
     emit_progress_event,
     legacy_inline_block_reason,
@@ -370,95 +369,18 @@ def _run_stage1_parallel(
     formats: frozenset[str],
     output_dir: Path | None,
 ) -> tuple[int, int, list[str]]:
-    from concurrent.futures import ThreadPoolExecutor
+    """Stage-1-only parallel loop. Delegates to the shared _run_worker_loop.
 
-    scheduler = FolderAwareScheduler(manifest)
-    backend_threads = max(2, int(args.backend_threads))
-    counter_lock = threading.Lock()
-    ok = 0
-    err = 0
-    artifact_paths: list[str] = []
-
-    def worker_loop(worker_id: int) -> None:
-        nonlocal ok, err
-        while True:
-            task = scheduler.claim_next()
-            if task is None:
-                return
-            try:
-                result = run_stage1(
-                    task,
-                    args,
-                    formats,
-                    output_dir,
-                    backend_threads,
-                    worker_id,
-                )
-            except Exception as exc:
-                result = ProcessResult(
-                    success=False,
-                    video_path=str(task["video_path"]),
-                    folder_hash=str(task["folder_hash"]),
-                    folder_path=str(task["folder_path"]),
-                    worker_id=worker_id,
-                    error=str(exc),
-                    stage="worker",
-                )
-                print(f"[ERROR] Worker exception: {exc}", file=sys.stderr)
-
-            folder_snapshot = scheduler.complete(result)
-            emit_progress_event(
-                "job_finished",
-                video_path=result.video_path,
-                worker_id=result.worker_id,
-                status="done" if result.success else "failed",
-                stage=result.stage,
-                error=result.error,
-                elapsed_sec=result.elapsed_sec,
-                language=result.language,
-                video_duration=result.video_duration,
-                output_paths=result.output_paths or [],
-                segments=result.segments,
-                artifact_path=result.artifact_path,
-                artifact_metadata=result.artifact_metadata,
-                folder_hash=folder_snapshot["folder_hash"],
-                folder_path=folder_snapshot["folder_path"],
-                folder_total_files=folder_snapshot["total_files"],
-                folder_completed_files=folder_snapshot["completed_files"],
-                folder_status=folder_snapshot["status"],
-                folder_completed=folder_snapshot["is_completed"],
-            )
-            if folder_snapshot["is_completed"]:
-                emit_progress_event(
-                    "folder_finished",
-                    folder_hash=folder_snapshot["folder_hash"],
-                    folder_path=folder_snapshot["folder_path"],
-                    total_files=folder_snapshot["total_files"],
-                    folder_total_files=folder_snapshot["total_files"],
-                    folder_completed_files=folder_snapshot["completed_files"],
-                    folder_status=folder_snapshot["status"],
-                    folder_completed=folder_snapshot["is_completed"],
-                )
-
-            with counter_lock:
-                if result.artifact_path:
-                    artifact_paths.append(result.artifact_path)
-                if result.success:
-                    ok += 1
-                else:
-                    err += 1
-
-    worker_total = max(1, int(args.workers))
-    with ThreadPoolExecutor(max_workers=worker_total) as pool:
-        futures = [
-            pool.submit(worker_loop, worker_id) for worker_id in range(worker_total)
-        ]
-        for future in futures:
-            future.result()
-
-    artifact_paths.sort()
-    return ok, err, artifact_paths
-
+    Uses run_stage1 as the work function and collects artifact paths.
+    """
+    return _run_worker_loop(
+        manifest,
+        args,
+        formats,
+        output_dir,
+        run_stage1,
+        collect_artifacts=True,
+    )
 
 def _print_dry_run_plan(
     entries: list[dict[str, str]],
@@ -654,6 +576,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         if not args.paths:
             parser.error("PATH is required unless --manifest-stdin is used.")
         recursive = not args.no_recurse
+        _discovery_start = time.monotonic()
         videos = discover_videos(args.paths, recursive=recursive)
         found_total = len(videos)
         skipped = 0
@@ -674,6 +597,12 @@ def main(argv: Optional[list[str]] = None) -> int:
                 print(f"Skipping {skipped} already-processed file(s).")
 
         manifest = build_run_manifest(videos, found_total=found_total, skipped=skipped)
+        _discovery_elapsed = time.monotonic() - _discovery_start
+        print(
+            f"[METRIC] stage=discovery files_found={found_total} files_queued={len(videos)} elapsed_ms={_discovery_elapsed * 1000:.1f}",
+            file=sys.stderr,
+            flush=True,
+        )
 
     persist_folder_manifest_state(manifest)
     entries = manifest.get("entries", [])
