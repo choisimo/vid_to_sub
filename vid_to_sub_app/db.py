@@ -195,7 +195,7 @@ class Database:
     def _conn(self) -> sqlite3.Connection:
         conn: sqlite3.Connection | None = getattr(self._local, "conn", None)
         if conn is None:
-            conn = sqlite3.connect(str(self._path), check_same_thread=False)
+            conn = sqlite3.connect(str(self._path), check_same_thread=False, timeout=30)
             conn.row_factory = sqlite3.Row
             self._local.conn = conn
             with self._connections_lock:
