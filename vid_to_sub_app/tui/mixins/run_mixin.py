@@ -32,7 +32,7 @@ from vid_to_sub_app.cli.stage_artifact import (
     load_stage_artifact,
     write_stage_artifact,
 )
-from vid_to_sub_app.shared.constants import ROOT_DIR
+from vid_to_sub_app.shared.constants import ROOT_DIR, SECRET_ENV_KEYS
 
 from ..helpers import (
     DEFAULT_BACKEND,
@@ -593,7 +593,7 @@ class RunMixin:
         env_prefix = " ".join(
             f"{key}={shlex.quote(value)}"
             for key, value in sorted(mapped_env.items())
-            if value
+            if value and key not in SECRET_ENV_KEYS
         )
         remote_parts = [profile.python_bin, script_path, *cli_args]
         remote_command = shlex.join(remote_parts)
@@ -1044,6 +1044,7 @@ class RunMixin:
             f"{profile.ssh_target}:{remote_artifact_path}",
             str(download_path),
         ]
+        _fetch_started = time.monotonic()
         result = subprocess.run(
             copy_cmd,
             check=False,
@@ -1051,19 +1052,25 @@ class RunMixin:
             stderr=subprocess.STDOUT,
             text=True,
         )
+        _fetch_elapsed = time.monotonic() - _fetch_started
         if result.returncode != 0:
-            try:
-                download_path.unlink(missing_ok=True)
-            except OSError:
-                pass
             summary = (result.stdout or "").strip()
             detail = f" {summary}" if summary else ""
             self.call_from_thread(
                 self._log,
                 f"[yellow]Stage handoff: failed to fetch remote artifact {remote_artifact_path} "
-                f"from {profile.name}.{detail}[/]",
+                f"from {profile.name}.{detail} "
+                f"[METRIC] artifact_fetch file={local_source.name} elapsed_ms={_fetch_elapsed * 1000:.1f} status=failure profile={profile.name}[/]",
             )
+            try:
+                download_path.unlink(missing_ok=True)
+            except OSError:
+                pass
             return None
+        self.call_from_thread(
+            self._log,
+            f"[METRIC] artifact_fetch file={local_source.name} elapsed_ms={_fetch_elapsed * 1000:.1f} status=ok profile={profile.name}",
+        )
 
         try:
             artifact = load_stage_artifact(download_path)
@@ -1085,6 +1092,21 @@ class RunMixin:
             artifact["source_path"] = str(local_source)
             artifact["output_base"] = str(local_output_dir or local_source.parent)
             artifact["source_fingerprint"] = local_source_fingerprint
+            if (
+                remote_source_fingerprint
+                and local_source_fingerprint
+                and remote_source_fingerprint != local_source_fingerprint
+            ):
+                self.call_from_thread(
+                    self._log,
+                    f"[yellow]Stage handoff: remote provenance mismatch for "
+                    f"{local_source.name}. Remote source fingerprint "
+                    f"({remote_source_fingerprint}) differs from local "
+                    f"({local_source_fingerprint}). Check path_map in profile "
+                    f"{profile.name!r} — local file may not match the remote "
+                    "source used for transcription.[/]",
+                )
+            quality["local_source_fingerprint"] = local_source_fingerprint
             artifact_formats = frozenset(
                 str(fmt) for fmt in artifact.get("formats") or []
             )
@@ -1118,6 +1140,9 @@ class RunMixin:
         plans: list[ExecutorPlan],
     ) -> list[str]:
         artifact_paths: list[str] = []
+        _handoff_started = time.monotonic()
+        _total = 0
+        _failed = 0
         for plan in plans:
             if getattr(plan, "kind", "local") == "local":
                 continue
@@ -1133,12 +1158,22 @@ class RunMixin:
                 )
                 continue
             for source_path in getattr(plan, "assigned_paths", []) or []:
+                _total += 1
                 materialized = self._materialize_remote_stage1_artifact(
                     profile,
                     str(source_path),
                 )
                 if materialized:
                     artifact_paths.append(materialized)
+                else:
+                    _failed += 1
+        _handoff_elapsed = time.monotonic() - _handoff_started
+        if _total > 0:
+            self.call_from_thread(
+                self._log,
+                f"[METRIC] stage_handoff total_files={_total} fetched={_total - _failed} "
+                f"failed={_failed} elapsed_ms={_handoff_elapsed * 1000:.1f}",
+            )
         return sorted(set(artifact_paths))
 
     def _collect_stage1_artifacts(self, plans: list[ExecutorPlan]) -> list[str]:

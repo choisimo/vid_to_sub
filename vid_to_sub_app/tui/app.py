@@ -477,7 +477,7 @@ class VidToSubApp(
                                 allow_blank=False,
                             )
                         yield Static(
-                            "[dim]Local mode runs one process here. Distributed mode splits discovered files across local workers and SSH resources from Settings.[/]",
+                            "[dim]Local mode runs one process here. Distributed mode splits stage-1 (transcription) across local workers and SSH resources from Settings — stage-2 (translation) always runs locally after remote artifacts are fetched.[/]",
                             classes="hint",
                             markup=True,
                         )
@@ -827,7 +827,7 @@ class VidToSubApp(
 
                         yield Static("SSH Connections", classes="stitle")
                         yield Static(
-                            "[dim]Primary remote executor list for distributed transcription. Saved connections are merged with any legacy Remote Resources JSON, and warnings are shown when names or targets drift.[/]",
+                            "[dim]Primary remote executor list for distributed stage-1 transcription. Saved connections are merged with any legacy Remote Resources JSON, and warnings are shown when names or targets drift. Stage-2 (translation) runs locally after remote artifacts are fetched.[/]",
                             classes="hint",
                             markup=True,
                         )
@@ -1792,19 +1792,50 @@ class VidToSubApp(
             primary_profiles,
             legacy_profiles,
         )
+        # Build source provenance map: executor_key -> "db" | "legacy" | "db+legacy"
+        _primary_keys = {p.executor_key for p in primary_profiles}
+        _legacy_keys = {p.executor_key for p in legacy_profiles}
+        sources: dict[str, str] = {}
+        for profile in profiles:
+            key = profile.executor_key
+            if key in _primary_keys and key in _legacy_keys:
+                sources[key] = "db+legacy"
+            elif key in _primary_keys:
+                sources[key] = "db"
+            else:
+                sources[key] = "legacy"
         self._remote_resources = profiles
         self._remote_resource_warnings = warnings
+        self._remote_resource_sources = sources
 
     def _update_remote_status(self) -> None:
         """Refresh the remote-status label in the Transcribe tab."""
-        from .helpers import summarize_remote_resources
-
         try:
             mode = self._sel(
                 "sel-execution-mode", _db.get("tui.execution_mode") or "local"
             )
             if mode == "distributed" and self._remote_resources:
-                msg = f"[cyan]Distributed:[/] {summarize_remote_resources(self._remote_resources)}"
+                total_slots = sum(p.slots for p in self._remote_resources)
+                _src = self._remote_resource_sources
+                _src_labels = {
+                    "db": "[green]db[/]",
+                    "legacy": "[yellow]legacy JSON[/]",
+                    "db+legacy": "[cyan]db+legacy[/]",
+                }
+                from collections import Counter
+                _name_counts = Counter(p.name for p in self._remote_resources)
+                resource_parts = []
+                for p in self._remote_resources[:3]:
+                    src_tag = _src_labels.get(_src.get(p.executor_key, ""), "")
+                    src_suffix = f" ({src_tag})" if src_tag else ""
+                    resource_parts.append(f"{p.rendered_name(disambiguate=_name_counts[p.name] > 1)}{src_suffix}")
+                extra = len(self._remote_resources) - 3
+                extra_suffix = f" (+{extra} more)" if extra > 0 else ""
+                names = ", ".join(resource_parts)
+                msg = (
+                    f"[cyan]Distributed:[/] {len(self._remote_resources)} remote resource(s), "
+                    f"{total_slots} slot(s): {names}{extra_suffix}"
+                )
             elif mode == "distributed":
                 msg = "[yellow]Distributed mode selected but no remote resources configured.[/]"
             else:

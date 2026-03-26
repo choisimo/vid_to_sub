@@ -49,6 +49,7 @@ class SettingsMixin:
     _ssh_selected_id: int | None = None
     _remote_resources: list[RemoteResourceProfile] = []
     _remote_resource_warnings: list[str] = []
+    _remote_resource_sources: dict[str, str] = {}  # executor_key -> "db" | "legacy"
     _run_last_shell = ""
 
     def _query_one(
@@ -128,8 +129,21 @@ class SettingsMixin:
             primary_profiles,
             legacy_profiles,
         )
+        # Build source map: executor_key -> provenance label
+        _primary_keys = {p.executor_key for p in primary_profiles}
+        _legacy_keys = {p.executor_key for p in legacy_profiles}
+        sources: dict[str, str] = {}
+        for profile in profiles:
+            key = profile.executor_key
+            if key in _primary_keys and key in _legacy_keys:
+                sources[key] = "db+legacy"
+            elif key in _primary_keys:
+                sources[key] = "db"
+            else:
+                sources[key] = "legacy"
         self._remote_resources = profiles
         self._remote_resource_warnings = warnings
+        self._remote_resource_sources = sources
 
     def _run_detection(self) -> Any:
         refresh_detection = getattr(self, "_refresh_detection_from_worker", None)
@@ -176,9 +190,24 @@ class SettingsMixin:
                 "sel-execution-mode", _db.get("tui.execution_mode") or "local"
             )
             if mode == "distributed" and self._remote_resources:
+                total_slots = sum(p.slots for p in self._remote_resources)
+                _src = self._remote_resource_sources
+                _src_labels = {
+                    "db": "[green]db[/]",
+                    "legacy": "[yellow]legacy JSON[/]",
+                    "db+legacy": "[cyan]db+legacy[/]",
+                }
+                resource_parts = []
+                for p in self._remote_resources[:3]:
+                    src_tag = _src_labels.get(_src.get(p.executor_key, ""), "")
+                    src_suffix = f" ({src_tag})" if src_tag else ""
+                    resource_parts.append(f"{p.rendered_name()}{src_suffix}")
+                extra = len(self._remote_resources) - 3
+                extra_suffix = f" (+{extra} more)" if extra > 0 else ""
+                names = ", ".join(resource_parts)
                 msg = (
-                    f"[cyan]Distributed:[/] "
-                    f"{summarize_remote_resources(self._remote_resources)}"
+                    f"[cyan]Distributed:[/] {len(self._remote_resources)} remote resource(s), "
+                    f"{total_slots} slot(s): {names}{extra_suffix}"
                 )
             elif mode == "distributed":
                 msg = (
