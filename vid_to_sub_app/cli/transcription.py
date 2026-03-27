@@ -32,10 +32,13 @@ _FasterWhisperModelCacheKey = tuple[str, str, str, int]
 _faster_whisper_thread_state = threading.local()
 
 
-class TranscriptSegment(TypedDict):
+class TranscriptSegment(TypedDict, total=False):
     start: float
     end: float
     text: str
+    words: list[dict[str, object]]
+    word_end: float
+    speaker: str
 
 
 class _FasterWhisperThreadCache(TypedDict):
@@ -266,8 +269,87 @@ def _segments_from_mapping(result: Mapping[str, object]) -> list[TranscriptSegme
             continue
         if not isinstance(text, str):
             continue
-        segments.append({"start": float(start), "end": float(end), "text": text})
+        normalized: TranscriptSegment = {
+            "start": float(start),
+            "end": float(end),
+            "text": text,
+        }
+        words = _normalize_segment_words(segment.get("words"))
+        if words:
+            normalized["words"] = words
+            last_word_end = _last_word_end(words)
+            if last_word_end is not None:
+                normalized["word_end"] = last_word_end
+        speaker = segment.get("speaker")
+        if isinstance(speaker, str) and speaker.strip():
+            normalized["speaker"] = speaker
+        segments.append(normalized)
     return segments
+
+
+def _normalize_segment_words(words_raw: object) -> list[dict[str, object]]:
+    if not isinstance(words_raw, list):
+        return []
+
+    normalized: list[dict[str, object]] = []
+    for word in words_raw:
+        if not isinstance(word, Mapping):
+            continue
+        start = word.get("start")
+        end = word.get("end")
+        text = word.get("word")
+        if not isinstance(text, str):
+            text = word.get("text")
+        if not isinstance(text, str):
+            continue
+        entry: dict[str, object] = {"word": text}
+        if isinstance(start, (int, float)):
+            entry["start"] = float(start)
+        if isinstance(end, (int, float)):
+            entry["end"] = float(end)
+        probability = word.get("probability")
+        if isinstance(probability, (int, float)):
+            entry["probability"] = float(probability)
+        score = word.get("score")
+        if "probability" not in entry and isinstance(score, (int, float)):
+            entry["probability"] = float(score)
+        speaker = word.get("speaker")
+        if isinstance(speaker, str) and speaker.strip():
+            entry["speaker"] = speaker
+        normalized.append(entry)
+    return normalized
+
+
+def _last_word_end(words: list[dict[str, object]]) -> float | None:
+    for word in reversed(words):
+        end = word.get("end")
+        if isinstance(end, (int, float)):
+            return float(end)
+    return None
+
+
+def _segment_words_from_object(segment: object) -> list[dict[str, object]]:
+    words_raw = getattr(segment, "words", None)
+    if words_raw is None:
+        return []
+
+    normalized: list[dict[str, object]] = []
+    for word in words_raw:
+        start = getattr(word, "start", None)
+        end = getattr(word, "end", None)
+        text = getattr(word, "word", None)
+        if not isinstance(text, str):
+            continue
+        entry: dict[str, object] = {"word": text}
+        if isinstance(start, (int, float)):
+            entry["start"] = float(start)
+        if isinstance(end, (int, float)):
+            entry["end"] = float(end)
+        probability = getattr(word, "probability", None)
+        if isinstance(probability, (int, float)):
+            entry["probability"] = float(probability)
+        normalized.append(entry)
+    return normalized
 
 
 def _preferred_gpu_candidates(
@@ -309,6 +391,7 @@ def transcribe_faster_whisper(
     normalized_content_type, extra_transcribe_options = (
         _transcribe_options_for_content_type("faster-whisper", content_type, language)
     )
+    use_word_timestamps = normalized_content_type != "music"
     try:
         from faster_whisper import WhisperModel
     except ImportError:
@@ -399,7 +482,7 @@ def transcribe_faster_whisper(
                 str(video),
                 language=language,
                 beam_size=beam_size,
-                word_timestamps=False,
+                word_timestamps=use_word_timestamps,
                 **extra_transcribe_options,
             )
             gpu_succeeded = True
@@ -436,7 +519,7 @@ def transcribe_faster_whisper(
                         str(video),
                         language=language,
                         beam_size=beam_size,
-                        word_timestamps=False,
+                        word_timestamps=use_word_timestamps,
                         **extra_transcribe_options,
                     )
                     gpu_succeeded = True
@@ -482,7 +565,7 @@ def transcribe_faster_whisper(
                 str(video),
                 language=language,
                 beam_size=beam_size,
-                word_timestamps=False,
+                word_timestamps=use_word_timestamps,
                 **extra_transcribe_options,
             )
             preferred_runtime_map[requested_runtime] = (selected_model, dev, ct)
@@ -506,7 +589,7 @@ def transcribe_faster_whisper(
             str(video),
             language=language,
             beam_size=beam_size,
-            word_timestamps=False,
+            word_timestamps=use_word_timestamps,
             **extra_transcribe_options,
         )
         preferred_runtime_map[requested_runtime] = (selected_model, dev, ct)
@@ -514,9 +597,20 @@ def transcribe_faster_whisper(
     if info_raw is None:
         raise RuntimeError("faster-whisper returned no transcription metadata.")
 
-    segments: list[TranscriptSegment] = [
-        {"start": seg.start, "end": seg.end, "text": seg.text} for seg in segs_raw
-    ]
+    segments: list[TranscriptSegment] = []
+    for seg in segs_raw:
+        normalized: TranscriptSegment = {
+            "start": float(seg.start),
+            "end": float(seg.end),
+            "text": str(seg.text),
+        }
+        words = _segment_words_from_object(seg)
+        if words:
+            normalized["words"] = words
+            last_word_end = _last_word_end(words)
+            if last_word_end is not None:
+                normalized["word_end"] = last_word_end
+        segments.append(normalized)
     info: dict[str, object] = {
         "language": info_raw.language,
         "language_probability": round(info_raw.language_probability, 4),
@@ -524,6 +618,7 @@ def transcribe_faster_whisper(
         "backend": "faster-whisper",
         "model": selected_model,
         "content_type": normalized_content_type,
+        "word_timestamps": use_word_timestamps,
     }
     return segments, info
 
@@ -540,6 +635,7 @@ def transcribe_openai_whisper(
     normalized_content_type, extra_transcribe_options = (
         _transcribe_options_for_content_type("whisper", content_type, language)
     )
+    use_word_timestamps = normalized_content_type != "music"
     try:
         import whisper as ow
     except ImportError:
@@ -558,6 +654,7 @@ def transcribe_openai_whisper(
         str(video),
         language=language,
         beam_size=beam_size,
+        word_timestamps=use_word_timestamps,
         **extra_transcribe_options,
     )
     result_map = _result_mapping(result, "openai-whisper")
@@ -567,6 +664,7 @@ def transcribe_openai_whisper(
         "backend": "openai-whisper",
         "model": model_name,
         "content_type": normalized_content_type,
+        "word_timestamps": use_word_timestamps,
     }
     return segments, info
 
@@ -647,6 +745,7 @@ def transcribe_whisperx(
         "language": result_map.get("language"),
         "backend": "whisperx",
         "model": model_name,
+        "word_timestamps": any(bool(segment.get("words")) for segment in segments),
     }
     return segments, info
 
