@@ -34,6 +34,7 @@ from .stage_artifact import (
     verify_artifact_source,
     write_stage_artifact,
 )
+from .timing_refine import refine_segment_timing
 from .transcription import transcribe
 from .translation import (
     postprocess_translated_segments_openai_compatible,
@@ -75,7 +76,7 @@ def _assess_stage1_quality(
     if noise_like_ratio > 0.20:
         reasons.append("noise_like_segments")
 
-    return {
+    quality = {
         "language_probability": round(float(lang_prob), 4)
         if isinstance(lang_prob, (int, float))
         else None,
@@ -85,6 +86,10 @@ def _assess_stage1_quality(
         "suspicious": bool(reasons),
         "reasons": reasons,
     }
+    timing_refine = info.get("timing_refine")
+    if isinstance(timing_refine, dict):
+        quality["timing_refine"] = timing_refine
+    return quality
 
 
 def _stage1_quality_sort_key(quality: dict[str, Any]) -> tuple[int, int, float, float]:
@@ -137,6 +142,31 @@ def _run_stage1_transcription(
     )
 
 
+def _refine_stage1_timing(
+    *,
+    video: Path,
+    segments: list[dict[str, Any]],
+    info: dict[str, Any],
+    prefix: str,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    timing_started_at = time.monotonic()
+    refined_segments, timing_stats = refine_segment_timing(video, segments, info)
+    timing_elapsed_ms = (time.monotonic() - timing_started_at) * 1000.0
+    info = dict(info)
+    info["timing_refine"] = timing_stats
+    print(
+        f"{prefix}[METRIC] stage=timing_refine file={video.name} "
+        f"elapsed_ms={timing_elapsed_ms:.1f} "
+        f"trimmed_segments={int(timing_stats.get('trimmed_segments') or 0)} "
+        f"median_trim_ms={int(timing_stats.get('median_trim_ms') or 0)} "
+        f"p95_trim_ms={int(timing_stats.get('p95_trim_ms') or 0)} "
+        f"low_confidence_segments={int(timing_stats.get('low_confidence_segments') or 0)}",
+        file=sys.stderr,
+        flush=True,
+    )
+    return refined_segments, info
+
+
 def _maybe_retry_stage1_with_music_preset(
     *,
     video: Path,
@@ -187,6 +217,12 @@ def _maybe_retry_stage1_with_music_preset(
         backend_threads=backend_threads,
         language=retry_language,
         content_type="music",
+    )
+    retried_segments, retried_info = _refine_stage1_timing(
+        video=video,
+        segments=retried_segments,
+        info=retried_info,
+        prefix=prefix,
     )
     retried_quality = _assess_stage1_quality(retried_segments, retried_info)
     retry_details["retried_quality"] = {
@@ -894,6 +930,12 @@ def run_stage1(
         f"{prefix}[METRIC] stage=asr file={video.name} elapsed_ms={_asr_elapsed * 1000:.1f}",
         file=sys.stderr,
         flush=True,
+    )
+    segments, info = _refine_stage1_timing(
+        video=video,
+        segments=segments,
+        info=info,
+        prefix=prefix,
     )
 
     if args.backend == "whisper-cpp" and video_duration is not None:
