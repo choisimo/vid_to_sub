@@ -354,3 +354,47 @@ Use `tui.py` when you want setup assistance, persistent settings, queue visibili
 - `whisperX` diarization needs `--hf-token`; without it, the run continues without diarization.
 - Primary outputs are considered existing by filename and format only, so `--skip-existing` checks for files such as `movie.srt` in the target output directory.
 - The Settings tab can export the current non-secret configuration into `.env`; API keys stay session/environment-only and are omitted from export.
+
+## Existing subtitle reuse and automatic candidate search
+
+Before running ASR, the pipeline can now search reusable subtitles from local sidecar files, embedded text subtitle streams, and configured external providers. Candidates are scored, emitted as a downloadable/reusable list, and reused when they pass the configured threshold. When a subtitle is reused, the existing Stage 2 translation flow can translate it without generating a fresh transcript.
+
+List candidates without transcription:
+
+```bash
+python vid_to_sub.py /path/to/videos \
+  --list-subtitle-candidates \
+  --reuse-existing-subtitles auto \
+  --subtitle-languages en,ko
+```
+
+Reuse an existing subtitle, then translate it:
+
+```bash
+python vid_to_sub.py /path/to/videos \
+  --reuse-existing-subtitles auto \
+  --subtitle-languages en \
+  --subtitle-min-score 0.78 \
+  --translate-to ko
+```
+
+Timing adjustment is controlled by `--subtitle-sync-mode off|duration|asr`. `duration` clamps obvious out-of-bounds timestamps to the media duration. `asr` runs transcription only as a timing reference, then estimates an offset/scale transform from text anchors; the reused subtitle remains the committed text source.
+
+External adapters currently include OpenSubtitles and SubDL. Missing API keys simply disable those providers and keep local/embedded reuse available.
+
+```bash
+export VID_TO_SUB_OPENSUBTITLES_API_KEY=...
+export VID_TO_SUB_OPENSUBTITLES_USERNAME=...      # optional
+export VID_TO_SUB_OPENSUBTITLES_PASSWORD=...      # optional
+export VID_TO_SUB_SUBDL_API_KEY=...               # optional
+```
+
+Options:
+
+- `--reuse-existing-subtitles off|auto|local|embedded|external|all`
+- `--subtitle-providers local,embedded,opensubtitles,subdl`
+- `--subtitle-languages en,ko`
+- `--subtitle-min-score 0.78`
+- `--subtitle-max-candidates 12`
+- `--subtitle-sync-mode off|duration|asr`
+- `--list-subtitle-candidates`
