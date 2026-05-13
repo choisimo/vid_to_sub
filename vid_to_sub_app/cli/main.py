@@ -47,6 +47,7 @@ from .runner import (
     run_stage2,
 )
 from .stage_artifact import artifact_path_for, load_stage_artifact
+from .subtitle_reuse import parse_language_list, search_subtitle_candidates
 
 
 def _emit_stage2_job_events(
@@ -212,6 +213,62 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         default=False,
         help="Enable speaker diarization via whisperX (requires --hf-token).",
+    )
+    parser.add_argument(
+        "--reuse-existing-subtitles",
+        choices=["off", "auto", "local", "embedded", "external", "all"],
+        default="off",
+        metavar="MODE",
+        help=(
+            "Reuse existing subtitles before running ASR. 'local' checks sidecar files, "
+            "'embedded' extracts text subtitle streams with ffmpeg, 'external' searches "
+            "configured providers such as OpenSubtitles/SubDL, and 'auto' tries all configured providers."
+        ),
+    )
+    parser.add_argument(
+        "--subtitle-providers",
+        default=None,
+        metavar="LIST",
+        help=(
+            "Comma-separated provider override for subtitle reuse/listing: "
+            "local,embedded,opensubtitles,subdl. Defaults depend on --reuse-existing-subtitles."
+        ),
+    )
+    parser.add_argument(
+        "--subtitle-languages",
+        default=None,
+        metavar="LIST",
+        help="Comma-separated subtitle language codes to search. Defaults to --language when set, otherwise all.",
+    )
+    parser.add_argument(
+        "--subtitle-min-score",
+        type=float,
+        default=0.78,
+        metavar="N",
+        help="Minimum candidate score required to reuse an existing subtitle automatically.",
+    )
+    parser.add_argument(
+        "--subtitle-max-candidates",
+        type=int,
+        default=12,
+        metavar="N",
+        help="Maximum subtitle candidates to keep per video.",
+    )
+    parser.add_argument(
+        "--subtitle-sync-mode",
+        choices=["off", "duration", "asr"],
+        default="duration",
+        metavar="MODE",
+        help=(
+            "How to adjust reused subtitle timing. 'duration' clamps obvious out-of-bounds times; "
+            "'asr' performs a fresh transcript only as a timing reference and fits candidate subtitles to matched text anchors."
+        ),
+    )
+    parser.add_argument(
+        "--list-subtitle-candidates",
+        action="store_true",
+        default=False,
+        help="Search and print downloadable/reusable subtitle candidates, then exit without transcription.",
     )
     parser.add_argument(
         "--translate-to",
@@ -382,6 +439,71 @@ def _run_stage1_parallel(
         collect_artifacts=True,
         count_suspicious_holds_as_errors=False,
     )
+
+
+
+def _subtitle_provider_list_from_args(args: argparse.Namespace) -> list[str]:
+    explicit = str(getattr(args, "subtitle_providers", "") or "").strip()
+    mode = str(getattr(args, "reuse_existing_subtitles", "off") or "off").strip().lower()
+    if explicit:
+        providers = [item.strip().lower() for item in explicit.split(",") if item.strip()]
+    elif mode == "local":
+        providers = ["local"]
+    elif mode == "embedded":
+        providers = ["embedded"]
+    elif mode == "external":
+        providers = ["opensubtitles", "subdl"]
+    else:
+        providers = ["local", "embedded", "opensubtitles", "subdl"]
+    return providers or ["local", "embedded"]
+
+
+def _subtitle_language_list_from_args(args: argparse.Namespace) -> list[str]:
+    fallback = []
+    source_language = str(getattr(args, "language", "") or "").strip()
+    if source_language:
+        fallback.append(source_language)
+    return parse_language_list(getattr(args, "subtitle_languages", None), fallback=fallback)
+
+
+def _print_subtitle_candidate_plan(
+    entries: list[dict[str, str]],
+    args: argparse.Namespace,
+) -> None:
+    languages = _subtitle_language_list_from_args(args)
+    providers = _subtitle_provider_list_from_args(args)
+    max_candidates = max(1, int(getattr(args, "subtitle_max_candidates", 12) or 12))
+    for entry in entries:
+        video_path = Path(entry["video_path"])
+        plan, candidates = search_subtitle_candidates(
+            video_path,
+            languages=languages,
+            providers=providers,
+            limit=max_candidates,
+        )
+        print(f"\n{video_path}")
+        print(
+            "  search: "
+            f"languages={','.join(plan.languages)} "
+            f"providers={','.join(providers)} "
+            f"movie_hash={plan.movie_hash or '-'}"
+        )
+        if not candidates:
+            print("  candidates: none")
+            continue
+        print("  candidates:")
+        for index, candidate in enumerate(candidates, start=1):
+            reusable = "yes" if candidate.score >= float(args.subtitle_min_score) else "no"
+            language = candidate.language or "?"
+            release = f" / {candidate.release}" if candidate.release else ""
+            material = "downloadable" if candidate.provider in {"opensubtitles", "subdl"} else candidate.kind
+            reasons = ",".join(candidate.reasons[:4])
+            print(
+                f"    {index:02d}. {candidate.provider}:{candidate.id} "
+                f"score={candidate.score:.3f} conf={candidate.confidence} "
+                f"lang={language} reusable={reusable} kind={material} "
+                f"title={candidate.title}{release} reasons={reasons}"
+            )
 
 def _print_dry_run_plan(
     entries: list[dict[str, str]],
@@ -624,6 +746,14 @@ def main(argv: Optional[list[str]] = None) -> int:
     )
 
     print(f"Found {total_queued} video file(s).", flush=True)
+
+    if args.list_subtitle_candidates:
+        candidate_entries = [entry for entry in entries if isinstance(entry, dict)]
+        _print_subtitle_candidate_plan(candidate_entries, args)
+        emit_progress_event(
+            "run_finished", total=total_queued, ok=0, err=0, elapsed_sec=0.0
+        )
+        return 0
 
     if args.dry_run:
         dry_run_entries = [entry for entry in entries if isinstance(entry, dict)]

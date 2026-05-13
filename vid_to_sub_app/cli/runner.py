@@ -34,6 +34,15 @@ from .stage_artifact import (
     verify_artifact_source,
     write_stage_artifact,
 )
+from .subtitle_reuse import (
+    SubtitleCandidate,
+    cleanup_materialized_candidate,
+    load_candidate_segments,
+    normalize_subtitle_bounds,
+    parse_language_list,
+    search_subtitle_candidates,
+    sync_segments_to_reference,
+)
 from .timing_refine import refine_segment_timing
 from .transcription import transcribe
 from .translation import (
@@ -474,6 +483,245 @@ def _resolved_postprocess_chunk_size(args: argparse.Namespace) -> int:
     )
 
 
+
+
+def _subtitle_reuse_mode(args: argparse.Namespace) -> str:
+    return str(getattr(args, "reuse_existing_subtitles", "off") or "off").strip().lower()
+
+
+def _subtitle_reuse_enabled(args: argparse.Namespace) -> bool:
+    return _subtitle_reuse_mode(args) not in {"", "off", "none", "false", "0"}
+
+
+def _subtitle_provider_list(args: argparse.Namespace) -> list[str]:
+    explicit = str(getattr(args, "subtitle_providers", "") or "").strip()
+    mode = _subtitle_reuse_mode(args)
+    if explicit:
+        providers = [item.strip().lower() for item in explicit.split(",") if item.strip()]
+    elif mode == "local":
+        providers = ["local"]
+    elif mode == "embedded":
+        providers = ["embedded"]
+    elif mode == "external":
+        providers = ["opensubtitles", "subdl"]
+    else:
+        providers = ["local", "embedded", "opensubtitles", "subdl"]
+    return providers or ["local", "embedded"]
+
+
+def _subtitle_language_list(args: argparse.Namespace) -> list[str]:
+    fallback = []
+    source_language = str(getattr(args, "language", "") or "").strip()
+    if source_language:
+        fallback.append(source_language)
+    return parse_language_list(getattr(args, "subtitle_languages", None), fallback=fallback)
+
+
+def _emit_subtitle_candidate_event(
+    *,
+    video: Path,
+    worker_id: int,
+    folder_hash: str,
+    folder_path: str,
+    plan: object,
+    candidates: list[SubtitleCandidate],
+) -> None:
+    emit_progress_event(
+        "subtitle_candidates",
+        video_path=str(video),
+        worker_id=worker_id,
+        folder_hash=folder_hash,
+        folder_path=folder_path,
+        search_plan=plan.to_public_dict() if hasattr(plan, "to_public_dict") else {},
+        candidates=[candidate.to_public_dict() for candidate in candidates],
+    )
+
+
+def _select_reusable_subtitle_candidate(
+    candidates: list[SubtitleCandidate],
+    *,
+    min_score: float,
+) -> SubtitleCandidate | None:
+    for candidate in sorted(candidates, key=lambda item: item.score, reverse=True):
+        if candidate.score >= min_score:
+            return candidate
+    return None
+
+
+
+def _reuse_existing_subtitle_stage1(
+    *,
+    video: Path,
+    args: argparse.Namespace,
+    formats: frozenset[str],
+    output_dir: Path | None,
+    backend_threads: int,
+    worker_id: int,
+    folder_hash: str,
+    folder_path: str,
+    video_duration: float | None,
+    started_at: float,
+    prefix: str,
+) -> ProcessResult | None:
+    if not _subtitle_reuse_enabled(args):
+        return None
+
+    languages = _subtitle_language_list(args)
+    providers = _subtitle_provider_list(args)
+    max_candidates = max(1, int(getattr(args, "subtitle_max_candidates", 12) or 12))
+    min_score = max(0.0, min(1.0, float(getattr(args, "subtitle_min_score", 0.78) or 0.78)))
+    _search_started = time.monotonic()
+    plan, candidates = search_subtitle_candidates(
+        video,
+        languages=languages,
+        providers=providers,
+        limit=max_candidates,
+    )
+    _emit_subtitle_candidate_event(
+        video=video,
+        worker_id=worker_id,
+        folder_hash=folder_hash,
+        folder_path=folder_path,
+        plan=plan,
+        candidates=candidates,
+    )
+    print(
+        f"{prefix}[METRIC] stage=subtitle_search file={video.name} "
+        f"candidates={len(candidates)} elapsed_ms={(time.monotonic() - _search_started) * 1000:.1f}",
+        file=sys.stderr,
+        flush=True,
+    )
+
+    selected = _select_reusable_subtitle_candidate(candidates, min_score=min_score)
+    if selected is None:
+        if candidates:
+            print(
+                f"{prefix}[INFO] Subtitle candidates found but none met --subtitle-min-score={min_score:.2f}; falling back to ASR.",
+                file=sys.stderr,
+                flush=True,
+            )
+        return None
+
+    materialized_path: Path | None = None
+    try:
+        segments, materialized_path = load_candidate_segments(video, selected)
+        sync_mode = str(getattr(args, "subtitle_sync_mode", "duration") or "duration").strip().lower()
+        sync_info: dict[str, object]
+        if sync_mode == "asr":
+            reference_segments, reference_info = _run_stage1_transcription(
+                video=video,
+                args=args,
+                backend_threads=backend_threads,
+                progress_callback=None,
+            )
+            reference_segments, reference_info = _refine_stage1_timing(
+                video=video,
+                segments=reference_segments,
+                info=reference_info,
+                prefix=prefix,
+            )
+            segments, sync_info = sync_segments_to_reference(segments, reference_segments)
+            sync_info["reference_backend"] = reference_info.get("backend")
+            sync_info["reference_language"] = reference_info.get("language")
+        elif sync_mode == "off":
+            sync_info = {"mode": "off", "changed": False}
+        else:
+            segments, sync_info = normalize_subtitle_bounds(segments, duration=video_duration)
+        info: dict[str, object] = {
+            "backend": "subtitle-reuse",
+            "device": "none",
+            "model": selected.provider,
+            "language": selected.language,
+            "duration": video_duration,
+            "content_type": "existing_subtitle",
+            "subtitle_reuse": {
+                "selected_candidate": selected.to_public_dict(),
+                "candidate_count": len(candidates),
+                "search_plan": plan.to_public_dict(),
+                "materialized_path": str(materialized_path),
+                "sync": sync_info,
+            },
+        }
+        written = write_outputs(video, segments, formats, output_dir, info)
+        output_base = output_dir if output_dir else video.parent
+        quality = {
+            "suspicious": False,
+            "reasons": [],
+            "source": "existing_subtitle",
+            "provider": selected.provider,
+            "candidate_id": selected.id,
+            "candidate_score": round(float(selected.score), 4),
+            "candidate_confidence": selected.confidence,
+            "candidate_reasons": list(selected.reasons),
+            "sync": sync_info,
+            "output_held": False,
+            "warning": None,
+        }
+        artifact: StageArtifact = {
+            "schema_version": ARTIFACT_SCHEMA_VERSION,
+            "source_path": str(video),
+            "output_base": str(output_base),
+            "source_fingerprint": fingerprint_source_path(video),
+            "backend": "subtitle-reuse",
+            "device": "none",
+            "model": selected.provider,
+            "content_type": "existing_subtitle",
+            "language": selected.language,
+            "language_probability": None,
+            "duration": round(float(video_duration), 3) if isinstance(video_duration, (int, float)) else None,
+            "quality": quality,
+            "target_lang": args.translate_to,
+            "formats": sorted(formats),
+            "primary_outputs": [str(path) for path in written],
+            "segments": segments,
+            "stage_status": {
+                "transcription_complete": True,
+                "stage1_output_held": False,
+                "stage1_output_warning": None,
+                "translation_pending": bool(args.translate_to),
+                "translation_complete": False,
+                "translation_failed": False,
+                "translation_error": None,
+            },
+        }
+        artifact_path = write_stage_artifact(artifact, output_dir, video)
+        artifact_metadata = build_stage_artifact_metadata(artifact_path, artifact)
+    except KeyboardInterrupt:
+        raise
+    except Exception as exc:
+        print(
+            f"{prefix}[WARN] Subtitle reuse failed for candidate {selected.provider}/{selected.id}; falling back to ASR: {exc}",
+            file=sys.stderr,
+            flush=True,
+        )
+        return None
+    finally:
+        if materialized_path is not None:
+            cleanup_materialized_candidate(materialized_path, selected)
+
+    elapsed = time.monotonic() - started_at
+    print(
+        f"{prefix}[INFO] Reused subtitle candidate {selected.provider}/{selected.id} "
+        f"score={selected.score:.3f}; skipped fresh ASR.",
+        file=sys.stderr,
+        flush=True,
+    )
+    return ProcessResult(
+        success=True,
+        video_path=str(video),
+        folder_hash=folder_hash,
+        folder_path=folder_path,
+        worker_id=worker_id,
+        elapsed_sec=round(elapsed, 3),
+        language=selected.language,
+        video_duration=float(video_duration) if isinstance(video_duration, (int, float)) else None,
+        output_paths=[str(path) for path in written],
+        segments=len(segments),
+        stage="subtitle_reuse",
+        artifact_path=str(artifact_path),
+        artifact_metadata=artifact_metadata,
+    )
+
 def _stage2_progress_path(artifact_path: Path) -> Path:
     artifact_name = artifact_path.name
     if artifact_name.endswith(".stage1.json"):
@@ -892,6 +1140,22 @@ def run_stage1(
         folder_path=folder_path,
         video_duration=video_duration,
     )
+    reused_result = _reuse_existing_subtitle_stage1(
+        video=video,
+        args=args,
+        formats=formats,
+        output_dir=output_dir,
+        backend_threads=backend_threads,
+        worker_id=worker_id,
+        folder_hash=folder_hash,
+        folder_path=folder_path,
+        video_duration=video_duration,
+        started_at=started_at,
+        prefix=prefix,
+    )
+    if reused_result is not None:
+        return reused_result
+
     pre_asr_hint = predict_auto_content_type(video, args)
     _log_pre_asr_content_hint(prefix, pre_asr_hint)
     initial_content_type = (
